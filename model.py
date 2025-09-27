@@ -43,7 +43,7 @@ class TCNNModel(torch.nn.Module):
         self.num_channels = config.num_channels
 
         self.init_model(config)
-        if config.load_iter != 0:
+        if config.load_dir is not None:
             self.load_ckpt(config)
 
     def init_model(self, config: Config) -> None:
@@ -60,12 +60,11 @@ class TCNNModel(torch.nn.Module):
 
         # slightly slower than tcnn
         # self.triangle_wave = TriangularPositionalEncoding2D(device=config.device)
-
-        if config.n_features_per_level % 8 != 0:
-            raise ValueError("The n_features_per_level should be 1, 2, 4, or multiple of 8.") 
         
         self.num_hash_grids = 1
         if config.n_features_per_level > 8:
+            if config.n_features_per_level % 8 != 0:
+                raise ValueError("The n_features_per_level should be 1, 2, 4, or multiple of 8.") 
             self.num_hash_grids = config.n_features_per_level // 8 
 
         self.hash_grids = torch.nn.ModuleList()
@@ -167,6 +166,7 @@ class TCNNModel(torch.nn.Module):
             all_features = hash_grid(uvs)
             sampled_features = torch.gather(all_features, num_sampled_lods, cols.to(torch.int64))
 
+            # TODO Check if we should add same noise to all features
             if self.quantize:
                 # add symmetric noise
                 noise = 2 * self.noise_range * torch.rand(1).to(self.device) - self.noise_range

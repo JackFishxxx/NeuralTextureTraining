@@ -58,23 +58,38 @@ class TCNNModel(torch.nn.Module):
             encoding_config=triangle_wave_config
         )
 
+        # slightly slower than tcnn
         # self.triangle_wave = TriangularPositionalEncoding2D(device=config.device)
-        hash_grid_config = {
-            "otype": "Grid",
-            "type": "Hash",
-            "n_levels": config.n_levels,
-            "n_features_per_level": config.n_features_per_level,
-            #"per_level_scale": 1.0,
-            "base_resolution": config.base_resolution,
-        }
-        self.hash_grid_1 = tcnn.Encoding(
-            n_input_dims=2,
-            encoding_config=hash_grid_config
-        )
-        self.hash_grid_2 = tcnn.Encoding(
-            n_input_dims=2,
-            encoding_config=hash_grid_config
-        )
+
+        if config.n_features_per_level % 8 != 0:
+            raise ValueError("The n_features_per_level should be 1, 2, 4, or multiple of 8.") 
+        
+        self.num_hash_grids = 1
+        if config.n_features_per_level > 8:
+            self.num_hash_grids = config.n_features_per_level // 8 
+
+        self.hash_grids = torch.nn.ModuleList()
+        for i in range(self.num_hash_grids):
+            # split the hash grid into multiple grids
+            # e.g. n_features_per_level = 16, then we have 2 hash grids
+            # e.g. n_features_per_level = 32, then we have 4 hash grids
+
+            # if config.n_features_per_level > 8 we set the n_features_per_level to 8
+            self.hash_grid_features_per_level = min(config.n_features_per_level, 8) 
+            hash_grid_config = {
+                "otype": "Grid",
+                "type": "Hash",
+                "n_levels": config.n_levels,
+                "n_features_per_level": self.hash_grid_features_per_level,
+                #"per_level_scale": 1.0,
+                "base_resolution": config.base_resolution,
+            }
+
+            hash_grid = tcnn.Encoding(
+                n_input_dims=2,
+                encoding_config=hash_grid_config
+            )
+            self.hash_grids.append(hash_grid)
 
         # ReLU: converg slowly
         # LeakyReLU: PSNR: 28.85, LPIPS: 0.2205(last time was 0.19)
@@ -87,19 +102,18 @@ class TCNNModel(torch.nn.Module):
             "n_neurons": config.n_neurons,
             "n_hidden_layers": config.n_hidden_layers
         }
-        n_input_dims = config.n_frequencies * 2 + 2 * config.n_features_per_level + 1
-        # n_input_dims = config.n_frequencies * 2 + config.n_levels * config.n_features_per_level + 1
+        n_input_dims = config.n_frequencies * 2 + config.n_features_per_level + 1
         self.network = tcnn.Network(
             n_input_dims=n_input_dims,
             n_output_dims=config.num_channels,
             network_config=network_config,
         )
 
-        self.optimizer = torch.optim.Adam([
-            {'params': self.network.parameters(), 'lr': 0.002},
-            {'params': self.hash_grid_1.parameters(), 'lr': 0.005},
-            {'params': self.hash_grid_2.parameters(), 'lr': 0.005},
-        ])
+        # add optimizer params config
+        optimizer_params = [{'params': self.network.parameters(), 'lr': 0.002}]
+        for hash_grid in self.hash_grids:
+            optimizer_params.append({'params': hash_grid.parameters(), 'lr': 0.005})
+        self.optimizer = torch.optim.Adam(optimizer_params)
         # the CosineAnnealingLR is too slow
         # self.scheduler = CosineAnnealingLR(self.optimizer, T_max=self.max_iter, eta_min=0.0)
         # gamma: PSNR, 0.85: 28.1, 0.9: 28.25, 0.95: 28.4, 0.99: too slow
@@ -140,80 +154,61 @@ class TCNNModel(torch.nn.Module):
 
         [batch_size, _] = x.shape
         uvs = x[:, 0:2]
-        lods = x[:, [2]]
+        lod_encodings = x[:, [2]]
 
-        # forward
+        # get required columns by lods
+        # TODO check if num_sampled_lods is currect
+        num_sampled_lods = 1
+        mips = lod_encodings * (self.num_lods - num_sampled_lods)
+        clipped_mips = torch.clamp(mips, max=self.n_levels - num_sampled_lods)
+        cols = (self.n_levels - num_sampled_lods - clipped_mips) * self.hash_grid_features_per_level + torch.arange(self.hash_grid_features_per_level * num_sampled_lods).to(self.device)
+
         positional_encodings = self.triangle_wave(uvs)
-        # positional_encodings = self.triangle_wave(xys)  # slightly slower than tcnn
-        all_features_1 = self.hash_grid_1(uvs)
-        all_features_2 = self.hash_grid_2(uvs)
+        # positional_encodings = self.triangle_wave(xys)  
+
         # get the results from hash grid
-        mips = lods * (self.num_lods - 1)
-        clipped_mips = torch.clamp(mips, max=self.n_levels - 1)
-        cols = (self.n_levels - 1 - clipped_mips) * self.n_features_per_level + torch.arange(self.n_features_per_level * 1).to(self.device)
-        features_1 = torch.gather(all_features_1, 1, cols.to(torch.int64))
+        features = []
+        for hash_grid in self.hash_grids:
+            all_features = hash_grid(uvs)
+            sampled_features = torch.gather(all_features, num_sampled_lods, cols.to(torch.int64))
 
-        clipped_mips = torch.clamp(mips, max=self.n_levels - 1)
-        cols = (self.n_levels - 1 - clipped_mips) * self.n_features_per_level + torch.arange(self.n_features_per_level * 1).to(self.device)
-        features_2 = torch.gather(all_features_2, 1, cols.to(torch.int64))
-
-
-        lod_encodings = lods
-
-        if self.quantize:
-            # add symmetric noise
-            noise = 2 * self.noise_range * torch.rand(1).to(self.device) - self.noise_range
-            features_1 = features_1 + noise
-            features_2 = features_2 + noise
+            if self.quantize:
+                # add symmetric noise
+                noise = 2 * self.noise_range * torch.rand(1).to(self.device) - self.noise_range
+                sampled_features = sampled_features + noise
+            
+            features.append(sampled_features)
+        features = torch.cat(features, dim=1)
         
-        inputs = torch.cat([positional_encodings, features_1, features_2, lod_encodings], dim=1)
-        # inputs = torch.cat([features, lod_encodings], dim=1)
+        inputs = torch.cat([positional_encodings, features, lod_encodings], dim=1)
 
         outputs = self.network(inputs)
 
         return outputs
     
     def simulate_quantize(self):
-
         # only quantize the features
-        state_dict = self.hash_grid_1.state_dict()
+        for hash_grid in self.hash_grids:
+            state_dict = hash_grid.state_dict()
 
-        # transfer the params to 4 bit quantized tensor
-        # [min_quantize_range, max_quantize_range] -> [0, 2 ** self.quantize_bits - 1]
-        params = state_dict['params']
-        params = (params + (-self.min_quantize_range)) * (2 ** self.quantize_bits)
-        params = torch.round(params)
-        # torch.round would round params to an even number
-        # so we need to clamp value
-        params = torch.clamp(params, min=0., max=2 ** self.quantize_bits - 1)
-        params = params / (2 ** self.quantize_bits) + self.min_quantize_range
-        state_dict['params'] = params
-        self.hash_grid_1.load_state_dict(state_dict)
-
-                # only quantize the features
-        state_dict = self.hash_grid_2.state_dict()
-
-        # transfer the params to 4 bit quantized tensor
-        # [min_quantize_range, max_quantize_range] -> [0, 2 ** self.quantize_bits - 1]
-        params = state_dict['params']
-        params = (params + (-self.min_quantize_range)) * (2 ** self.quantize_bits)
-        params = torch.round(params)
-        # torch.round would round params to an even number
-        # so we need to clamp value
-        params = torch.clamp(params, min=0., max=2 ** self.quantize_bits - 1)
-        params = params / (2 ** self.quantize_bits) + self.min_quantize_range
-        state_dict['params'] = params
-        self.hash_grid_2.load_state_dict(state_dict)
+            # transfer the params to 4 bit quantized tensor
+            # [min_quantize_range, max_quantize_range] -> [0, 2 ** self.quantize_bits - 1]
+            params = state_dict['params']
+            params = (params + (-self.min_quantize_range)) * (2 ** self.quantize_bits)
+            params = torch.round(params)
+            # torch.round would round params to an even number
+            # so we need to clamp value
+            params = torch.clamp(params, min=0., max=2 ** self.quantize_bits - 1)
+            params = params / (2 ** self.quantize_bits) + self.min_quantize_range
+            state_dict['params'] = params
+            hash_grid.load_state_dict(state_dict)
     
     def clamp_value(self):
 
-        state_dict = self.hash_grid_1.state_dict()
-        state_dict['params'] = torch.clamp(state_dict['params'], min=self.min_quantize_range, max=self.max_quantize_range)
-        self.hash_grid_1.load_state_dict(state_dict)
-
-        state_dict = self.hash_grid_2.state_dict()
-        state_dict['params'] = torch.clamp(state_dict['params'], min=self.min_quantize_range, max=self.max_quantize_range)
-        self.hash_grid_2.load_state_dict(state_dict)
+        for hash_grid in self.hash_grids:
+            state_dict = hash_grid.state_dict()
+            state_dict['params'] = torch.clamp(state_dict['params'], min=self.min_quantize_range, max=self.max_quantize_range)
+            hash_grid.load_state_dict(state_dict)
 
     def get_model_info(self) -> np.array:
         
@@ -228,7 +223,7 @@ class TCNNModel(torch.nn.Module):
         info.append(int(self.n_levels))  # base resolution : e.g. 7
         info.append(int(self.num_lods))  # max mip value : e.g. 10
 
-        info.append(int(self.n_features_per_level) * 2)  # 2 level
+        info.append(int(self.n_features_per_level))  # level
         info.append(int(self.n_frequencies))  # seq len : e.g. 6
         info.append(int(self.n_neurons))  # hidden size : e.g. 16
         info.append(int(self.n_hidden_layers))  # num hidden layes : e.g. 1
@@ -258,30 +253,37 @@ class TCNNModel(torch.nn.Module):
             # quant_model_path = os.path.join(self.model_path, f"{curr_iter}_quant.pt")
             quant_model_path = os.path.join(model_path, f"{curr_iter}_quant.npz")
 
-            features_1 = save_model.hash_grid_1.state_dict()["params"]
-            packed_features_1 = pack_features(features_1, quantize_bits=save_model.quantize_bits, save_bits=save_model.save_bits)
-
-            features_2 = save_model.hash_grid_2.state_dict()["params"]
-            packed_features_2 = pack_features(features_2, quantize_bits=save_model.quantize_bits, save_bits=save_model.save_bits)
-            # unpacked_features = unpack_features(packed_features, quantize_bits=save_model.quantize_bits, save_bits=save_model.save_bits)
-            # print(torch.abs(unpacked_features - features).sum())
+            packed_features_list = []
+            for hash_grid in save_model.hash_grids:
+                features = hash_grid.state_dict()["params"]
+                packed_features = pack_features(features, quantize_bits=save_model.quantize_bits, save_bits=save_model.save_bits)
+                packed_features_list.append(packed_features)
+                # unpacked_features = unpack_features(packed_features, quantize_bits=save_model.quantize_bits, save_bits=save_model.save_bits)
+                # print(torch.abs(unpacked_features - features).sum())
 
             # generate model infos
             info = self.get_model_info()
 
             offset = 0
-            packed_features = torch.zeros([packed_features_1.shape[0] + packed_features_2.shape[0]], device=packed_features_1.device, dtype=packed_features_1.dtype)
+            all_packed_features = []
             for level in range(self.n_levels):
                 feature_size = self.base_resolution * 2 ** level
-                cur_level_features = torch.cat([
-                    packed_features_1[offset: offset + feature_size ** 2].reshape([feature_size, feature_size, 1]), packed_features_2[offset: offset + feature_size ** 2].reshape([feature_size, feature_size, 1])]
-                , dim=2)  # [feature_size, feature_size, 2]
-                packed_features[2 * offset: 2 * (offset + feature_size ** 2)] = cur_level_features.flatten()
+                cur_level_features_list = []
+
+                for packed_features in packed_features_list:
+                    # [feature_size * feature_size, 1] -> [feature_size, feature_size, 1]
+                    cur_level_features = packed_features[offset: offset + feature_size ** 2].reshape([feature_size, feature_size, 1])  
+                    cur_level_features_list.append(cur_level_features)
+                cur_level_features = torch.cat(cur_level_features_list, dim=2)  # [feature_size, feature_size, num_hash_grids]
+
+                all_packed_features.append(cur_level_features.flatten())
                 offset += feature_size ** 2
+            
+            all_packed_features = torch.cat(all_packed_features, dim=0)  # [feature_size * feature_size * num_hash_grids, 1]
 
             # torch.save(quant_model, quant_model_path)  # torch does not support saving uint16 tensor
             # TODO change to a description file and a npy data file
-            np.savez(quant_model_path, info=info, network=save_model.network.state_dict()["params"].numpy(), hash_grid=packed_features.cpu().numpy())
+            np.savez(quant_model_path, info=info, network=save_model.network.state_dict()["params"].numpy(), hash_grid=all_packed_features.cpu().numpy())
 
 class TCNNSplitModel(torch.nn.Module):
 

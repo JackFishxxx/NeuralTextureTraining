@@ -46,7 +46,7 @@ class Config():
         self.num_lods = 0
         self.n_frequencies = 8
         self.n_levels = 7
-        self.n_features_per_level = 8
+        self.n_features_per_level = 16
         self.base_resolution = 4
         self.n_neurons = 16
         self.n_hidden_layers = 1
@@ -59,7 +59,7 @@ def get_args():
                         help='root directory of dataset')
     parser.add_argument('--save_dir', type=str,
                         help='directory of dataset')
-    parser.add_argument('--load_iter', type=int, default=0,
+    parser.add_argument('--load_iter', type=int, default=-1,
                         help='0 -> do not load model, -1 means the newest')
     parser.add_argument('--load_dir', type=str,
                         help='')

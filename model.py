@@ -129,26 +129,21 @@ class TCNNModel(torch.nn.Module):
         
         # TODO
         ckpt_iter = config.load_iter
-        if config.load_iter == -1:
-            ckpt_iter = 0
-
-        ckpt_path = os.path.join(config.load_dir, "models", f"{ckpt_iter}_quant.npz")
-        ckpt_params = np.load(ckpt_path, allow_pickle=True).item()
-
-        state_dict = self.state_dict()
-        for key, value in ckpt_params.items():
+        ckpt_dir = os.path.join(config.load_dir, "models")
+        if ckpt_iter == -1:
+            files = [f for f in os.listdir(ckpt_dir) if f.endswith(".pth")]
+            if not files:
+                raise FileNotFoundError(f"No checkpoint found in {ckpt_dir}")
             
-            device = state_dict[f"{key}.params"].device
-            module_param = torch.from_numpy(value["params"]).to(device)
+            iters = [int(os.path.splitext(f)[0]) for f in files if os.path.splitext(f)[0].isdigit()]
+            if not iters:
+                raise ValueError(f"No valid iter checkpoints found in {ckpt_dir}")
 
-            if "hash_grid_1" in key:
-                module_param = unpack_features(module_param, quantize_bits=self.quantize_bits, save_bits=self.save_bits)
-            if "hash_grid_2" in key:
-                module_param = unpack_features(module_param, quantize_bits=self.quantize_bits, save_bits=self.save_bits)
+            ckpt_iter = max(iters)
 
-            state_dict[f"{key}.params"] = module_param
-
-        self.load_state_dict(state_dict)
+        ckpt_path = os.path.join(ckpt_dir, f"{ckpt_iter}.pth")
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        self.load_state_dict(ckpt)
    
     def forward(self, x: TensorType["batch_size", 3]) -> TensorType["batch_size", "num_channels"]:
 
@@ -238,7 +233,7 @@ class TCNNModel(torch.nn.Module):
         
         save_model = copy.deepcopy(self).cpu()
         save_path = os.path.join(model_path, f"{curr_iter}.pth")
-        torch.save(save_model, save_path)
+        torch.save(self.state_dict(), save_path)
 
         # tcnn does not support torch.quantization?
         # TODO need to figure out the grid feature storage

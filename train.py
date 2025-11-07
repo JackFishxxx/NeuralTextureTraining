@@ -113,6 +113,7 @@ class Trainer:
 
             # loss
             loss = self.L2_loss(gt_texture, predict_texture)
+            loss = loss.mean(dim=0)
             loss = loss.sum()
 
             self.writer.add_scalar('Loss/train', loss.item(), curr_iter)

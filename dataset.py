@@ -91,6 +91,9 @@ class TextureDataset(torch.nn.Module):
             
             filepath = os.path.join(self.data_dir, filename)
             texture_type = self.identify_texture_type(filename)
+
+            print(f"Input Texture: type='{texture_type}' , filename='{filename}'")
+
             if texture_type not in self.texture_configs:
                 raise ValueError(f"Unknown texture type: {texture_type}")
             color_mode = self.texture_configs[texture_type]['color_mode']
@@ -105,8 +108,9 @@ class TextureDataset(torch.nn.Module):
                 #     tensor = tensor.unsqueeze(2)
                 # tensor = tensor.permute(2, 0, 1)
 
-                # change srgb to linear to fit ue5
-                tensor = torch.pow(tensor, 2.2)
+                # change srgb to linear to fit ue5 when image is not Normal texture.
+                if texture_type != "normal":
+                    tensor = torch.pow(tensor, 2.2)
 
                 if tensor.shape[0] != expected_channels:
                     raise ValueError(f"Expected {expected_channels} channels, got {tensor.shape[0]}")

@@ -27,8 +27,8 @@ class Config():
         self.noise_std = params.noise_std
 
         # check quantize bits and save bits       
-        if self.quantize_bits >= self.save_bits:
-            raise ValueError("The save bits should be larger than the quantize bits.")
+        if self.save_bits < self.quantize_bits:
+            raise ValueError("The save bits should not be less than the quantize bits.")
 
         ### ---------- trainer configs ---------- ###
         self.max_iter = params.max_iter

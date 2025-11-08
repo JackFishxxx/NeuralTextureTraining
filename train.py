@@ -151,6 +151,9 @@ class Trainer:
 
         os.makedirs(os.path.join(self.media_path, "rgb"), exist_ok=True)
         os.makedirs(os.path.join(self.media_path, "normal"), exist_ok=True)
+        os.makedirs(os.path.join(self.media_path, "roughness"), exist_ok=True)
+        os.makedirs(os.path.join(self.media_path, "occlusion"), exist_ok=True)
+        os.makedirs(os.path.join(self.media_path, "displacement"), exist_ok=True)
 
         quant_model = copy.deepcopy(self.model)
         quant_model.simulate_quantize()
@@ -196,13 +199,43 @@ class Trainer:
             if curr_iter % (self.eval_interval * 2) == 0:
                 save_image = torch.cat([predicted_image, gt_image], dim=3).squeeze()
 
-                rgb_image = save_image[0:3, ...]
-                rgb_path = os.path.join(self.media_path, "rgb", f"{curr_iter}_{int(lod)}.png")
-                TF.to_pil_image(rgb_image).save(rgb_path)
+                # Use dataset-provided channel mapping if available
+                channel_slices = getattr(self.dataset, 'channel_slices', {})
 
-                normal_image = save_image[3:6, ...]
-                normal_path = os.path.join(self.media_path, "normal", f"{curr_iter}_{int(lod)}.png")
-                TF.to_pil_image(normal_image).save(normal_path)
+                # Diffuse (RGB)
+                if 'diffuse' in channel_slices:
+                    s, e = channel_slices['diffuse']
+                    rgb_image = save_image[s:e, ...]
+                    rgb_path = os.path.join(self.media_path, "rgb", f"{curr_iter}_{int(lod)}.png")
+                    TF.to_pil_image(rgb_image).save(rgb_path)
+
+                # Normal (RGB)
+                if 'normal' in channel_slices:
+                    s, e = channel_slices['normal']
+                    normal_image = save_image[s:e, ...]
+                    normal_path = os.path.join(self.media_path, "normal", f"{curr_iter}_{int(lod)}.png")
+                    TF.to_pil_image(normal_image).save(normal_path)
+
+                # Roughness (1ch)
+                if 'roughness' in channel_slices:
+                    s, e = channel_slices['roughness']
+                    rough_image = save_image[s:e, ...]
+                    rough_path = os.path.join(self.media_path, "roughness", f"{curr_iter}_{int(lod)}.png")
+                    TF.to_pil_image(rough_image).save(rough_path)
+
+                # Occlusion (1ch)
+                if 'occlusion' in channel_slices:
+                    s, e = channel_slices['occlusion']
+                    ao_image = save_image[s:e, ...]
+                    ao_path = os.path.join(self.media_path, "occlusion", f"{curr_iter}_{int(lod)}.png")
+                    TF.to_pil_image(ao_image).save(ao_path)
+
+                # Displacement (1ch)
+                if 'displacement' in channel_slices:
+                    s, e = channel_slices['displacement']
+                    disp_image = save_image[s:e, ...]
+                    disp_path = os.path.join(self.media_path, "displacement", f"{curr_iter}_{int(lod)}.png")
+                    TF.to_pil_image(disp_image).save(disp_path)
         
         psnr_aver = torch.tensor(psnr_list).mean()
         ssim_aver = torch.tensor(ssim_list).mean()
@@ -222,6 +255,9 @@ class Trainer:
 
         os.makedirs(os.path.join(self.infer_path, "rgb"), exist_ok=True)
         os.makedirs(os.path.join(self.infer_path, "normal"), exist_ok=True)
+        os.makedirs(os.path.join(self.infer_path, "roughness"), exist_ok=True)
+        os.makedirs(os.path.join(self.infer_path, "occlusion"), exist_ok=True)
+        os.makedirs(os.path.join(self.infer_path, "displacement"), exist_ok=True)
 
         metrics = f"LOD PSNR SSIM LPIPS\n"
 
@@ -262,13 +298,37 @@ class Trainer:
 
             save_image = torch.cat([predicted_image, gt_image], dim=3).squeeze()
 
-            rgb_image = save_image[0:3, ...]
-            rgb_path = os.path.join(self.infer_path, "rgb", f"LOD_{int(lod)}.png")
-            TF.to_pil_image(rgb_image).save(rgb_path)
+            channel_slices = getattr(self.dataset, 'channel_slices', {})
 
-            normal_image = save_image[3:6, ...]
-            normal_path = os.path.join(self.infer_path, "normal", f"LOD_{int(lod)}.png")
-            TF.to_pil_image(normal_image).save(normal_path)
+            if 'diffuse' in channel_slices:
+                s, e = channel_slices['diffuse']
+                rgb_image = save_image[s:e, ...]
+                rgb_path = os.path.join(self.infer_path, "rgb", f"LOD_{int(lod)}.png")
+                TF.to_pil_image(rgb_image).save(rgb_path)
+
+            if 'normal' in channel_slices:
+                s, e = channel_slices['normal']
+                normal_image = save_image[s:e, ...]
+                normal_path = os.path.join(self.infer_path, "normal", f"LOD_{int(lod)}.png")
+                TF.to_pil_image(normal_image).save(normal_path)
+
+            if 'roughness' in channel_slices:
+                s, e = channel_slices['roughness']
+                rough_image = save_image[s:e, ...]
+                rough_path = os.path.join(self.infer_path, "roughness", f"LOD_{int(lod)}.png")
+                TF.to_pil_image(rough_image).save(rough_path)
+
+            if 'occlusion' in channel_slices:
+                s, e = channel_slices['occlusion']
+                ao_image = save_image[s:e, ...]
+                ao_path = os.path.join(self.infer_path, "occlusion", f"LOD_{int(lod)}.png")
+                TF.to_pil_image(ao_image).save(ao_path)
+
+            if 'displacement' in channel_slices:
+                s, e = channel_slices['displacement']
+                disp_image = save_image[s:e, ...]
+                disp_path = os.path.join(self.infer_path, "displacement", f"LOD_{int(lod)}.png")
+                TF.to_pil_image(disp_image).save(disp_path)
 
             metrics += f"LOD_{int(lod)} {psnr_value:.4f} {ssim_value:.4f} {lpips_value:.4f}\n"
         

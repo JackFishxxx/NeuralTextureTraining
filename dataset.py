@@ -49,6 +49,11 @@ class TextureDataset(torch.nn.Module):
         self.data_dir = config.data_dir
 
         self.keyword_order, self.texture_keywords, self.texture_configs = get_texture_config()
+        # mapping from texture type to channel slice [start, end)
+        self.channel_slices = {}
+        # ordered available texture types that were found and concatenated
+        self.available_textures = []
+
         self.textures = self.load_data()
         self.texture_height, self.texture_width, self.num_channels = self.textures.shape
         
@@ -119,12 +124,18 @@ class TextureDataset(torch.nn.Module):
         
         textures_ordered = []
         current_index = 0
+        self.channel_slices = {}
+        self.available_textures = []
         for texture_type in self.keyword_order:
             if texture_type in textures and textures[texture_type] is not None:
-                textures_ordered.append(textures[texture_type])
-                # self.material_slices[texture_type] = (current_index, current_index + textures[texture_type].shape[0])
-                current_index += textures[texture_type].shape[0]
-                # self.material_count += 1
+                tex = textures[texture_type]
+                textures_ordered.append(tex)
+                start = current_index
+                end = current_index + tex.shape[0]
+                self.channel_slices[texture_type] = (start, end)
+                self.available_textures.append(texture_type)
+                current_index = end
+                
 
         textures_ordered = torch.cat(textures_ordered, dim=0).permute(1, 2, 0).to(self.device)  # [C, H, W] -> [H, W, C]
 

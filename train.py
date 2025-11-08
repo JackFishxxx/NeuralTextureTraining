@@ -206,6 +206,9 @@ class Trainer:
                 if 'diffuse' in channel_slices:
                     s, e = channel_slices['diffuse']
                     rgb_image = save_image[s:e, ...]
+                    # convert from linear to sRGB for visualization
+                    rgb_image = torch.clamp(rgb_image, 0.0, 1.0)
+                    rgb_image = torch.pow(rgb_image, 1.0 / 2.2)
                     rgb_path = os.path.join(self.media_path, "rgb", f"{curr_iter}_{int(lod)}.png")
                     TF.to_pil_image(rgb_image).save(rgb_path)
 
@@ -213,8 +216,13 @@ class Trainer:
                 if 'normal' in channel_slices:
                     s, e = channel_slices['normal']
                     normal_image = save_image[s:e, ...]
+                    # visualize normals by re-normalizing vectors: [0,1]→[-1,1]→unit→[0,1]
+                    n = normal_image * 2.0 - 1.0
+                    norm = torch.sqrt(torch.clamp((n ** 2).sum(dim=0, keepdim=True), min=1e-8))
+                    n = n / norm
+                    normal_vis = torch.clamp((n + 1.0) * 0.5, 0.0, 1.0)
                     normal_path = os.path.join(self.media_path, "normal", f"{curr_iter}_{int(lod)}.png")
-                    TF.to_pil_image(normal_image).save(normal_path)
+                    TF.to_pil_image(normal_vis).save(normal_path)
 
                 # Roughness (1ch)
                 if 'roughness' in channel_slices:
@@ -303,14 +311,22 @@ class Trainer:
             if 'diffuse' in channel_slices:
                 s, e = channel_slices['diffuse']
                 rgb_image = save_image[s:e, ...]
+                # convert from linear to sRGB for visualization
+                rgb_image = torch.clamp(rgb_image, 0.0, 1.0)
+                rgb_image = torch.pow(rgb_image, 1.0 / 2.2)
                 rgb_path = os.path.join(self.infer_path, "rgb", f"LOD_{int(lod)}.png")
                 TF.to_pil_image(rgb_image).save(rgb_path)
 
             if 'normal' in channel_slices:
                 s, e = channel_slices['normal']
                 normal_image = save_image[s:e, ...]
+                # visualize normals by re-normalizing vectors: [0,1]→[-1,1]→unit→[0,1]
+                n = normal_image * 2.0 - 1.0
+                norm = torch.sqrt(torch.clamp((n ** 2).sum(dim=0, keepdim=True), min=1e-8))
+                n = n / norm
+                normal_vis = torch.clamp((n + 1.0) * 0.5, 0.0, 1.0)
                 normal_path = os.path.join(self.infer_path, "normal", f"LOD_{int(lod)}.png")
-                TF.to_pil_image(normal_image).save(normal_path)
+                TF.to_pil_image(normal_vis).save(normal_path)
 
             if 'roughness' in channel_slices:
                 s, e = channel_slices['roughness']

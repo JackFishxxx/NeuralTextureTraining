@@ -56,7 +56,7 @@ class Trainer:
         os.makedirs(self.log_path, exist_ok=True)
         os.makedirs(self.model_path, exist_ok=True)
         os.makedirs(self.media_path, exist_ok=True)  
-        if configs.load_iter != 0:
+        if configs.load_dir is not None:
             self.infer_path = os.path.join(configs.load_dir, "infer")
             os.makedirs(self.infer_path, exist_ok=True)  
 

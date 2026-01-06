@@ -21,7 +21,17 @@ In February 2025, NVIDIA open-sourced the [RTXNTC SDK](https://github.com/NVIDIA
 - **This project**  
   - Does **not** rely on CoopVec or CoopMat. Instead, it is implemented directly with PyTorch and tiny-cuda-nn, making it simpler and easier to understand.  
   - Provides **full UE5 plugin integration**: Neural Textures can be imported as custom resources (similar to PNG/JPG) and directly sampled in the material system.  
-  - Supports the entire pipeline of training, quantization, and export, suitable for both research and production use.  
+  - Supports the entire pipeline of training, quantization, and export, suitable for both research and production use.
+
+# UE Plugin Integration
+
+We provide a full Unreal Engine plugin integration for NeuralTexture, tested on Unreal Engine 5.5 (other engine versions may require minor adjustments). With the plugin, Neural Textures can be imported as custom assets (similar to PNG/JPG) and sampled directly in the Material system. The runtime inference is executed fully in shaders (no CUDA / PyTorch required).
+
+## Full UE Project Source (Access Required)
+
+For a complete Unreal Engine project with full plugin support, please refer to [JackFishxxx/UnrealEngine](https://github.com/JackFishxxx/UnrealEngine/tree/5.5.1-ntc). Note that this repository is forked from EpicGames' Unreal Engine source repository. Therefore, it inherits EpicGames access restrictions. You must have Unreal Engine GitHub access (i.e., your GitHub account has joined the EpicGames organization) before you can view or clone it.
+
+If you do not have access yet, follow [EpicGames' official guide](https://www.unrealengine.com/en-US/ue-on-github) or [Doc of downloading source code](https://dev.epicgames.com/documentation/en-us/unreal-engine/downloading-source-code-in-unreal-engine) to link your Epic Games account with GitHub and accept the organization invitation.
 
 # Pipeline
 

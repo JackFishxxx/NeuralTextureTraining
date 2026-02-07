@@ -121,7 +121,7 @@ class Trainer:
             # optimize
             loss.backward()
             self.model.optimizer.step()
-            self.model.scheduler.step(metrics=loss)
+            self.model.scheduler.step(metrics=loss.item())
 
             # print(self.model.optimizer.param_groups[0]['lr'], self.model.optimizer.param_groups[1]['lr'])
 

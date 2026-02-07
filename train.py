@@ -113,7 +113,10 @@ class Trainer:
 
             # loss
             loss = self.L2_loss(gt_texture, predict_texture)
-            loss = loss.mean(dim=0)
+            # custom loss weights for different channels(albedo.rgb, normal.xyz, roughness, ao, displacement)
+            # TODO: make it configurable
+            loss = loss.mean(dim=0) * loss_weights
+            loss_weights = torch.tensor([1.0, 1.0, 1.0, 0.7, 0.7, 0.7, 0.3, 0.3, 0.3]).to(self.device)
             loss = loss.sum()
 
             self.writer.add_scalar('Loss/train', loss.item(), curr_iter)

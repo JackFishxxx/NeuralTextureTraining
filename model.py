@@ -256,7 +256,8 @@ class TCNNModel(torch.nn.Module):
         info.append(int(self.n_hidden_layers))
         info.append(int((self.num_channels // 16 + 1) * 16))
 
-        info = np.array(info)
+        info = np.array(info, dtype=np.int32)
+        #print(info) # debug npz header
 
         return info
 

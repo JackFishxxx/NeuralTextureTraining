@@ -255,8 +255,12 @@ class TCNNModel(torch.nn.Module):
     def save(self, curr_iter: int, model_path: str) -> None:
         
         save_model = copy.deepcopy(self).cpu()
-        save_path = os.path.join(model_path, f"{curr_iter}.pth")
-        torch.save(self.state_dict(), save_path)
+
+        save_path = os.path.join(model_path, f"train_result_{curr_iter}")
+        os.makedirs(save_path, exist_ok=True)
+
+        model_path = os.path.join(save_path, f"model.pth")
+        torch.save(self.state_dict(), model_path)
 
         # tcnn does not support torch.quantization?
         # TODO need to figure out the grid feature storage
@@ -267,34 +271,81 @@ class TCNNModel(torch.nn.Module):
 
             save_model.simulate_quantize()
 
-            # process the range of weights and features
-            # quant_model_path = os.path.join(self.model_path, f"{curr_iter}_quant.pt")
-            quant_model_path = os.path.join(model_path, f"{curr_iter}_quant.npz")
-
-            # pack each grid separately and save per-grid blobs + metadata
-            packed_features_list = []
-            for hash_grid in save_model.hash_grids:
-                features = hash_grid.state_dict()["params"]
-                packed_features = pack_features(features, quantize_bits=save_model.quantize_bits, save_bits=save_model.save_bits)
-                packed_features_list.append(packed_features)
-                # unpacked_features = unpack_features(packed_features, quantize_bits=save_model.quantize_bits, save_bits=save_model.save_bits)
-                # print(torch.abs(unpacked_features - features).sum())
+            # ----------------------------------------------------------------------------------
+            # - process the range of network weights
+            # ----------------------------------------------------------------------------------
 
             # generate model infos
             info = self.get_model_info()
 
-            # build simple per-grid metadata: [base_res, n_levels, n_features_per_level]
-            grid_meta = np.array([
-                [int(b), int(l), int(f)]
-                for b, l, f in zip(self.hash_grid_base_res, self.hash_grid_n_levels, self.hash_grid_feature_sizes)
-            ], dtype=np.int32)
-
             save_kwargs = {
                 'info': info,
-                'network': save_model.network.state_dict()["params"].numpy(),
-                'grid_meta': grid_meta,
+                'network': save_model.network.state_dict()["params"].numpy()
             }
-            for i, pf in enumerate(packed_features_list):
-                save_kwargs[f'hash_grid_{i}'] = pf.cpu().numpy()
+            
+            network_data_path = os.path.join(save_path, f"network_data.npz")
+            # Save parameters to npz (features moved to DDS files)
+            np.savez(network_data_path, **save_kwargs)
 
-            np.savez(quant_model_path, **save_kwargs)
+            # ----------------------------------------------------------------------------------
+            # - process the range of feature textures
+            # ----------------------------------------------------------------------------------
+
+            # collect per-grid quantized integer features (one entry per feature)
+            # Only grids with quantize_bits==8 and save_bits==32 are supported for DDS export
+            quant_ints_list = []
+            matching_indices = []
+            for i, hash_grid in enumerate(save_model.hash_grids):
+                qbits = int(save_model.hash_grid_quantize_bits[i])
+                sbits = int(save_model.hash_grid_save_bits[i])
+                features = hash_grid.state_dict()["params"]
+                # map float quantized features back to integer range [0, 2^qbits - 1]
+                N_k = 2 ** qbits
+                min_q = - (N_k - 1) / 2 * (1.0 / N_k)
+                ints = torch.round((features + (-min_q)) * (2 ** qbits))
+                ints = torch.clamp(ints, min=0., max=2 ** qbits - 1).to(torch.int64)
+                quant_ints_list.append(ints)
+                matching_indices.append(i)
+
+            # Convert packed features to uint8 for R8G8B8A8 format
+            # Packed features are in the range [0, 2^quantize_bits - 1]
+            # We need to scale them to [0, 255] for uint8
+            scale_factor = 255.0 / (2 ** save_model.quantize_bits - 1)
+
+            # For each matching grid, extract highest-resolution level and form a single R8G8B8A8 DDS
+            for idx, ints in enumerate(quant_ints_list):
+                orig_i = matching_indices[idx]
+                ints_np = ints.cpu().numpy()
+                base_res = int(self.hash_grid_base_res[orig_i])
+                n_levels = int(self.hash_grid_n_levels[orig_i])
+                n_fpl = int(self.hash_grid_n_features_per_level[orig_i])
+
+                # compute offset to the highest resolution level (in feature units)
+                offset = 0
+                for level in range(n_levels - 1):
+                    feature_size = base_res * (2 ** level)
+                    offset += n_fpl * feature_size ** 2
+
+                max_res_size = base_res * (2 ** (n_levels - 1))
+                max_res_features = n_fpl * max_res_size ** 2
+
+                level_features = ints_np[offset: offset + max_res_features]
+                # reshape into [H, W, n_fpl]
+                try:
+                    level_features = level_features.reshape(max_res_size, max_res_size, n_fpl)
+                except Exception:
+                    raise ValueError(f"Cannot reshape grid {orig_i} features of length {level_features.size} into ({max_res_size},{max_res_size},{n_fpl})")
+
+                # Build RGBA channels from the first up to 4 feature channels
+                channels = []
+                for c in range(4):
+                    if c < n_fpl:
+                        ch = (level_features[:, :, c] * scale_factor).astype(np.uint8)
+                    else:
+                        ch = np.zeros((max_res_size, max_res_size), dtype=np.uint8)
+                    channels.append(ch)
+
+                rgba = np.stack(channels, axis=2)
+                dds_path = os.path.join(save_path, f"hash_grid_{orig_i}.dds")
+                write_dds_r8g8b8a8(dds_path, max_res_size, max_res_size, rgba)
+            

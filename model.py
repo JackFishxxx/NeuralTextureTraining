@@ -1,4 +1,5 @@
 import os
+import math
 import torch
 import copy
 import numpy as np
@@ -9,8 +10,8 @@ from configs import Config
 
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 
-from utils import pack_features, unpack_features
 
+from utils import pack_features, unpack_features, write_dds_r8g8b8a8
 
 class TCNNModel(torch.nn.Module):
 
@@ -30,8 +31,6 @@ class TCNNModel(torch.nn.Module):
         self.noise_range = 1 / 2 * self.Q_k
 
         self.num_lods = config.num_lods
-        self.base_resolution = config.base_resolution
-
         self.n_frequencies = config.n_frequencies
         self.n_neurons = config.n_neurons
         self.n_hidden_layers = config.n_hidden_layers
@@ -62,59 +61,49 @@ class TCNNModel(torch.nn.Module):
         # support heterogeneous hash grid configs from configs.py
         # if not provided, fall back to legacy behavior
         self.hash_grids = torch.nn.ModuleList()
-        self.hash_grid_feature_sizes = []  # per-grid n_features_per_level
-        self.hash_grid_n_levels = []       # per-grid n_levels
         self.hash_grid_base_res = []       # per-grid base_resolution
+        self.hash_grid_n_levels = []       # per-grid n_levels
+        self.hash_grid_n_features_per_level = []  # per-grid n_features_per_level
         self.hash_grid_quantize_bits = []  # per-grid quantize bits (fallback to global)
         self.hash_grid_save_bits = []      # per-grid save bits (fallback to global)
 
         for grid_cfg in config.hash_grid_configs:
-            # Derive base_resolution
-            base_res = int(grid_cfg.get('base_resolution', config.base_resolution))
-
-            # Derive n_levels (prefer explicit, else from max_resolution)
-            if 'n_levels' in grid_cfg:
-                n_lvls = int(grid_cfg['n_levels'])
-            else:
-                max_res = grid_cfg.get('max_resolution', None)
-                if max_res is None:
-                    # fallback to global when neither provided
-                    n_lvls = int(config.n_levels)
-                else:
-                    # n_levels = floor(log2(max_res / base_res)) + 1
-                    n_lvls = int(torch.floor(torch.log2(torch.tensor(max_res / base_res))) + 1)
-                    n_lvls = max(1, n_lvls)
-
-            # Derive n_features_per_level (prefer explicit, else from bits)
-            if 'n_features_per_level' in grid_cfg:
-                fpl = int(grid_cfg['n_features_per_level'])
-            else:
-                qbits = int(grid_cfg.get('quantize_bits', self.quantize_bits))
-                sbits = int(grid_cfg.get('save_bits', self.save_bits))
-                fpl = int(sbits // qbits)
-                fpl = max(1, fpl)
-
-            # Per-grid bits info (default to model-level if unspecified)
+            max_res = int(grid_cfg.get('max_resolution', 0))
+            n_levels = int(grid_cfg.get("n_levels", 0))
             qbits = int(grid_cfg.get('quantize_bits', self.quantize_bits))
             sbits = int(grid_cfg.get('save_bits', self.save_bits))
+            n_feature_per_level = sbits // qbits
+
+            # Derive base_resolution
+            base_res = int(max_res >> (n_levels - 1))
+            if base_res == 0:
+                print(f"Warning: max_resolution {max_res} is too small for {n_levels} levels with scale 2. Clamping base_res to 1.")
+                base_res = 1
+
+            log2_hashmap_size = int(math.log2(max_res)) * 2
 
             hash_grid_config = {
                 "otype": "Grid",
-                "type": "Hash",
-                "n_levels": int(n_lvls),
-                "n_features_per_level": int(fpl),
-                "base_resolution": int(base_res),
+                "type": "Dense",
+                "n_levels": n_levels,
+                "n_features_per_level": n_feature_per_level,
+                "base_resolution": base_res,
+                "per_level_scale": 2.0,
+                # "log2_hashmap_size": log2_hashmap_size,
+                "interpolation": "Linear",
             }
             hash_grid = tcnn.Encoding(
                 n_input_dims=2,
                 encoding_config=hash_grid_config
             )
             self.hash_grids.append(hash_grid)
-            self.hash_grid_feature_sizes.append(int(fpl))
-            self.hash_grid_n_levels.append(int(n_lvls))
             self.hash_grid_base_res.append(int(base_res))
+            self.hash_grid_n_levels.append(int(n_levels))
+            self.hash_grid_n_features_per_level.append(int(n_feature_per_level))
             self.hash_grid_quantize_bits.append(int(qbits))
             self.hash_grid_save_bits.append(int(sbits))
+
+            print(f"Initialized hash grid: max_res={max_res}, base_res={base_res}, n_levels={n_levels}, n_features_per_level={n_feature_per_level}, quantize_bits={qbits}, save_bits={sbits}")
 
         # ReLU: converg slowly
         # LeakyReLU: PSNR: 28.85, LPIPS: 0.2205(last time was 0.19)
@@ -128,8 +117,9 @@ class TCNNModel(torch.nn.Module):
             "n_neurons": config.n_neurons,
             "n_hidden_layers": config.n_hidden_layers
         }
-        total_grid_features = sum(self.hash_grid_feature_sizes) * self.num_sampled_lods
+        total_grid_features = sum(self.hash_grid_n_features_per_level) * self.num_sampled_lods
         n_input_dims = config.n_frequencies * 2 + total_grid_features + 1
+        print(f"total_grid_features={total_grid_features}, n_input_dims={n_input_dims}")
         self.network = tcnn.Network(
             n_input_dims=n_input_dims,
             n_output_dims=config.num_channels,
@@ -190,7 +180,7 @@ class TCNNModel(torch.nn.Module):
         features = []
         for idx, hash_grid in enumerate(self.hash_grids):
             grid_levels = self.hash_grid_n_levels[idx]
-            grid_fpl = self.hash_grid_feature_sizes[idx]
+            grid_fpl = self.hash_grid_n_features_per_level[idx]
 
             all_features = hash_grid(uvs)  # [B, grid_levels * grid_fpl]
             clipped_mips = torch.clamp(mips, max=grid_levels - num_sampled_lods)
@@ -246,7 +236,7 @@ class TCNNModel(torch.nn.Module):
         for i in range(num_grids):
             info.append(int(self.hash_grid_base_res[i]))
             info.append(int(self.hash_grid_n_levels[i]))
-            info.append(int(self.hash_grid_feature_sizes[i]))
+            info.append(int(self.hash_grid_n_features_per_level[i]))
             info.append(int(self.hash_grid_quantize_bits[i]))
             info.append(int(self.hash_grid_save_bits[i]))
 

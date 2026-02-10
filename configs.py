@@ -52,7 +52,7 @@ class Config():
             {"max_resolution": 1024, "quantize_bits":8, "save_bits":32, "learning_rate": 0.002},
             {"max_resolution": 512, "quantize_bits":8, "save_bits":32, "learning_rate": 0.005},
         ]
-        self.output_loss_weights = [1.0, 1.0, 1.0, 0.7, 0.7, 0.7, 0.3, 0.7, 0.3]
+        self.output_loss_weights = [1.0, 1.0, 1.0, 0.7, 0.7, 0.7, 0.3, 0.3, 0.3]
         self.network_learning_rate = params.learning_rate
 
         # Normalize configs to the internal format expected by the model

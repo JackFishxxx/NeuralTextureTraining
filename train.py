@@ -65,6 +65,9 @@ class Trainer:
         self.texture_height = dataset.texture_height
         self.texture_width = dataset.texture_width
 
+        # loss weights
+        self.output_loss_weights = configs.output_loss_weights
+
         self.sample_probabilities = self.generate_probabilities()      
 
         # losses
@@ -114,8 +117,7 @@ class Trainer:
             # loss
             loss = self.L2_loss(gt_texture, predict_texture)
             # custom loss weights for different channels(albedo.rgb, normal.xyz, roughness, ao, displacement)
-            # TODO: make it configurable
-            loss_weights = torch.tensor([1.0, 1.0, 1.0, 0.7, 0.7, 0.7, 0.3, 0.3, 0.3]).to(self.device)
+            loss_weights = torch.tensor(self.output_loss_weights).to(self.device)
             loss = loss.mean(dim=0) * loss_weights
             loss = loss.sum()
 

@@ -47,11 +47,13 @@ class Config():
 
         # By default, None → use legacy behavior (uniform grids based on n_features_per_level).
         self.hash_grid_configs: Optional[List[Dict]] = getattr(params, 'hash_grid_configs', None)
-        # Optional: heterogeneous hash grid configs
+        # Multi-HashGrid configs
         self.hash_grid_configs = [
-            {"max_resolution": 1024, "quantize_bits":8, "save_bits":32},
-            {"max_resolution": 512, "quantize_bits":8, "save_bits":32},
+            {"max_resolution": 1024, "quantize_bits":8, "save_bits":32, "learning_rate": 0.002},
+            {"max_resolution": 512, "quantize_bits":8, "save_bits":32, "learning_rate": 0.005},
         ]
+        self.output_loss_weights = [1.0, 1.0, 1.0, 0.7, 0.7, 0.7, 0.3, 0.7, 0.3]
+        self.network_learning_rate = params.learning_rate
 
         # Normalize configs to the internal format expected by the model
         if self.hash_grid_configs is not None:
@@ -74,11 +76,14 @@ class Config():
                 if sbits < qbits:
                     raise ValueError("The save bits should not be less than the quantize bits.")
 
+                lr = cfg.get("learning_rate", self.learning_rate)
+
                 processed.append({
                     "max_resolution": max_res,
                     "n_levels": n_levels,
                     "quantize_bits": qbits,
                     "save_bits": sbits,
+                    "learning_rate": lr,
                 })
 
             self.hash_grid_configs = processed

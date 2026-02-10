@@ -36,6 +36,10 @@ class TCNNModel(torch.nn.Module):
         self.n_hidden_layers = config.n_hidden_layers
         self.num_channels = config.num_channels
 
+        self.hash_grid_learning_rates = []
+        for grid_cfg in config.hash_grid_configs:
+            self.hash_grid_learning_rates.append(grid_cfg.get('learning_rate', config.learning_rate))
+
         self.init_model(config)
         if config.load_dir is not None:
             self.load_ckpt(config)
@@ -127,9 +131,10 @@ class TCNNModel(torch.nn.Module):
         )
 
         # add optimizer params config
-        optimizer_params = [{'params': self.network.parameters(), 'lr': 0.002}]
-        for hash_grid in self.hash_grids:
-            optimizer_params.append({'params': hash_grid.parameters(), 'lr': 0.005})
+        optimizer_params = [{'params': self.network.parameters(), 'lr': getattr(config, 'network_learning_rate', 0.002)}]
+        for idx, hash_grid in enumerate(self.hash_grids):
+            lr = self.hash_grid_learning_rates[idx]
+            optimizer_params.append({'params': hash_grid.parameters(), 'lr': lr})
         self.optimizer = torch.optim.Adam(optimizer_params)
         # the CosineAnnealingLR is too slow
         # self.scheduler = CosineAnnealingLR(self.optimizer, T_max=self.max_iter, eta_min=0.0)

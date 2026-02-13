@@ -30,6 +30,11 @@ class TCNNModel(torch.nn.Module):
         self.max_quantize_range = 1 / 2
         self.noise_range = 1 / 2 * self.Q_k
 
+        # Noise annealing: linearly decay noise from full strength to 0
+        # over the first noise_anneal_fraction of training
+        self.noise_anneal_iters = int(getattr(config, 'max_iter', 50000) * getattr(config, 'noise_anneal_fraction', 0.8))
+        self.current_iter = 0
+
         self.num_lods = config.num_lods
         self.n_frequencies = config.n_frequencies
         self.n_neurons = config.n_neurons
@@ -186,17 +191,36 @@ class TCNNModel(torch.nn.Module):
         for idx, hash_grid in enumerate(self.hash_grids):
             grid_levels = self.hash_grid_n_levels[idx]
             grid_fpl = self.hash_grid_n_features_per_level[idx]
+            qbits = self.hash_grid_quantize_bits[idx]
 
             all_features = hash_grid(uvs)  # [B, grid_levels * grid_fpl]
             clipped_mips = torch.clamp(mips, max=grid_levels - num_sampled_lods)
             cols = (grid_levels - num_sampled_lods - clipped_mips) * grid_fpl + torch.arange(grid_fpl * num_sampled_lods).to(self.device)
             sampled_features = torch.gather(all_features, 1, cols.to(torch.int64))
 
-            # TODO Check if we should add same noise to all features
-            if self.quantize:
-                # add symmetric noise
-                noise = 2 * self.noise_range * torch.rand(1).to(self.device) - self.noise_range
-                sampled_features = sampled_features + noise
+            if self.quantize and self.training:
+                # Per-grid quantization step size
+                N_k = 2 ** qbits
+                Q_k = 1.0 / N_k
+
+                # Noise annealing: linearly decay noise strength from 1.0 to 0.0
+                if self.noise_anneal_iters > 0:
+                    anneal_factor = max(0.0, 1.0 - self.current_iter / self.noise_anneal_iters)
+                else:
+                    anneal_factor = 1.0
+
+                # STE (Straight-Through Estimator) quantization simulation:
+                # Quantize in forward pass, but let gradients pass through unchanged.
+                # This is more accurate than additive uniform noise because it
+                # exactly simulates the rounding that happens at inference time,
+                # eliminating the systematic color bias caused by shared noise.
+                half_noise = 0.5 * Q_k * anneal_factor
+                noise = (torch.rand_like(sampled_features) * 2 - 1) * half_noise
+                sampled_features_noisy = sampled_features + noise
+                # Quantize (round to grid) then use STE
+                quantized = torch.round(sampled_features_noisy / Q_k) * Q_k
+                # Straight-through: forward uses quantized, backward uses sampled_features
+                sampled_features = sampled_features + (quantized - sampled_features).detach()
             
             features.append(sampled_features)
         features = torch.cat(features, dim=1)
@@ -226,9 +250,14 @@ class TCNNModel(torch.nn.Module):
     
     def clamp_value(self):
 
-        for hash_grid in self.hash_grids:
+        for idx, hash_grid in enumerate(self.hash_grids):
+            qbits = self.hash_grid_quantize_bits[idx]
+            N_k = 2 ** qbits
+            Q_k = 1.0 / N_k
+            min_q = -(N_k - 1) / 2 * Q_k
+            max_q = 0.5
             state_dict = hash_grid.state_dict()
-            state_dict['params'] = torch.clamp(state_dict['params'], min=self.min_quantize_range, max=self.max_quantize_range)
+            state_dict['params'] = torch.clamp(state_dict['params'], min=min_q, max=max_q)
             hash_grid.load_state_dict(state_dict)
 
     def get_model_info(self) -> np.array:

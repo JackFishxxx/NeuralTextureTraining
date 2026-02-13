@@ -26,6 +26,7 @@ class Config():
         self.quantize_bits = params.quantize_bits
         self.save_bits = params.save_bits
         self.noise_std = params.noise_std
+        self.noise_anneal_fraction = params.noise_anneal_fraction
 
         ### ---------- trainer configs ---------- ###
         self.max_iter = params.max_iter
@@ -131,6 +132,8 @@ def get_args():
                         choices=[8, 16, 32, 64])
     parser.add_argument('--noise_std', type=float, default=1.0,
                         help='std dev of noise added to regularize sigma')
+    parser.add_argument('--noise_anneal_fraction', type=float, default=0.8,
+                        help='fraction of training over which noise is annealed from full to zero (0.0 = no annealing, 1.0 = anneal over entire training)')
         
     ### ---------- trainer configs ---------- ###
     parser.add_argument('--max_iter', type=int, default=400000,

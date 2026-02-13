@@ -95,6 +95,9 @@ class Trainer:
 
             self.model.optimizer.zero_grad()
 
+            # update model's current iteration for noise annealing
+            self.model.current_iter = curr_iter
+
             # generate random indexs
             ys = torch.randint(0, self.texture_height, [self.batch_size, 1]).to(self.device)
             xs = torch.randint(0, self.texture_width, [self.batch_size, 1]).to(self.device)

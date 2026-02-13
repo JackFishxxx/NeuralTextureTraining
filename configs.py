@@ -21,6 +21,26 @@ class Config():
         self.load_dir = params.load_dir
         self.mode = params.mode
 
+        ### ---------- groups batching configs ---------- ###
+        self.groups_batching = params.groups_batching
+        self.groups_batch_dir = params.groups_batch_dir
+        self.groups_save_dir = params.groups_save_dir
+        self.groups_max_workers = params.groups_max_workers
+        self.groups_verbose = params.groups_verbose
+        # Auto-discover all texture group subdirectories under groups_batch_dir
+        if self.groups_batching:
+            if not os.path.isdir(self.groups_batch_dir):
+                raise ValueError(f"groups_batch_dir '{self.groups_batch_dir}' does not exist or is not a directory.")
+            self.groups_list: List[str] = sorted([
+                d for d in os.listdir(self.groups_batch_dir)
+                if os.path.isdir(os.path.join(self.groups_batch_dir, d))
+            ])
+            if len(self.groups_list) == 0:
+                raise ValueError(f"No texture group subdirectories found in '{self.groups_batch_dir}'.")
+            print(f"[GroupsBatching] Found {len(self.groups_list)} texture groups: {self.groups_list}")
+        else:
+            self.groups_list: List[str] = []
+
         ### ---------- quantization configs ---------- ###
         self.quantize = params.quantize
         self.quantize_bits = params.quantize_bits
@@ -116,6 +136,26 @@ class Config():
 
             self.hash_grid_configs = processed
 
+    def make_group_config(self, group_name: str) -> 'Config':
+        """Create a shallow copy of this Config with data_dir and save_dir
+        overridden for a specific texture group (used in GroupsBatching mode).
+
+        Args:
+            group_name: Name of the texture group subdirectory.
+
+        Returns:
+            A new Config object pointing to the specific group's data and save paths.
+        """
+        import copy
+        cfg = copy.copy(self)
+        cfg.data_dir = os.path.join(self.groups_batch_dir, group_name)
+        cfg.save_dir = os.path.join(self.groups_save_dir, group_name)
+        # Reset per-dataset fields so they get re-populated by the dataset
+        cfg.num_channels = 0
+        cfg.num_lods = 1
+        cfg.output_loss_weights = None
+        return cfg
+
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -131,7 +171,19 @@ def get_args():
     parser.add_argument('--mode', type=str, default="train",
                         help='',
                         choices=['train', 'infer'])
-    
+
+    ### ---------- groups batching configs ---------- ###
+    parser.add_argument('--groups_batching', action='store_true', default=False,
+                        help='enable GroupsBatching mode: train multiple texture groups from groups_batch_dir sequentially')
+    parser.add_argument('--groups_batch_dir', type=str, default='data_batch',
+                        help='root directory containing multiple texture group subdirectories (each subfolder is one texture group)')
+    parser.add_argument('--groups_save_dir', type=str, default='save_batch',
+                        help='root directory for saving GroupsBatching results (each group gets its own subfolder)')
+    parser.add_argument('--groups_max_workers', type=int, default=1,
+                        help='number of concurrent training workers for GroupsBatching (default 1 = sequential)')
+    parser.add_argument('--groups_verbose', action='store_true', default=False,
+                        help='print per-group training details instead of aggregate progress only')
+
     ### ---------- quantization configs ---------- ###
     parser.add_argument('--quantize', type=bool, default=True,
                         help='whether to quantize the model or not')

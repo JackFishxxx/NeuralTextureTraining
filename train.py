@@ -23,10 +23,13 @@ from configs import Config
 
 class Trainer:
 
-    def __init__(self, params: argparse.Namespace) -> None:
+    def __init__(self, params: argparse.Namespace, config_override: Config = None) -> None:
 
         # init required variables, e.g. dataset, configs and models
-        configs = Config(params)
+        if config_override is not None:
+            configs = config_override
+        else:
+            configs = Config(params)
         dataset = TextureDataset(configs)
         configs.num_channels = dataset.num_channels
         configs.num_lods = dataset.num_lods
@@ -190,7 +193,7 @@ class Trainer:
                 tcnn.free_temporary_memory()
 
     @torch.no_grad()
-    def eval(self, curr_iter) -> None:
+    def eval(self, curr_iter) -> float:
         
         psnr_list = []
         ssim_list = []
@@ -259,6 +262,8 @@ class Trainer:
         self.writer.add_scalar('LPIPS/train', lpips_aver.item(), curr_iter)
     
         print(f"Iter:{curr_iter}, PSNR:{psnr_aver.item():.4f}, SSIM:{ssim_aver.item():.4f}, LPIPS:{lpips_aver.item():.4f}")
+
+        return psnr_aver.item()
 
     def _postprocess_for_vis(self, image: torch.Tensor, vis_mode: str) -> torch.Tensor:
         """Apply visualization post-processing based on vis_mode.
@@ -407,11 +412,41 @@ if __name__ == "__main__":
 
     params = get_args()
 
-    trainer = Trainer(params)
+    configs = Config(params)
 
-    if params.mode == "train":
-        trainer.train()
-    elif params.mode == "infer":
-        trainer.infer()
+    if configs.groups_batching:
+        # GroupsBatching mode: iterate over all texture groups sequentially
+        print(f"[GroupsBatching] Starting batch training for {len(configs.groups_list)} groups...")
+        for idx, group_name in enumerate(configs.groups_list):
+            print(f"\n{'='*60}")
+            print(f"[GroupsBatching] Training group {idx+1}/{len(configs.groups_list)}: {group_name}")
+            print(f"{'='*60}")
+            group_cfg = configs.make_group_config(group_name)
+            try:
+                trainer = Trainer(params, config_override=group_cfg)
+                if params.mode == "train":
+                    trainer.train()
+                elif params.mode == "infer":
+                    trainer.infer()
+                else:
+                    raise ValueError("Error mode.")
+            except Exception as e:
+                print(f"[GroupsBatching] ERROR on group '{group_name}': {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+            finally:
+                # Free GPU memory between groups
+                torch.cuda.empty_cache()
+            print(f"[GroupsBatching] Finished group '{group_name}'")
+        print(f"\n[GroupsBatching] All groups completed.")
     else:
-        raise ValueError("Error mode.")
+        # Single-group mode (original behavior)
+        trainer = Trainer(params)
+
+        if params.mode == "train":
+            trainer.train()
+        elif params.mode == "infer":
+            trainer.infer()
+        else:
+            raise ValueError("Error mode.")

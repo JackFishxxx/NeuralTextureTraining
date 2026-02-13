@@ -110,15 +110,13 @@ def write_dds_r8g8b8a8(filepath: str, width: int, height: int, data: np.ndarray)
     # Calculate pitch (bytes per row)
     pitch = width * 4  # 4 bytes per pixel for RGBA8
 
-    # DDS_PIXELFORMAT structure
-    pf_size = 32
-    pf_flags = DDPF_RGB | DDPF_ALPHAPIXELS
-    pf_fourcc = 0
-    pf_rgb_bit_count = 32
-    pf_r_bit_mask = 0x000000FF
-    pf_g_bit_mask = 0x0000FF00
-    pf_b_bit_mask = 0x00FF0000
-    pf_a_bit_mask = 0xFF000000
+    # DX10 header constants
+    DX10_FOURCC = b'DX10'
+    DXGI_FORMAT_R8G8B8A8_UNORM = 28  # non-SRGB
+    D3D10_RESOURCE_DIMENSION_TEXTURE2D = 3
+    MISC_FLAG = 0
+    ARRAY_SIZE = 1
+    DXGI_SAMPLE_DESC = (1, 0)
 
     with open(filepath, 'wb') as f:
         # Write magic number
@@ -126,7 +124,8 @@ def write_dds_r8g8b8a8(filepath: str, width: int, height: int, data: np.ndarray)
 
         # Write DDS_HEADER
         f.write(struct.pack('<I', 124))  # dwSize
-        f.write(struct.pack('<I', DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PITCH | DDSD_PIXELFORMAT))  # dwFlags
+        # dwFlags
+        f.write(struct.pack('<I', DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PITCH | DDSD_PIXELFORMAT))
         f.write(struct.pack('<I', height))  # dwHeight
         f.write(struct.pack('<I', width))  # dwWidth
         f.write(struct.pack('<I', pitch))  # dwPitchOrLinearSize
@@ -134,7 +133,15 @@ def write_dds_r8g8b8a8(filepath: str, width: int, height: int, data: np.ndarray)
         f.write(struct.pack('<I', 1))  # dwMipMapCount
         f.write(struct.pack('<I', 0) * 11)  # dwReserved1[11]
 
-        # Write DDS_PIXELFORMAT
+        # Write DDS_PIXELFORMAT (with DX10 FourCC)
+        pf_size = 32
+        pf_flags = DDPF_FOURCC
+        pf_fourcc = struct.unpack('<I', DX10_FOURCC)[0]
+        pf_rgb_bit_count = 0
+        pf_r_bit_mask = 0
+        pf_g_bit_mask = 0
+        pf_b_bit_mask = 0
+        pf_a_bit_mask = 0
         f.write(struct.pack('<I', pf_size))
         f.write(struct.pack('<I', pf_flags))
         f.write(struct.pack('<I', pf_fourcc))
@@ -150,6 +157,14 @@ def write_dds_r8g8b8a8(filepath: str, width: int, height: int, data: np.ndarray)
         f.write(struct.pack('<I', 0))  # dwCaps3
         f.write(struct.pack('<I', 0))  # dwCaps4
         f.write(struct.pack('<I', 0))  # dwReserved2
+
+        # Write DDS_HEADER_DXT10
+        # DXGI_FORMAT, resourceDimension, miscFlag, arraySize, miscFlags2
+        f.write(struct.pack('<I', DXGI_FORMAT_R8G8B8A8_UNORM))
+        f.write(struct.pack('<I', D3D10_RESOURCE_DIMENSION_TEXTURE2D))
+        f.write(struct.pack('<I', MISC_FLAG))
+        f.write(struct.pack('<I', ARRAY_SIZE))
+        f.write(struct.pack('<I', 0))  # miscFlags2
 
         # Write pixel data (row by row)
         f.write(data.tobytes())

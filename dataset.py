@@ -125,6 +125,24 @@ class TextureDataset(torch.nn.Module):
 
             textures[texture_type] = tensor
         
+        # Determine target resolution from the first available texture
+        # and resize any mismatched textures to ensure consistent spatial dimensions
+        target_h, target_w = None, None
+        for texture_type in self.keyword_order:
+            if texture_type in textures:
+                _, h, w = textures[texture_type].shape
+                if target_h is None:
+                    target_h, target_w = h, w
+                elif h != target_h or w != target_w:
+                    print(f"Warning: Resizing '{texture_type}' from {h}x{w} to {target_h}x{target_w} "
+                          f"to match other textures.")
+                    textures[texture_type] = TF.resize(
+                        textures[texture_type], [target_h, target_w],
+                        interpolation=TF.InterpolationMode.BICUBIC,
+                        antialias=True,
+                    )
+                    textures[texture_type] = torch.clamp(textures[texture_type], 0.0, 1.0)
+
         textures_ordered = []
         current_index = 0
         self.channel_slices = {}

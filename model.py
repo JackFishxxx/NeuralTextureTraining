@@ -41,6 +41,16 @@ class TCNNModel(torch.nn.Module):
         self.n_hidden_layers = config.n_hidden_layers
         self.num_channels = config.num_channels
 
+        # Make feature grids tile seamlessly under wrap/repeat sampling.
+        # Can be disabled or softened from config if needed.
+        self.wrap_boundary_constraint = bool(getattr(config, 'wrap_boundary_constraint', True))
+        self.wrap_boundary_strength = float(getattr(config, 'wrap_boundary_strength', 1.0))
+        # Performance knobs for boundary constraint.
+        # Apply every N iterations (1 = every iter).
+        self.wrap_boundary_interval = max(1, int(getattr(config, 'wrap_boundary_interval', 16)))
+        # Constrain only the highest K levels (1 = highest level only).
+        self.wrap_boundary_levels = max(1, int(getattr(config, 'wrap_boundary_levels', 1)))
+
         self.hash_grid_learning_rates = []
         for grid_cfg in config.hash_grid_configs:
             self.hash_grid_learning_rates.append(grid_cfg.get('learning_rate', config.learning_rate))
@@ -175,7 +185,8 @@ class TCNNModel(torch.nn.Module):
     def forward(self, x: TensorType["batch_size", 3]) -> TensorType["batch_size", "num_channels"]:
 
         [batch_size, _] = x.shape
-        uvs = x[:, 0:2]
+        # Explicit wrap to [0,1), so train/eval behavior matches repeat sampling at inference.
+        uvs = torch.remainder(x[:, 0:2], 1.0)
         lod_encodings = x[:, [2]]
 
         # get required columns by lods
@@ -250,15 +261,101 @@ class TCNNModel(torch.nn.Module):
     
     def clamp_value(self):
 
-        for idx, hash_grid in enumerate(self.hash_grids):
-            qbits = self.hash_grid_quantize_bits[idx]
-            N_k = 2 ** qbits
-            Q_k = 1.0 / N_k
-            min_q = -(N_k - 1) / 2 * Q_k
-            max_q = 0.5
-            state_dict = hash_grid.state_dict()
-            state_dict['params'] = torch.clamp(state_dict['params'], min=min_q, max=max_q)
-            hash_grid.load_state_dict(state_dict)
+        apply_wrap = (
+            self.wrap_boundary_constraint
+            and self.wrap_boundary_strength > 0.0
+            and (self.current_iter % self.wrap_boundary_interval == 0)
+        )
+
+        with torch.no_grad():
+            for idx, hash_grid in enumerate(self.hash_grids):
+                qbits = self.hash_grid_quantize_bits[idx]
+                N_k = 2 ** qbits
+                Q_k = 1.0 / N_k
+                min_q = -(N_k - 1) / 2 * Q_k
+                max_q = 0.5
+
+                params = self._get_grid_params_tensor(hash_grid)
+                params.clamp_(min=min_q, max=max_q)
+
+                if apply_wrap:
+                    self._enforce_wrap_boundary_constraint_inplace(
+                        params,
+                        base_res=int(self.hash_grid_base_res[idx]),
+                        n_levels=int(self.hash_grid_n_levels[idx]),
+                        n_features_per_level=int(self.hash_grid_n_features_per_level[idx]),
+                        strength=self.wrap_boundary_strength,
+                        highest_k_levels=self.wrap_boundary_levels,
+                    )
+
+    def _get_grid_params_tensor(self, hash_grid: torch.nn.Module) -> torch.nn.Parameter:
+        # tiny-cuda-nn grid usually exposes a single parameter named "params".
+        for name, p in hash_grid.named_parameters():
+            if name == 'params':
+                return p
+        # Fallback for compatibility: first parameter.
+        return next(hash_grid.parameters())
+
+    def _enforce_wrap_boundary_constraint_inplace(
+        self,
+        flat_params: torch.Tensor,
+        base_res: int,
+        n_levels: int,
+        n_features_per_level: int,
+        strength: float = 1.0,
+        highest_k_levels: int = 1,
+    ) -> None:
+        """Tie opposite borders of each dense grid level for seamless repeat sampling.
+
+        This makes left/right and top/bottom borders consistent, which removes
+        visible seams when feature textures are sampled with wrap mode at runtime.
+        """
+        strength = float(max(0.0, min(1.0, strength)))
+        if strength <= 0.0:
+            return
+
+        highest_k_levels = max(1, int(highest_k_levels))
+        start_level = max(0, n_levels - highest_k_levels)
+
+        offset = 0
+        one_minus = 1.0 - strength
+
+        for level in range(n_levels):
+            res = base_res * (2 ** level)
+            level_count = res * res * n_features_per_level
+            if level < start_level:
+                offset += level_count
+                continue
+
+            level_flat = flat_params[offset: offset + level_count]
+            level_tex = level_flat.view(res, res, n_features_per_level)
+
+            # Match left/right edges
+            left = level_tex[:, 0, :].clone()
+            right = level_tex[:, -1, :].clone()
+            lr_avg = 0.5 * (left + right)
+            level_tex[:, 0, :] = left * one_minus + lr_avg * strength
+            level_tex[:, -1, :] = right * one_minus + lr_avg * strength
+
+            # Match top/bottom edges
+            top = level_tex[0, :, :].clone()
+            bottom = level_tex[-1, :, :].clone()
+            tb_avg = 0.5 * (top + bottom)
+            level_tex[0, :, :] = top * one_minus + tb_avg * strength
+            level_tex[-1, :, :] = bottom * one_minus + tb_avg * strength
+
+            # Keep four corners fully consistent to avoid corner pinching.
+            c00 = level_tex[0, 0, :].clone()
+            c01 = level_tex[0, -1, :].clone()
+            c10 = level_tex[-1, 0, :].clone()
+            c11 = level_tex[-1, -1, :].clone()
+            corner_avg = 0.25 * (c00 + c01 + c10 + c11)
+            level_tex[0, 0, :] = c00 * one_minus + corner_avg * strength
+            level_tex[0, -1, :] = c01 * one_minus + corner_avg * strength
+            level_tex[-1, 0, :] = c10 * one_minus + corner_avg * strength
+            level_tex[-1, -1, :] = c11 * one_minus + corner_avg * strength
+
+            offset += level_count
 
     def get_model_info(self) -> np.array:
         

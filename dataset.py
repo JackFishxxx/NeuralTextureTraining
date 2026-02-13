@@ -1,6 +1,6 @@
 from torch.utils.data import Dataset
 from configs import Config
-from typing import Dict, List
+from typing import Dict, List, Optional
 from torchtyping import TensorType
 
 import torch
@@ -25,14 +25,17 @@ def get_texture_config() -> List[Dict]:
         # add other texture types and their possible keywords if needed
     }
 
+    # vis_mode: "srgb" = apply gamma for display, "normal" = re-normalize vectors, "linear" = save as-is
+    # loss_weight: per-channel loss weight used during training
+    # display_name: subfolder name used when saving evaluation images
     texture_configs = {
-        keyword_order[0]: {"expected_channels": 3, "color_mode": "RGB"},
-        keyword_order[1]: {"expected_channels": 3, "color_mode": "RGB"},
-        keyword_order[2]: {"expected_channels": 1, "color_mode": "L"},
-        keyword_order[3]: {"expected_channels": 1, "color_mode": "L"},
-        keyword_order[4]: {"expected_channels": 1, "color_mode": "L"},
-        keyword_order[5]: {"expected_channels": 1, "color_mode": "L"},
-        keyword_order[6]: {"expected_channels": 1, "color_mode": "L"},
+        keyword_order[0]: {"expected_channels": 3, "color_mode": "RGB", "vis_mode": "srgb",   "loss_weight": 1.0, "display_name": "rgb"},
+        keyword_order[1]: {"expected_channels": 3, "color_mode": "RGB", "vis_mode": "normal", "loss_weight": 0.8, "display_name": "normal"},
+        keyword_order[2]: {"expected_channels": 1, "color_mode": "L",   "vis_mode": "linear", "loss_weight": 0.3, "display_name": "roughness"},
+        keyword_order[3]: {"expected_channels": 1, "color_mode": "L",   "vis_mode": "linear", "loss_weight": 0.3, "display_name": "occlusion"},
+        keyword_order[4]: {"expected_channels": 1, "color_mode": "L",   "vis_mode": "linear", "loss_weight": 0.3, "display_name": "metallic"},
+        keyword_order[5]: {"expected_channels": 1, "color_mode": "L",   "vis_mode": "linear", "loss_weight": 0.3, "display_name": "specular"},
+        keyword_order[6]: {"expected_channels": 1, "color_mode": "L",   "vis_mode": "linear", "loss_weight": 0.3, "display_name": "displacement"},
         # add other texture types if needed
     }
 
@@ -169,6 +172,40 @@ class TextureDataset(torch.nn.Module):
 
         return lod_cache
     
+    def get_output_loss_weights(self, config_weights: Optional[Dict[str, float]] = None) -> List[float]:
+        """Generate per-channel loss weights based on the actually loaded textures.
+        
+        Args:
+            config_weights: Optional dict mapping texture_type -> loss_weight from config.
+                           If provided, overrides the default weights in texture_configs.
+        """
+        weights = []
+        for tex_type in self.available_textures:
+            cfg = self.texture_configs[tex_type]
+            n_ch = cfg['expected_channels']
+            # Priority: config_weights > texture_configs
+            if config_weights and tex_type in config_weights:
+                w = config_weights[tex_type]
+            else:
+                w = cfg.get('loss_weight', 1.0)
+            weights.extend([w] * n_ch)
+        return weights
+
+    def get_vis_configs(self) -> List[Dict]:
+        """Return a list of visualization configs for all available textures.
+        Each entry: {texture_type, display_name, vis_mode, channel_slice}.
+        """
+        vis = []
+        for tex_type in self.available_textures:
+            cfg = self.texture_configs[tex_type]
+            vis.append({
+                'texture_type': tex_type,
+                'display_name': cfg.get('display_name', tex_type),
+                'vis_mode': cfg.get('vis_mode', 'linear'),
+                'channel_slice': self.channel_slices[tex_type],
+            })
+        return vis
+
     def identify_texture_type(self, filename: str) -> str:
         
         filename_lower = filename.lower()

@@ -52,7 +52,23 @@ class Config():
             {"max_resolution": 1024, "quantize_bits":8, "save_bits":32, "learning_rate": 0.002},
             {"max_resolution": 512, "quantize_bits":8, "save_bits":32, "learning_rate": 0.005},
         ]
-        self.output_loss_weights = [1.0, 1.0, 1.0, 0.7, 0.7, 0.7, 0.3, 0.3, 0.3]
+        
+        # Per-texture-type loss weights (optional)
+        # If None, weights from dataset.get_texture_config() will be used
+        # Keys: texture type names (diffuse, normal, roughness, etc.)
+        # Values: per-channel weight
+        self.texture_loss_weights: Optional[Dict[str, float]] = {
+            "diffuse": 1.0,
+            "normal": 0.8,
+            "roughness": 0.3,
+            "occlusion": 0.3,
+            "metallic": 0.3,
+            "specular": 0.3,
+            "displacement": 0.3,
+        }
+        
+        # Final per-channel loss weights list (generated from texture_loss_weights and available textures)
+        self.output_loss_weights: Optional[List[float]] = None
         self.network_learning_rate = params.learning_rate
 
         # Normalize configs to the internal format expected by the model

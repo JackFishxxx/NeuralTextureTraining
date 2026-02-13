@@ -65,8 +65,14 @@ class Trainer:
         self.texture_height = dataset.texture_height
         self.texture_width = dataset.texture_width
 
-        # loss weights
-        self.output_loss_weights = configs.output_loss_weights
+        # loss weights — generated dynamically from the textures actually loaded
+        # Use config's texture_loss_weights if provided, otherwise use defaults from dataset
+        self.output_loss_weights = configs.output_loss_weights or dataset.get_output_loss_weights(
+            config_weights=getattr(configs, 'texture_loss_weights', None)
+        )
+
+        # visualization configs for eval/infer (data-driven, not hardcoded)
+        self.vis_configs = dataset.get_vis_configs()
 
         self.sample_probabilities = self.generate_probabilities()      
 
@@ -154,11 +160,9 @@ class Trainer:
         ssim_list = []
         lpips_list = []
 
-        os.makedirs(os.path.join(self.media_path, "rgb"), exist_ok=True)
-        os.makedirs(os.path.join(self.media_path, "normal"), exist_ok=True)
-        os.makedirs(os.path.join(self.media_path, "roughness"), exist_ok=True)
-        os.makedirs(os.path.join(self.media_path, "occlusion"), exist_ok=True)
-        os.makedirs(os.path.join(self.media_path, "displacement"), exist_ok=True)
+        # create output directories for each available texture type
+        for vc in self.vis_configs:
+            os.makedirs(os.path.join(self.media_path, vc['display_name']), exist_ok=True)
 
         quant_model = copy.deepcopy(self.model)
         quant_model.simulate_quantize()
@@ -204,51 +208,12 @@ class Trainer:
             if curr_iter % (self.eval_interval * 2) == 0:
                 save_image = torch.cat([predicted_image, gt_image], dim=3).squeeze()
 
-                # Use dataset-provided channel mapping if available
-                channel_slices = getattr(self.dataset, 'channel_slices', {})
-
-                # Diffuse (RGB)
-                if 'diffuse' in channel_slices:
-                    s, e = channel_slices['diffuse']
-                    rgb_image = save_image[s:e, ...]
-                    # convert from linear to sRGB for visualization
-                    rgb_image = torch.clamp(rgb_image, 0.0, 1.0)
-                    rgb_image = torch.pow(rgb_image, 1.0 / 2.2)
-                    rgb_path = os.path.join(self.media_path, "rgb", f"{curr_iter}_{int(lod)}.png")
-                    TF.to_pil_image(rgb_image).save(rgb_path)
-
-                # Normal (RGB)
-                if 'normal' in channel_slices:
-                    s, e = channel_slices['normal']
-                    normal_image = save_image[s:e, ...]
-                    # visualize normals by re-normalizing vectors: [0,1]→[-1,1]→unit→[0,1]
-                    n = normal_image * 2.0 - 1.0
-                    norm = torch.sqrt(torch.clamp((n ** 2).sum(dim=0, keepdim=True), min=1e-8))
-                    n = n / norm
-                    normal_vis = torch.clamp((n + 1.0) * 0.5, 0.0, 1.0)
-                    normal_path = os.path.join(self.media_path, "normal", f"{curr_iter}_{int(lod)}.png")
-                    TF.to_pil_image(normal_vis).save(normal_path)
-
-                # Roughness (1ch)
-                if 'roughness' in channel_slices:
-                    s, e = channel_slices['roughness']
-                    rough_image = save_image[s:e, ...]
-                    rough_path = os.path.join(self.media_path, "roughness", f"{curr_iter}_{int(lod)}.png")
-                    TF.to_pil_image(rough_image).save(rough_path)
-
-                # Occlusion (1ch)
-                if 'occlusion' in channel_slices:
-                    s, e = channel_slices['occlusion']
-                    ao_image = save_image[s:e, ...]
-                    ao_path = os.path.join(self.media_path, "occlusion", f"{curr_iter}_{int(lod)}.png")
-                    TF.to_pil_image(ao_image).save(ao_path)
-
-                # Displacement (1ch)
-                if 'displacement' in channel_slices:
-                    s, e = channel_slices['displacement']
-                    disp_image = save_image[s:e, ...]
-                    disp_path = os.path.join(self.media_path, "displacement", f"{curr_iter}_{int(lod)}.png")
-                    TF.to_pil_image(disp_image).save(disp_path)
+                for vc in self.vis_configs:
+                    s, e = vc['channel_slice']
+                    tex_image = save_image[s:e, ...]
+                    tex_image = self._postprocess_for_vis(tex_image, vc['vis_mode'])
+                    save_path = os.path.join(self.media_path, vc['display_name'], f"{curr_iter}_{int(lod)}.png")
+                    TF.to_pil_image(tex_image).save(save_path)
         
         psnr_aver = torch.tensor(psnr_list).mean()
         ssim_aver = torch.tensor(ssim_list).mean()
@@ -259,6 +224,35 @@ class Trainer:
     
         print(f"Iter:{curr_iter}, PSNR:{psnr_aver.item():.4f}, SSIM:{ssim_aver.item():.4f}, LPIPS:{lpips_aver.item():.4f}")
 
+    def _postprocess_for_vis(self, image: torch.Tensor, vis_mode: str) -> torch.Tensor:
+        """Apply visualization post-processing based on vis_mode.
+        Args:
+            image: [C, H, W] tensor in [0, 1]
+            vis_mode: 'srgb' | 'normal' | 'linear'
+        """
+        image = torch.clamp(image, 0.0, 1.0)
+        if vis_mode == 'srgb':
+            image = torch.pow(image, 1.0 / 2.2)
+        elif vis_mode == 'normal':
+            n = image * 2.0 - 1.0
+            norm = torch.sqrt(torch.clamp((n ** 2).sum(dim=0, keepdim=True), min=1e-8))
+            n = n / norm
+            image = torch.clamp((n + 1.0) * 0.5, 0.0, 1.0)
+        # 'linear' -> no transform
+        return image
+
+    def _get_metrics_slice(self):
+        """Return (start, end) channel indices for computing image-quality metrics.
+        Prefers 'diffuse' (3-channel RGB); falls back to the first available texture.
+        For single-channel textures the metrics still work (grayscale).
+        """
+        channel_slices = self.dataset.channel_slices
+        if 'diffuse' in channel_slices:
+            return channel_slices['diffuse']
+        # fallback: use the first available texture
+        first = self.dataset.available_textures[0]
+        return channel_slices[first]
+
     @torch.no_grad()
     def infer(self) -> None:
 
@@ -266,11 +260,9 @@ class Trainer:
         ssim_list = []
         lpips_list = []
 
-        os.makedirs(os.path.join(self.infer_path, "rgb"), exist_ok=True)
-        os.makedirs(os.path.join(self.infer_path, "normal"), exist_ok=True)
-        os.makedirs(os.path.join(self.infer_path, "roughness"), exist_ok=True)
-        os.makedirs(os.path.join(self.infer_path, "occlusion"), exist_ok=True)
-        os.makedirs(os.path.join(self.infer_path, "displacement"), exist_ok=True)
+        # create output directories for each available texture type
+        for vc in self.vis_configs:
+            os.makedirs(os.path.join(self.infer_path, vc['display_name']), exist_ok=True)
 
         metrics = f"LOD PSNR SSIM LPIPS\n"
 
@@ -295,8 +287,9 @@ class Trainer:
             predicted_image = predicted_image.permute(2, 0, 1)[None, ...]  # [B, C, H, W]
             gt_image = gt_image.permute(2, 0, 1)[None, ...]
 
-            predicted_rgb = predicted_image[:, 0:3, :, :]
-            gt_rgb = gt_image[:, 0:3, :, :]
+            ms, me = self._get_metrics_slice()
+            predicted_rgb = predicted_image[:, ms:me, :, :]
+            gt_rgb = gt_image[:, ms:me, :, :]
                         
             psnr_value = self.psnr(predicted_rgb, gt_rgb)
             psnr_list.append(psnr_value.item())
@@ -311,45 +304,12 @@ class Trainer:
 
             save_image = torch.cat([predicted_image, gt_image], dim=3).squeeze()
 
-            channel_slices = getattr(self.dataset, 'channel_slices', {})
-
-            if 'diffuse' in channel_slices:
-                s, e = channel_slices['diffuse']
-                rgb_image = save_image[s:e, ...]
-                # convert from linear to sRGB for visualization
-                rgb_image = torch.clamp(rgb_image, 0.0, 1.0)
-                rgb_image = torch.pow(rgb_image, 1.0 / 2.2)
-                rgb_path = os.path.join(self.infer_path, "rgb", f"LOD_{int(lod)}.png")
-                TF.to_pil_image(rgb_image).save(rgb_path)
-
-            if 'normal' in channel_slices:
-                s, e = channel_slices['normal']
-                normal_image = save_image[s:e, ...]
-                # visualize normals by re-normalizing vectors: [0,1]→[-1,1]→unit→[0,1]
-                n = normal_image * 2.0 - 1.0
-                norm = torch.sqrt(torch.clamp((n ** 2).sum(dim=0, keepdim=True), min=1e-8))
-                n = n / norm
-                normal_vis = torch.clamp((n + 1.0) * 0.5, 0.0, 1.0)
-                normal_path = os.path.join(self.infer_path, "normal", f"LOD_{int(lod)}.png")
-                TF.to_pil_image(normal_vis).save(normal_path)
-
-            if 'roughness' in channel_slices:
-                s, e = channel_slices['roughness']
-                rough_image = save_image[s:e, ...]
-                rough_path = os.path.join(self.infer_path, "roughness", f"LOD_{int(lod)}.png")
-                TF.to_pil_image(rough_image).save(rough_path)
-
-            if 'occlusion' in channel_slices:
-                s, e = channel_slices['occlusion']
-                ao_image = save_image[s:e, ...]
-                ao_path = os.path.join(self.infer_path, "occlusion", f"LOD_{int(lod)}.png")
-                TF.to_pil_image(ao_image).save(ao_path)
-
-            if 'displacement' in channel_slices:
-                s, e = channel_slices['displacement']
-                disp_image = save_image[s:e, ...]
-                disp_path = os.path.join(self.infer_path, "displacement", f"LOD_{int(lod)}.png")
-                TF.to_pil_image(disp_image).save(disp_path)
+            for vc in self.vis_configs:
+                s, e = vc['channel_slice']
+                tex_image = save_image[s:e, ...]
+                tex_image = self._postprocess_for_vis(tex_image, vc['vis_mode'])
+                save_path = os.path.join(self.infer_path, vc['display_name'], f"LOD_{int(lod)}.png")
+                TF.to_pil_image(tex_image).save(save_path)
 
             metrics += f"LOD_{int(lod)} {psnr_value:.4f} {ssim_value:.4f} {lpips_value:.4f}\n"
         
@@ -360,6 +320,35 @@ class Trainer:
         with open(os.path.join(self.infer_path, "metrics.txt"), "w+") as file:
             file.writelines(metrics)
     
+    def _postprocess_for_vis(self, image: torch.Tensor, vis_mode: str) -> torch.Tensor:
+        """Apply visualization post-processing based on vis_mode.
+        Args:
+            image: [C, H, W] tensor in [0, 1]
+            vis_mode: 'srgb' | 'normal' | 'linear'
+        """
+        image = torch.clamp(image, 0.0, 1.0)
+        if vis_mode == 'srgb':
+            image = torch.pow(image, 1.0 / 2.2)
+        elif vis_mode == 'normal':
+            n = image * 2.0 - 1.0
+            norm = torch.sqrt(torch.clamp((n ** 2).sum(dim=0, keepdim=True), min=1e-8))
+            n = n / norm
+            image = torch.clamp((n + 1.0) * 0.5, 0.0, 1.0)
+        # 'linear' -> no transform
+        return image
+
+    def _get_metrics_slice(self):
+        """Return (start, end) channel indices for computing image-quality metrics.
+        Prefers 'diffuse' (3-channel RGB); falls back to the first available texture.
+        For single-channel textures the metrics still work (grayscale).
+        """
+        channel_slices = self.dataset.channel_slices
+        if 'diffuse' in channel_slices:
+            return channel_slices['diffuse']
+        # fallback: use the first available texture
+        first = self.dataset.available_textures[0]
+        return channel_slices[first]
+
     @torch.no_grad()
     def generate_probabilities(self) -> TensorType["num_lods"]:
         

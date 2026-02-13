@@ -39,6 +39,17 @@ class Config():
         self.eval_interval = params.eval_interval
         self.save_interval = params.save_interval
 
+        ### ---------- early stopping configs ---------- ###
+        self.early_stop = params.early_stop
+        self.early_stop_interval = params.early_stop_interval
+        self.early_stop_psnr_threshold = params.early_stop_psnr_threshold
+        # early_stop_interval must be a multiple of eval_interval so that PSNR is available at check points
+        if self.early_stop and self.early_stop_interval % self.eval_interval != 0:
+            raise ValueError(
+                f"early_stop_interval ({self.early_stop_interval}) must be a multiple of "
+                f"eval_interval ({self.eval_interval}) for PSNR-based early stopping."
+            )
+
         ### ---------- model configs ---------- ###
         self.num_channels = 0
         self.num_lods = 1
@@ -153,5 +164,13 @@ def get_args():
                         help='the interval of iteration for evalation')
     parser.add_argument('--save_interval', type=int, default=5000,
                         help='the interval of iteration for saving model')
+
+    ### ---------- early stopping configs ---------- ###
+    parser.add_argument('--early_stop', action='store_true', default=True,
+                        help='enable early stopping when PSNR improvement is below threshold')
+    parser.add_argument('--early_stop_interval', type=int, default=5000,
+                        help='number of iterations per segment for early stopping PSNR evaluation')
+    parser.add_argument('--early_stop_psnr_threshold', type=float, default=0.01,
+                        help='minimum PSNR improvement (in dB) between two consecutive segments; training stops if improvement is below this value')
 
     return parser.parse_args()

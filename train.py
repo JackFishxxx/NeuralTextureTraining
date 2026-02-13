@@ -84,6 +84,14 @@ class Trainer:
         self.ssim = StructuralSimilarityIndexMeasure(return_full_image=True).to(self.device)
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True).to(self.device)
 
+        # early stopping (PSNR-based)
+        self.early_stop = configs.early_stop
+        self.early_stop_interval = configs.early_stop_interval
+        self.early_stop_psnr_threshold = configs.early_stop_psnr_threshold
+        self._early_stop_eval_count = 0
+        self._early_stop_avg_psnr = 0
+        self._early_stop_prev_psnr = 0   # PSNR of the previous segment
+
         self.configs = configs
         self.model = model
         self.dataset = dataset
@@ -143,7 +151,32 @@ class Trainer:
 
             # eval
             if curr_iter % self.eval_interval == 0:
-                self.eval(curr_iter)
+                eval_psnr = self.eval(curr_iter)
+
+                # early stopping check (PSNR-based, evaluated at early_stop_interval)
+                if self.early_stop:
+                    self._early_stop_avg_psnr += eval_psnr
+                    self._early_stop_eval_count += 1
+                    if curr_iter > 0 and curr_iter % self.early_stop_interval == 0:
+                        self._early_stop_avg_psnr /= self._early_stop_eval_count
+                        psnr_improvement = self._early_stop_avg_psnr - self._early_stop_prev_psnr
+                        print(f"[EarlyStopCheck] Iter {curr_iter}: PSNR = {self._early_stop_avg_psnr:.4f} dB, "
+                              f"improvement = {psnr_improvement:.4f} dB, threshold = {self.early_stop_psnr_threshold:.4f} dB")
+                        if psnr_improvement < self.early_stop_psnr_threshold:
+                            print(f"[EarlyStopCheck] PSNR improvement ({psnr_improvement:.4f} dB) < threshold "
+                                  f"({self.early_stop_psnr_threshold:.4f} dB). Stopping training at iter {curr_iter}.")
+                            # save model before stopping
+                            self.model.save(curr_iter, self.model_path)
+                            self.end_time = datetime.datetime.now()
+                            self.duration_time = self.end_time - self.start_time
+                            print(f"Total training time: {self.duration_time}")
+                            return
+                        else:
+                            self._early_stop_prev_psnr = self._early_stop_avg_psnr
+                            self._early_stop_avg_psnr = 0
+                            self._early_stop_eval_count = 0
+
+
                 # print(self.model.optimizer.param_groups[0]['lr'], self.model.optimizer.param_groups[1]['lr'])
             
             if curr_iter % self.save_interval == 0:

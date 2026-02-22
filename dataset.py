@@ -41,6 +41,25 @@ def get_texture_config() -> List[Dict]:
 
     return keyword_order, texture_keywords, texture_configs
 
+
+def get_canonical_num_channels() -> int:
+    """Fixed total number of channels (11) aligned with model.CANONICAL_CHANNEL_ORDER."""
+    keyword_order, _, texture_configs = get_texture_config()
+    return sum(texture_configs[t]["expected_channels"] for t in keyword_order)
+
+
+def get_canonical_channel_slices_static() -> Dict[str, tuple]:
+    """Return (start, end) slice in the 11-channel layout for each texture type (aligned with model)."""
+    keyword_order, _, texture_configs = get_texture_config()
+    out = {}
+    idx = 0
+    for t in keyword_order:
+        n = texture_configs[t]["expected_channels"]
+        out[t] = (idx, idx + n)
+        idx += n
+    return out
+
+
 class TextureDataset(torch.nn.Module):
 
     def __init__(self, config: Config):
@@ -52,8 +71,11 @@ class TextureDataset(torch.nn.Module):
         self.data_dir = config.data_dir
 
         self.keyword_order, self.texture_keywords, self.texture_configs = get_texture_config()
-        # mapping from texture type to channel slice [start, end)
+        # mapping from texture type to channel slice [start, end) in current loaded data
         self.channel_slices = {}
+        # (start, end) in the canonical 11-channel layout for each texture type, aligned with model
+        self.canonical_channel_slices = get_canonical_channel_slices_static()
+        self.canonical_num_channels = get_canonical_num_channels()
         # ordered available texture types that were found and concatenated
         self.available_textures = []
 
@@ -209,9 +231,46 @@ class TextureDataset(torch.nn.Module):
             weights.extend([w] * n_ch)
         return weights
 
+    def expand_to_canonical(self, x: TensorType["batch_size", "num_channels"]) -> TensorType["batch_size", 11]:
+        """Expand [B, num_channels] to canonical 11 channels; fill missing texture positions with 0."""
+        device = x.device
+        dtype = x.dtype
+        batch_size = x.shape[0]
+        out = torch.zeros((batch_size, self.canonical_num_channels), device=device, dtype=dtype)
+        for tex_type in self.available_textures:
+            ds_start, ds_end = self.channel_slices[tex_type]
+            canon_start, canon_end = self.canonical_channel_slices[tex_type]
+            out[:, canon_start:canon_end] = x[:, ds_start:ds_end]
+        return out
+
+    def expand_lod_to_canonical(self, lod_tensor: TensorType["num_lods", "H", "W", "num_channels"]) -> TensorType["num_lods", "H", "W", 11]:
+        """Expand lod_cache [num_lods, H, W, num_channels] to [num_lods, H, W, 11]; fill missing with 0."""
+        num_lods, h, w, c = lod_tensor.shape
+        device = lod_tensor.device
+        dtype = lod_tensor.dtype
+        out = torch.zeros((num_lods, h, w, self.canonical_num_channels), device=device, dtype=dtype)
+        for tex_type in self.available_textures:
+            ds_start, ds_end = self.channel_slices[tex_type]
+            canon_start, canon_end = self.canonical_channel_slices[tex_type]
+            out[:, :, :, canon_start:canon_end] = lod_tensor[:, :, :, ds_start:ds_end]
+        return out
+
+    def get_canonical_loss_weights(self, config_weights: Optional[Dict[str, float]] = None) -> List[float]:
+        """Return per-channel loss weights of length 11; channels for missing textures are 0."""
+        weights = [0.0] * self.canonical_num_channels
+        for tex_type in self.keyword_order:
+            canon_start, canon_end = self.canonical_channel_slices[tex_type]
+            if tex_type not in self.available_textures:
+                continue
+            cfg = self.texture_configs[tex_type]
+            w = config_weights.get(tex_type, cfg.get("loss_weight", 1.0)) if config_weights else cfg.get("loss_weight", 1.0)
+            for i in range(canon_start, canon_end):
+                weights[i] = w
+        return weights
+
     def get_vis_configs(self) -> List[Dict]:
         """Return a list of visualization configs for all available textures.
-        Each entry: {texture_type, display_name, vis_mode, channel_slice}.
+        Each entry: texture_type, display_name, vis_mode, channel_slice (dataset order), canonical_channel_slice (0..11).
         """
         vis = []
         for tex_type in self.available_textures:
@@ -221,6 +280,7 @@ class TextureDataset(torch.nn.Module):
                 'display_name': cfg.get('display_name', tex_type),
                 'vis_mode': cfg.get('vis_mode', 'linear'),
                 'channel_slice': self.channel_slices[tex_type],
+                'canonical_channel_slice': self.canonical_channel_slices[tex_type],
             })
         return vis
 

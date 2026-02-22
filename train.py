@@ -31,9 +31,10 @@ class Trainer:
         else:
             configs = Config(params)
         dataset = TextureDataset(configs)
-        configs.num_channels = dataset.num_channels
         configs.num_lods = dataset.num_lods
         model = TCNNModel(configs)
+        # Network output is fixed to 11 channels (aligned with diffuse->displacement); missing filled by dataset with 0
+        configs.num_channels = model.num_channels
 
         # init required 
         self.device = configs.device
@@ -68,9 +69,8 @@ class Trainer:
         self.texture_height = dataset.texture_height
         self.texture_width = dataset.texture_width
 
-        # loss weights — generated dynamically from the textures actually loaded
-        # Use config's texture_loss_weights if provided, otherwise use defaults from dataset
-        self.output_loss_weights = configs.output_loss_weights or dataset.get_output_loss_weights(
+        # 11-channel loss weights; channels for missing textures are 0
+        self.output_loss_weights = configs.output_loss_weights or dataset.get_canonical_loss_weights(
             config_weights=getattr(configs, 'texture_loss_weights', None)
         )
 
@@ -120,9 +120,9 @@ class Trainer:
             # lods = torch.randint(0, 1, size=(self.batch_size, 1)).to(self.device)
             batch_index = torch.cat([ys, xs, lods], dim=1)
 
-            # get data
+            # Get data; expand to canonical 11 channels, missing texture positions filled with 0
             gt_texture = self.dataset(batch_index)  # [batch_size, num_channels]
-            gt_texture = gt_texture.to(torch.float16)
+            gt_texture = self.dataset.expand_to_canonical(gt_texture).to(torch.float16)
 
             # xys -> uvs
             # shift the sample position from [0, 1, ..., 1023] -> [0.5, 1.5, ..., 1023.5]
@@ -223,13 +223,15 @@ class Trainer:
             predicted_image = quant_model(eval_input)
             predicted_image = predicted_image.reshape([lod_height, lod_width, -1])
             predicted_image = torch.clamp(predicted_image, min=0, max=1)
-            gt_image = self.dataset.lod_cache[lod, :lod_height, :lod_width, :]
+            gt_slice = self.dataset.lod_cache[lod, :lod_height, :lod_width, :]  # [H, W, num_channels]
+            gt_canonical = self.dataset.expand_to_canonical(gt_slice.reshape(-1, gt_slice.shape[-1])).reshape(lod_height, lod_width, -1)
+            gt_image = gt_canonical.permute(2, 0, 1)[None, ...]  # [1, 11, H, W]
 
-            predicted_image = predicted_image.permute(2, 0, 1)[None, ...]  # [B, C, H, W]
-            gt_image = gt_image.permute(2, 0, 1)[None, ...]
+            predicted_image = predicted_image.permute(2, 0, 1)[None, ...]  # [1, 11, H, W]
 
-            predicted_rgb = predicted_image[:, 0:3, :, :]
-            gt_rgb = gt_image[:, 0:3, :, :]
+            ms, me = self._get_metrics_slice()
+            predicted_rgb = predicted_image[:, ms:me, :, :]
+            gt_rgb = gt_image[:, ms:me, :, :]
                         
             psnr_value = self.psnr(predicted_rgb, gt_rgb)
             psnr_list.append(psnr_value.item())
@@ -248,7 +250,7 @@ class Trainer:
                 save_image = torch.cat([predicted_image, gt_image], dim=3).squeeze()
 
                 for vc in self.vis_configs:
-                    s, e = vc['channel_slice']
+                    s, e = vc['canonical_channel_slice']
                     tex_image = save_image[s:e, ...]
                     tex_image = self._postprocess_for_vis(tex_image, vc['vis_mode'])
                     save_path = os.path.join(self.media_path, vc['display_name'], f"{curr_iter}_{int(lod)}.png")
@@ -283,16 +285,14 @@ class Trainer:
         return image
 
     def _get_metrics_slice(self):
-        """Return (start, end) channel indices for computing image-quality metrics.
-        Prefers 'diffuse' (3-channel RGB); falls back to the first available texture.
-        For single-channel textures the metrics still work (grayscale).
+        """Return (start, end) channel indices in canonical 11-channel space for metrics.
+        Prefers 'diffuse' (0:3); falls back to the first available texture's canonical slice.
         """
-        channel_slices = self.dataset.channel_slices
-        if 'diffuse' in channel_slices:
-            return channel_slices['diffuse']
-        # fallback: use the first available texture
+        canon = self.dataset.canonical_channel_slices
+        if 'diffuse' in self.dataset.available_textures:
+            return canon['diffuse']
         first = self.dataset.available_textures[0]
-        return channel_slices[first]
+        return canon[first]
 
     @torch.no_grad()
     def infer(self) -> None:
@@ -323,10 +323,11 @@ class Trainer:
             predicted_image = self.model(eval_input)
             predicted_image = predicted_image.reshape([lod_height, lod_width, -1])
             predicted_image = torch.clamp(predicted_image, min=0, max=1)
-            gt_image = self.dataset.lod_cache[lod, :lod_height, :lod_width, :]
+            gt_slice = self.dataset.lod_cache[lod, :lod_height, :lod_width, :]
+            gt_canonical = self.dataset.expand_to_canonical(gt_slice.reshape(-1, gt_slice.shape[-1])).reshape(lod_height, lod_width, -1)
+            gt_image = gt_canonical.permute(2, 0, 1)[None, ...]  # [1, 11, H, W]
 
-            predicted_image = predicted_image.permute(2, 0, 1)[None, ...]  # [B, C, H, W]
-            gt_image = gt_image.permute(2, 0, 1)[None, ...]
+            predicted_image = predicted_image.permute(2, 0, 1)[None, ...]  # [1, 11, H, W]
 
             ms, me = self._get_metrics_slice()
             predicted_rgb = predicted_image[:, ms:me, :, :]
@@ -346,7 +347,7 @@ class Trainer:
             save_image = torch.cat([predicted_image, gt_image], dim=3).squeeze()
 
             for vc in self.vis_configs:
-                s, e = vc['channel_slice']
+                s, e = vc['canonical_channel_slice']
                 tex_image = save_image[s:e, ...]
                 tex_image = self._postprocess_for_vis(tex_image, vc['vis_mode'])
                 save_path = os.path.join(self.infer_path, vc['display_name'], f"LOD_{int(lod)}.png")
@@ -379,16 +380,14 @@ class Trainer:
         return image
 
     def _get_metrics_slice(self):
-        """Return (start, end) channel indices for computing image-quality metrics.
-        Prefers 'diffuse' (3-channel RGB); falls back to the first available texture.
-        For single-channel textures the metrics still work (grayscale).
+        """Return (start, end) channel indices in canonical 11-channel space for metrics.
+        Prefers 'diffuse' (0:3); falls back to the first available texture's canonical slice.
         """
-        channel_slices = self.dataset.channel_slices
-        if 'diffuse' in channel_slices:
-            return channel_slices['diffuse']
-        # fallback: use the first available texture
+        canon = self.dataset.canonical_channel_slices
+        if 'diffuse' in self.dataset.available_textures:
+            return canon['diffuse']
         first = self.dataset.available_textures[0]
-        return channel_slices[first]
+        return canon[first]
 
     @torch.no_grad()
     def generate_probabilities(self) -> TensorType["num_lods"]:

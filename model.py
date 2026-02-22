@@ -13,6 +13,13 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 
 from utils import pack_features, unpack_features, write_dds_r8g8b8a8
 
+# Fixed channel order aligned with: diffuse, normal, roughness, occlusion, metallic, specular, displacement
+# Channel counts: 3, 3, 1, 1, 1, 1, 1 -> 11 channels total; missing textures are filled with 0 at train/infer
+CANONICAL_CHANNEL_ORDER = ["diffuse", "normal", "roughness", "occlusion", "metallic", "specular", "displacement"]
+CANONICAL_CHANNEL_COUNTS = [3, 3, 1, 1, 1, 1, 1]
+NUM_CANONICAL_CHANNELS = sum(CANONICAL_CHANNEL_COUNTS)  # 11
+
+
 class TCNNModel(torch.nn.Module):
 
     def __init__(self, config: Config):
@@ -39,7 +46,8 @@ class TCNNModel(torch.nn.Module):
         self.n_frequencies = config.n_frequencies
         self.n_neurons = config.n_neurons
         self.n_hidden_layers = config.n_hidden_layers
-        self.num_channels = config.num_channels
+        # Network output is fixed to 11 channels aligned with the 7 texture types; missing textures filled with 0 externally
+        self.num_channels = NUM_CANONICAL_CHANNELS
 
         # Make feature grids tile seamlessly under wrap/repeat sampling.
         # Can be disabled or softened from config if needed.
@@ -141,7 +149,7 @@ class TCNNModel(torch.nn.Module):
         print(f"total_grid_features={total_grid_features}, n_input_dims={n_input_dims}")
         self.network = tcnn.Network(
             n_input_dims=n_input_dims,
-            n_output_dims=config.num_channels,
+            n_output_dims=NUM_CANONICAL_CHANNELS,
             network_config=network_config,
         )
 

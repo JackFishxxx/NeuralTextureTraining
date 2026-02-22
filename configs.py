@@ -81,7 +81,7 @@ class Config():
         self.hash_grid_configs: Optional[List[Dict]] = getattr(params, 'hash_grid_configs', None)
         # Multi-HashGrid configs
         self.hash_grid_configs = [
-            {"max_resolution": 1024, "quantize_bits":8, "save_bits":32, "learning_rate": 0.002},
+            {"max_resolution": 1024, "quantize_bits":8, "save_bits":32, "learning_rate": 0.005},
             {"max_resolution": 512, "quantize_bits":8, "save_bits":32, "learning_rate": 0.005},
         ]
         

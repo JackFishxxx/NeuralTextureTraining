@@ -2,3 +2,5 @@ outputs/
 __pycache__/
 data/
 save/
+data_batch/
+save_batch/

@@ -182,13 +182,13 @@ class Trainer:
 
                 # print(self.model.optimizer.param_groups[0]['lr'], self.model.optimizer.param_groups[1]['lr'])
             
-            if curr_iter % self.save_interval == 0:
+            if curr_iter > 0 and curr_iter % self.save_interval == 0:
                 self.model.save(curr_iter, self.model_path)
                 self.end_time = datetime.datetime.now()
                 self.duration_time = self.end_time - self.start_time
                 print(self.duration_time)
             
-            if curr_iter % 10000 == 0:
+            if curr_iter > 0 and curr_iter % 10000 == 0:
                 torch.cuda.empty_cache()
                 tcnn.free_temporary_memory()
 
@@ -244,7 +244,7 @@ class Trainer:
                 lpips_list.append(lpips_value.item())
                 self.writer.add_scalar(f'LPIPS_LOD{int(lod)}/train', lpips_value.item(), curr_iter)
 
-            if curr_iter % (self.eval_interval * 2) == 0:
+            if curr_iter % (self.save_interval) == 0:
                 save_image = torch.cat([predicted_image, gt_image], dim=3).squeeze()
 
                 for vc in self.vis_configs:

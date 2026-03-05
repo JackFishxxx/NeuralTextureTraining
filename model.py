@@ -4,6 +4,7 @@ import torch
 import copy
 import numpy as np
 import tinycudann as tcnn
+import torch.nn.functional as F
 from torchtyping import TensorType
 
 from configs import Config
@@ -46,6 +47,7 @@ class TCNNModel(torch.nn.Module):
         self.n_frequencies = config.n_frequencies
         self.n_neurons = config.n_neurons
         self.n_hidden_layers = config.n_hidden_layers
+        self.output_activation = getattr(config, "output_activation", "hard_swish")
         # Network output is fixed to 11 channels aligned with the 7 texture types; missing textures filled with 0 externally
         self.num_channels = NUM_CANONICAL_CHANNELS
 
@@ -132,15 +134,15 @@ class TCNNModel(torch.nn.Module):
 
             print(f"Initialized hash grid: max_res={max_res}, base_res={base_res}, n_levels={n_levels}, n_features_per_level={n_feature_per_level}, quantize_bits={qbits}, save_bits={sbits}")
 
-        # ReLU: converg slowly
-        # LeakyReLU: PSNR: 28.85, LPIPS: 0.2205(last time was 0.19)
-        # Squareplus: PSNR: 28.7937, LPIPS: 0.1768
-        # Softplus: PSNR: 28.8342, LPIPS: 0.1823
+        # Hidden layers still rely on tiny-cuda-nn's native activation.
+        # Output activation is applied manually in forward() and can be configured as:
+        # hard_swish (default), hard_gelu, or leaky_relu.
+        hidden_activation = "LeakyReLU" if config.n_hidden_layers > 0 else "None"
         network_config = {
             #"otype": "FullyFusedMLP",
             "otype": "CutlassMLP",
-            "activation": "LeakyReLU",
-            "output_activation": "LeakyReLU",
+            "activation": hidden_activation,
+            "output_activation": "None",
             "n_neurons": config.n_neurons,
             "n_hidden_layers": config.n_hidden_layers
         }
@@ -169,6 +171,32 @@ class TCNNModel(torch.nn.Module):
         # Squareplus factor=0.95, patience=2000, PSNR=28.57, LPIPS=0., time=20min
         # Squareplus factor=0.85, patience=2000, PSNR=28.60, LPIPS=0.2002, time=20min
         self.scheduler = ReduceLROnPlateau(self.optimizer, factor=0.85, patience=2000)
+
+    def _hard_swish(self, x: torch.Tensor) -> torch.Tensor:
+        """Hard-Swish activation without trig/exp.
+
+        Formula: y = x * clamp(x + 3, 0, 6) / 6
+        """
+        return x * torch.clamp(x + 3.0, min=0.0, max=6.0) * (1.0 / 6.0)
+
+    def _hard_gelu(self, x: torch.Tensor) -> torch.Tensor:
+        """Hard-GELU approximation without trig/exp.
+
+        Uses a clamped linear gate in place of GELU's smooth CDF.
+        """
+        return x * torch.clamp((x + 1.5) * (1.0 / 3.0), min=0.0, max=1.0)
+
+    def _apply_output_activation(self, x: torch.Tensor) -> torch.Tensor:
+        if self.output_activation == "hard_swish":
+            return self._hard_swish(x)
+        if self.output_activation == "hard_gelu":
+            return self._hard_gelu(x)
+        if self.output_activation == "leaky_relu":
+            return F.leaky_relu(x, negative_slope=0.01)
+        raise ValueError(
+            f"Unsupported output activation '{self.output_activation}'. "
+            "Expected one of: hard_swish, hard_gelu, leaky_relu."
+        )
     
     def load_ckpt(self, config: Config) -> None:
         
@@ -247,6 +275,7 @@ class TCNNModel(torch.nn.Module):
         inputs = torch.cat([positional_encodings, features, lod_encodings], dim=1)
 
         outputs = self.network(inputs)
+        outputs = self._apply_output_activation(outputs)
 
         return outputs
     

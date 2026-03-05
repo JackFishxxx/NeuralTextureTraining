@@ -76,6 +76,18 @@ class Config():
         self.n_frequencies = 0
         self.n_neurons = 16
         self.n_hidden_layers = 0
+        raw_output_activation = getattr(params, "output_activation", "hard_swish")
+        self.output_activation = str(raw_output_activation).strip().lower().replace("-", "_")
+        supported_output_activations = {"hard_swish", "hard_gelu", "leaky_relu"}
+        # Avg dataset performance:
+        # 1. hard_swish PSNR=40.2070 SSIM=0.9568 LPIPS=0.0805
+        # 2. hard_gelu PSNR=40.1565 SSIM=0.9569 LPIPS=0.0805
+        # 3. leaky_relu PSNR=40.1032 SSIM=0.9566 LPIPS=0.0803
+        if self.output_activation not in supported_output_activations:
+            raise ValueError(
+                f"Unsupported output_activation '{raw_output_activation}'. "
+                f"Supported values: {sorted(supported_output_activations)}"
+            )
 
         # By default, None → use legacy behavior (uniform grids based on n_features_per_level).
         self.hash_grid_configs: Optional[List[Dict]] = getattr(params, 'hash_grid_configs', None)

@@ -38,9 +38,6 @@ class TCNNModel(torch.nn.Module):
         self.max_quantize_range = 1 / 2
         self.noise_range = 1 / 2 * self.Q_k
 
-        # Noise annealing: linearly decay noise from full strength to 0
-        # over the first noise_anneal_fraction of training
-        self.noise_anneal_iters = int(getattr(config, 'max_iter', 50000) * getattr(config, 'noise_anneal_fraction', 0.8))
         self.current_iter = 0
 
         self.num_lods = config.num_lods
@@ -250,19 +247,9 @@ class TCNNModel(torch.nn.Module):
                 N_k = 2 ** qbits
                 Q_k = 1.0 / N_k
 
-                # Noise annealing: linearly decay noise strength from 1.0 to 0.0
-                if self.noise_anneal_iters > 0:
-                    anneal_factor = max(0.0, 1.0 - self.current_iter / self.noise_anneal_iters)
-                else:
-                    anneal_factor = 1.0
-
                 # STE (Straight-Through Estimator) quantization simulation:
                 # Quantize in forward pass, but let gradients pass through unchanged.
-                # This is more accurate than additive uniform noise because it
-                # exactly simulates the rounding that happens at inference time,
-                # eliminating the systematic color bias caused by shared noise.
-                half_noise = 0.5 * Q_k * anneal_factor
-                noise = (torch.rand_like(sampled_features) * 2 - 1) * half_noise
+                noise = (torch.rand_like(sampled_features) * 2 - 1) * self.noise_range
                 sampled_features_noisy = sampled_features + noise
                 # Quantize (round to grid) then use STE
                 quantized = torch.round(sampled_features_noisy / Q_k) * Q_k

@@ -21,7 +21,7 @@ def get_texture_config() -> List[Dict]:
         keyword_order[3]: ["occlusion", "ao", "ambient"],
         keyword_order[4]: ["metallic", "metalness"],
         keyword_order[5]: ["specular"],
-        keyword_order[6]: ["displacement", "disp"],
+        keyword_order[6]: ["displacement", "disp", "height"],
         # add other texture types and their possible keywords if needed
     }
 

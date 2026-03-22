@@ -1,8 +1,10 @@
 import os
+import sys
 import torch
 import datetime
 import argparse
 import copy
+from typing import Tuple
 from torchmetrics.image import (
     LearnedPerceptualImagePatchSimilarity,
     StructuralSimilarityIndexMeasure,
@@ -19,6 +21,7 @@ from configs import get_args
 from model import TCNNModel
 from dataset import TextureDataset
 from configs import Config
+from Comparison_ASTC import ASTCCodec, ASTCENC_DEFAULT_PATH, run_astc_comparison_pipeline
 
 
 class Trainer:
@@ -98,6 +101,18 @@ class Trainer:
         self.configs = configs
         self.model = model
         self.dataset = dataset
+        self.enable_astc_compare = bool(configs.enable_astc_compare)
+        self.astcenc_path = str(getattr(configs, "astcenc_path", ASTCENC_DEFAULT_PATH))
+        self.astcenc_quality = str(getattr(configs, "astcenc_quality", "medium"))
+        self.astc_block = str(getattr(configs, "astc_block", "6x6"))
+        self.ref_astc_resolution = getattr(configs, "ref_astc_resolution", None)
+        self.astc_codec = ASTCCodec(
+            astcenc_path=self.astcenc_path,
+            astcenc_quality=self.astcenc_quality,
+            astc_block=self.astc_block,
+        )
+        if self.enable_astc_compare:
+            self.astc_codec.ensure_executable()
 
 
     def train(self) -> None:
@@ -170,6 +185,8 @@ class Trainer:
                                   f"({self.early_stop_psnr_threshold:.4f} dB). Stopping training at iter {curr_iter}.")
                             # save model before stopping
                             self.model.save(curr_iter, self.model_path)
+                            if self.enable_astc_compare:
+                                self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path)
                             self.end_time = datetime.datetime.now()
                             self.duration_time = self.end_time - self.start_time
                             print(f"Total training time: {self.duration_time}")
@@ -184,6 +201,8 @@ class Trainer:
             
             if curr_iter > 0 and curr_iter % self.save_interval == 0:
                 self.model.save(curr_iter, self.model_path)
+                if self.enable_astc_compare:
+                    self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path)
                 self.end_time = datetime.datetime.now()
                 self.duration_time = self.end_time - self.start_time
                 print(self.duration_time)
@@ -363,33 +382,31 @@ class Trainer:
         metrics += f"AVER {psnr_aver} {ssim_aver} {lpips_aver}\n"
         with open(os.path.join(self.infer_path, "metrics.txt"), "w+") as file:
             file.writelines(metrics)
-    
-    def _postprocess_for_vis(self, image: torch.Tensor, vis_mode: str) -> torch.Tensor:
-        """Apply visualization post-processing based on vis_mode.
-        Args:
-            image: [C, H, W] tensor in [0, 1]
-            vis_mode: 'srgb' | 'normal' | 'linear'
-        """
-        image = torch.clamp(image, 0.0, 1.0)
-        if vis_mode == 'srgb':
-            image = torch.pow(image, 1.0 / 2.2)
-        elif vis_mode == 'normal':
-            n = image * 2.0 - 1.0
-            norm = torch.sqrt(torch.clamp((n ** 2).sum(dim=0, keepdim=True), min=1e-8))
-            n = n / norm
-            image = torch.clamp((n + 1.0) * 0.5, 0.0, 1.0)
-        # 'linear' -> no transform
-        return image
 
-    def _get_metrics_slice(self):
-        """Return (start, end) channel indices in canonical 11-channel space for metrics.
-        Prefers 'diffuse' (0:3); falls back to the first available texture's canonical slice.
-        """
-        canon = self.dataset.canonical_channel_slices
-        if 'diffuse' in self.dataset.available_textures:
-            return canon['diffuse']
-        first = self.dataset.available_textures[0]
-        return canon[first]
+        if self.enable_astc_compare:
+            self.run_astc_comparison(output_root=self.infer_path)
+    
+    @torch.no_grad()
+    def run_astc_comparison(self, curr_iter: int = None, output_root: str = None) -> None:
+        if output_root is None:
+            output_root = self.infer_path if hasattr(self, "infer_path") else self.media_path
+        run_astc_comparison_pipeline(
+            model=self.model,
+            dataset=self.dataset,
+            astc_codec=self.astc_codec,
+            psnr_metric=self.psnr,
+            ssim_metric=self.ssim,
+            lpips_metric=self.lpips,
+            vis_configs=self.vis_configs,
+            postprocess_for_vis=self._postprocess_for_vis,
+            output_root=output_root,
+            texture_height=self.texture_height,
+            texture_width=self.texture_width,
+            num_lods=self.num_lods,
+            device=self.device,
+            curr_iter=curr_iter,
+            ref_astc_resolution=self.ref_astc_resolution,
+        )
 
     @torch.no_grad()
     def generate_probabilities(self) -> TensorType["num_lods"]:
@@ -418,6 +435,7 @@ if __name__ == "__main__":
     if configs.groups_batching:
         # GroupsBatching mode: iterate over all texture groups sequentially
         print(f"[GroupsBatching] Starting batch training for {len(configs.groups_list)} groups...")
+        failed_groups = []
         for idx, group_name in enumerate(configs.groups_list):
             print(f"\n{'='*60}")
             print(f"[GroupsBatching] Training group {idx+1}/{len(configs.groups_list)}: {group_name}")
@@ -435,12 +453,16 @@ if __name__ == "__main__":
                 print(f"[GroupsBatching] ERROR on group '{group_name}': {e}")
                 import traceback
                 traceback.print_exc()
+                failed_groups.append(group_name)
                 continue
             finally:
                 # Free GPU memory between groups
                 torch.cuda.empty_cache()
             print(f"[GroupsBatching] Finished group '{group_name}'")
         print(f"\n[GroupsBatching] All groups completed.")
+        if failed_groups:
+            print(f"[GroupsBatching] Exiting with error; failed groups: {', '.join(failed_groups)}", file=sys.stderr)
+            sys.exit(1)
     else:
         # Single-group mode (original behavior)
         trainer = Trainer(params)

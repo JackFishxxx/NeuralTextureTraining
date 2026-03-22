@@ -113,6 +113,13 @@ class Config():
         self.output_loss_weights: Optional[List[float]] = None
         self.network_learning_rate = params.learning_rate
 
+        ### ---------- ASTC comparison (vs traditional round-trip) ---------- ###
+        self.enable_astc_compare = bool(params.enable_astc_compare)
+        self.astcenc_path = params.astcenc_path
+        self.astcenc_quality = params.astcenc_quality
+        self.astc_block = params.astc_block
+        self.ref_astc_resolution = getattr(params, "ref_astc_resolution", None)
+
         # Normalize configs to the internal format expected by the model
         if self.hash_grid_configs is not None:
             processed: List[Dict] = []
@@ -230,5 +237,18 @@ def get_args():
                         help='number of iterations per segment for early stopping PSNR evaluation')
     parser.add_argument('--early_stop_psnr_threshold', type=float, default=0.01,
                         help='minimum PSNR improvement (in dB) between two consecutive segments; training stops if improvement is below this value')
+
+    ### ---------- ASTC comparison configs ---------- ###
+    parser.add_argument('--enable_astc_compare', action=argparse.BooleanOptionalAction, default=True,
+                        help='enable ASTC comparison (official astcenc roundtrip)')
+    parser.add_argument('--astcenc_path', type=str, default='tools/astcenc',
+                        help='astcenc executable path or directory. If path does not exist, astcenc will be auto-downloaded there')
+    parser.add_argument('--astcenc_quality', type=str, default='medium',
+                        choices=['fastest', 'fast', 'medium', 'thorough', 'exhaustive'],
+                        help='astcenc quality preset for ASTC comparison')
+    parser.add_argument('--astc_block', type=str, default='6x6',
+                        help='ASTC block size, e.g. 4x4 / 6x6 / 8x8')
+    parser.add_argument('--ref_astc_resolution', type=int, default=1024,
+                        help='Traditional ref_astc_* baseline: square edge length (H=W) before astcenc; omit for LOD0 size')
 
     return parser.parse_args()

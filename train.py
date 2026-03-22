@@ -129,7 +129,7 @@ class Trainer:
             # uvs = ((xys + 0.5) / lod_scale) / (texture_weight / lod_scale)
             us = (xs + 0.5) / self.texture_height 
             vs = (ys + 0.5) / self.texture_width
-            lods = lods / (self.num_lods - 1)
+            lods = lods.float() / (self.num_lods - 1) if self.num_lods > 0 else torch.zeros_like(lods, dtype=torch.float32)
             batch_input = torch.cat([us, vs, lods], dim=1)
             # predict
             predict_texture = self.model(batch_input)  # [batch_size, num_channels]
@@ -214,7 +214,7 @@ class Trainer:
             x_coords, y_coords = torch.meshgrid(torch.arange(lod_height), torch.arange(lod_width), indexing='xy')
             u_coords = (x_coords + 0.5) / lod_height
             v_coords = (y_coords + 0.5) / lod_width 
-            lod_coords = torch.ones_like(x_coords) * lod / (self.num_lods - 1)
+            lod_coords = torch.ones_like(x_coords) * (float(lod) / float(self.num_lods - 1) if self.num_lods > 0 else 0.0)
             # eval_input = torch.stack([u_coords, v_coords, lod_coords, x_coords, y_coords], dim=2).to(self.device)
             # eval_input = eval_input.reshape([-1, 5])
             eval_input = torch.stack([u_coords, v_coords, lod_coords], dim=2).to(self.device)
@@ -231,6 +231,7 @@ class Trainer:
 
             ms, me = self._get_metrics_slice()
             predicted_rgb = predicted_image[:, ms:me, :, :]
+            predicted_rgb = torch.nan_to_num(predicted_rgb.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0) # Fix NaN or Inf found in input tensor
             gt_rgb = gt_image[:, ms:me, :, :]
                         
             psnr_value = self.psnr(predicted_rgb, gt_rgb)
@@ -316,7 +317,7 @@ class Trainer:
             indexing='xy')
             u_coords = (x_coords + 0.5) / lod_height
             v_coords = (y_coords + 0.5) / lod_width 
-            lod_coords = torch.ones_like(x_coords) * lod / (self.num_lods - 1)
+            lod_coords = torch.ones_like(x_coords) * (float(lod) / float(self.num_lods - 1) if self.num_lods > 0 else 0.0)
             eval_input = torch.stack([u_coords, v_coords, lod_coords, x_coords, y_coords], dim=2).to(self.device)
             eval_input = eval_input.reshape([-1, 5])
 
@@ -331,6 +332,7 @@ class Trainer:
 
             ms, me = self._get_metrics_slice()
             predicted_rgb = predicted_image[:, ms:me, :, :]
+            predicted_rgb = torch.nan_to_num(predicted_rgb.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0) # Fix NaN or Inf found in input tensor
             gt_rgb = gt_image[:, ms:me, :, :]
                         
             psnr_value = self.psnr(predicted_rgb, gt_rgb)

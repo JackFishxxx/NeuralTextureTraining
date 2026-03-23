@@ -38,6 +38,12 @@ class TCNNModel(torch.nn.Module):
         self.max_quantize_range = 1 / 2
         self.noise_range = 1 / 2 * self.Q_k
 
+        self.max_iter = max(1, int(config.max_iter))
+        self._qat_noise_schedule = str(getattr(config, "qat_noise_schedule", "none")).strip().lower()
+        self._qat_noise_mult_start = float(getattr(config, "qat_noise_mult_start", 1.0))
+        self._qat_noise_mult_end = float(getattr(config, "qat_noise_mult_end", 0.25))
+        self._qat_noise_warmup_frac = float(getattr(config, "qat_noise_warmup_frac", 0.0))
+
         self.current_iter = 0
 
         self.num_lods = config.num_lods
@@ -194,7 +200,20 @@ class TCNNModel(torch.nn.Module):
             f"Unsupported output activation '{self.output_activation}'. "
             "Expected one of: hard_swish, hard_gelu, leaky_relu."
         )
-    
+
+    def _qat_noise_multiplier(self) -> float:
+        """Scales uniform additive noise in fake-quant forward; eval / non-quant unchanged."""
+        if self._qat_noise_schedule == "none":
+            return 1.0
+        T = max(1, self.max_iter - 1)
+        t = min(max(int(self.current_iter), 0), T)
+        w = int(self._qat_noise_warmup_frac * T)
+        if t <= w:
+            return self._qat_noise_mult_start
+        p = (t - w) / max(1, T - w)
+        c = 0.5 * (1.0 + math.cos(math.pi * p))
+        return self._qat_noise_mult_end + (self._qat_noise_mult_start - self._qat_noise_mult_end) * c
+
     def load_ckpt(self, config: Config) -> None:
         
         # TODO
@@ -249,7 +268,9 @@ class TCNNModel(torch.nn.Module):
 
                 # STE (Straight-Through Estimator) quantization simulation:
                 # Quantize in forward pass, but let gradients pass through unchanged.
-                noise = (torch.rand_like(sampled_features) * 2 - 1) * self.noise_range
+                noise_range = 0.5 * Q_k
+                mult = self._qat_noise_multiplier()
+                noise = (torch.rand_like(sampled_features) * 2 - 1) * noise_range * mult
                 sampled_features_noisy = sampled_features + noise
                 # Quantize (round to grid) then use STE
                 quantized = torch.round(sampled_features_noisy / Q_k) * Q_k

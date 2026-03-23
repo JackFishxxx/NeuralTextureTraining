@@ -45,6 +45,15 @@ class Config():
         self.quantize = params.quantize
         self.quantize_bits = params.quantize_bits
         self.save_bits = params.save_bits
+        # Hash-grid QAT: multiplicative noise schedule (ANA-style cosine anneal)
+        self.qat_noise_schedule = str(getattr(params, "qat_noise_schedule", "cosine")).strip().lower()
+        if self.qat_noise_schedule not in ("none", "cosine"):
+            raise ValueError(
+                f"qat_noise_schedule must be 'none' or 'cosine', got '{self.qat_noise_schedule}'"
+            )
+        self.qat_noise_mult_start = float(getattr(params, "qat_noise_mult_start", 1.0))
+        self.qat_noise_mult_end = float(getattr(params, "qat_noise_mult_end", 0.25))
+        self.qat_noise_warmup_frac = float(getattr(params, "qat_noise_warmup_frac", 0.1))
 
         ### ---------- trainer configs ---------- ###
         self.max_iter = params.max_iter
@@ -210,6 +219,31 @@ def get_args():
     parser.add_argument('--save_bits', type=int, default=32,
                         help='choose the bits to quantize',
                         choices=[8, 16, 32, 64])
+    parser.add_argument(
+        '--qat_noise_schedule',
+        type=str,
+        default='cosine',
+        choices=['none', 'cosine'],
+        help='QAT additive noise strength schedule over training iterations (hash grid STE branch)',
+    )
+    parser.add_argument(
+        '--qat_noise_mult_start',
+        type=float,
+        default=1.0,
+        help='noise multiplier at warmup end / start of cosine segment',
+    )
+    parser.add_argument(
+        '--qat_noise_mult_end',
+        type=float,
+        default=0.25,
+        help='noise multiplier at end of training (cosine tail)',
+    )
+    parser.add_argument(
+        '--qat_noise_warmup_frac',
+        type=float,
+        default=0.1,
+        help='fraction of (max_iter-1) iterations holding mult_start before cosine decay',
+    )
         
     ### ---------- trainer configs ---------- ###
     parser.add_argument('--max_iter', type=int, default=400000,

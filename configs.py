@@ -65,6 +65,8 @@ class Config():
 
         self.eval_interval = params.eval_interval
         self.save_interval = params.save_interval
+        self.eval_inference_tile = params.eval_inference_tile
+        self.eval_metrics_max_edge = params.eval_metrics_max_edge
 
         ### ---------- early stopping configs ---------- ###
         self.early_stop = params.early_stop
@@ -263,6 +265,10 @@ def get_args():
                         help='the interval of iteration for evalation')
     parser.add_argument('--save_interval', type=int, default=5000,
                         help='the interval of iteration for saving model')
+    parser.add_argument('--eval_inference_tile', type=int, default=512,
+                        help='eval/infer: tile edge in pixels (0 = one batch over full plane, may OOM)')
+    parser.add_argument('--eval_metrics_max_edge', type=int, default=1024,
+                        help='area-downsample to this max(H,W) before PSNR/SSIM/LPIPS (0 = full res)')
 
     ### ---------- early stopping configs ---------- ###
     parser.add_argument('--early_stop', action='store_true', default=True,

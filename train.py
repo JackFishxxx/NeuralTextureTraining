@@ -1,9 +1,9 @@
 import os
 import sys
 import torch
+import torch.nn.functional as F
 import datetime
 import argparse
-import copy
 from typing import Tuple
 from torchmetrics.image import (
     LearnedPerceptualImagePatchSimilarity,
@@ -101,6 +101,8 @@ class Trainer:
         self.configs = configs
         self.model = model
         self.dataset = dataset
+        self.eval_inference_tile = max(0, int(configs.eval_inference_tile))
+        self.eval_metrics_max_edge = int(configs.eval_metrics_max_edge)
         self.enable_astc_compare = bool(configs.enable_astc_compare)
         self.astcenc_path = str(getattr(configs, "astcenc_path", ASTCENC_DEFAULT_PATH))
         self.astcenc_quality = str(getattr(configs, "astcenc_quality", "medium"))
@@ -123,6 +125,8 @@ class Trainer:
 
             # update model's current iteration for noise annealing
             self.model.current_iter = curr_iter
+            if self.quantize and curr_iter % self.eval_interval == 0:
+                self.writer.add_scalar("QAT/noise_mult", self.model._qat_noise_multiplier(), curr_iter)
 
             # generate random indexs
             ys = torch.randint(0, self.texture_height, [self.batch_size, 1]).to(self.device)
@@ -211,6 +215,67 @@ class Trainer:
                 torch.cuda.empty_cache()
                 tcnn.free_temporary_memory()
 
+    def _cuda_trim_eval_mem(self, synchronize: bool = False) -> None:
+        if self.device != "cuda":
+            return
+        if synchronize:
+            torch.cuda.synchronize()
+        tcnn.free_temporary_memory()
+        torch.cuda.empty_cache()
+
+    def _backup_hash_grid_state(self):
+        return [{k: v.detach().clone() for k, v in g.state_dict().items()} for g in self.model.hash_grids]
+
+    def _restore_hash_grid_state(self, backups) -> None:
+        for g, bak in zip(self.model.hash_grids, backups):
+            g.load_state_dict(bak)
+
+    @staticmethod
+    def _lod_plane_tile(
+        h0: int, h1: int, w0: int, w1: int, plane_h: int, plane_w: int, lod_f: float, device: str
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """[N,3] batch and (row,col) indices; same UV as train (us=(col+0.5)/H, vs=(row+0.5)/W)."""
+        rr, cc = torch.meshgrid(
+            torch.arange(h0, h1, device=device),
+            torch.arange(w0, w1, device=device),
+            indexing="ij",
+        )
+        z = torch.full_like(rr, lod_f)
+        inp = torch.stack(((cc + 0.5) / plane_h, (rr + 0.5) / plane_w, z), dim=-1).reshape(-1, 3)
+        return inp, rr.reshape(-1).long(), cc.reshape(-1).long()
+
+    @torch.no_grad()
+    def _fill_predicted_lod(self, lod: int, lod_height: int, lod_width: int) -> torch.Tensor:
+        """Tiled full-plane forward (caps tcnn batch size; scatter by row/col to avoid layout bugs)."""
+        device = self.device
+        c = self.model.num_channels
+        out = torch.empty(lod_height, lod_width, c, device=device, dtype=torch.float32)
+        step = max(1, self.eval_inference_tile or max(lod_height, lod_width))
+        lod_f = 0.0 if self.num_lods <= 1 else float(lod) / float(self.num_lods - 1)
+        for h0 in range(0, lod_height, step):
+            h1 = min(h0 + step, lod_height)
+            for w0 in range(0, lod_width, step):
+                w1 = min(w0 + step, lod_width)
+                inp, fr, fc = self._lod_plane_tile(h0, h1, w0, w1, lod_height, lod_width, lod_f, device)
+                out[fr, fc, :] = self.model(inp).float()
+        return out
+
+    def _downsample_for_metrics(self, pred: torch.Tensor, gt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Area-downsample for PSNR/SSIM/LPIPS when the plane is large."""
+        max_edge = self.eval_metrics_max_edge
+        if max_edge <= 0:
+            return pred, gt
+        _, _, h, w = pred.shape
+        edge = max(h, w)
+        if edge <= max_edge:
+            return pred, gt
+        scale = max_edge / float(edge)
+        nh = max(1, int(round(h * scale)))
+        nw = max(1, int(round(w * scale)))
+        pred_ds = F.interpolate(pred, size=(nh, nw), mode="area")
+        gt_ds = F.interpolate(gt, size=(nh, nw), mode="area")
+        return pred_ds, gt_ds
+
     @torch.no_grad()
     def eval(self, curr_iter) -> float:
         
@@ -222,60 +287,63 @@ class Trainer:
         for vc in self.vis_configs:
             os.makedirs(os.path.join(self.media_path, vc['display_name']), exist_ok=True)
 
-        quant_model = copy.deepcopy(self.model)
-        quant_model.simulate_quantize()
+        self._cuda_trim_eval_mem(synchronize=True)
 
-        #for lod in range(self.num_lods - 4):
-        for lod in [0]:
+        grid_backup = self._backup_hash_grid_state()
+        was_training = self.model.training
+        try:
+            self.model.eval()
+            self.model.simulate_quantize()
 
-            lod_height = self.texture_height // (2 ** lod)
-            lod_width = self.texture_width // (2 ** lod)
-            x_coords, y_coords = torch.meshgrid(torch.arange(lod_height), torch.arange(lod_width), indexing='xy')
-            u_coords = (x_coords + 0.5) / lod_height
-            v_coords = (y_coords + 0.5) / lod_width 
-            lod_coords = torch.ones_like(x_coords) * (float(lod) / float(self.num_lods - 1) if self.num_lods > 0 else 0.0)
-            # eval_input = torch.stack([u_coords, v_coords, lod_coords, x_coords, y_coords], dim=2).to(self.device)
-            # eval_input = eval_input.reshape([-1, 5])
-            eval_input = torch.stack([u_coords, v_coords, lod_coords], dim=2).to(self.device)
-            eval_input = eval_input.reshape([-1, 3])
+            #for lod in range(self.num_lods - 4):
+            for lod in [0]:
 
-            predicted_image = quant_model(eval_input)
-            predicted_image = predicted_image.reshape([lod_height, lod_width, -1])
-            predicted_image = torch.clamp(predicted_image, min=0, max=1)
-            gt_slice = self.dataset.lod_cache[lod, :lod_height, :lod_width, :]  # [H, W, num_channels]
-            gt_canonical = self.dataset.expand_to_canonical(gt_slice.reshape(-1, gt_slice.shape[-1])).reshape(lod_height, lod_width, -1)
-            gt_image = gt_canonical.permute(2, 0, 1)[None, ...]  # [1, 11, H, W]
+                lod_height = self.texture_height // (2 ** lod)
+                lod_width = self.texture_width // (2 ** lod)
 
-            predicted_image = predicted_image.permute(2, 0, 1)[None, ...]  # [1, 11, H, W]
+                predicted_image = self._fill_predicted_lod(lod, lod_height, lod_width)
+                predicted_image = torch.clamp(predicted_image, min=0, max=1)
+                gt_slice = self.dataset.lod_cache[lod, :lod_height, :lod_width, :]  # [H, W, num_channels]
+                gt_canonical = self.dataset.expand_to_canonical(gt_slice.reshape(-1, gt_slice.shape[-1])).reshape(lod_height, lod_width, -1)
+                gt_image = gt_canonical.permute(2, 0, 1)[None, ...]  # [1, 11, H, W]
 
-            ms, me = self._get_metrics_slice()
-            predicted_rgb = predicted_image[:, ms:me, :, :]
-            predicted_rgb = torch.nan_to_num(predicted_rgb.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0) # Fix NaN or Inf found in input tensor
-            gt_rgb = gt_image[:, ms:me, :, :]
-                        
-            psnr_value = self.psnr(predicted_rgb, gt_rgb)
-            psnr_list.append(psnr_value.item())
-            self.writer.add_scalar(f'PSNR_LOD{int(lod)}/train', psnr_value.item(), curr_iter)
+                predicted_image = predicted_image.permute(2, 0, 1)[None, ...]  # [1, 11, H, W]
 
-            ssim_value, ssim_images = self.ssim(predicted_rgb, gt_rgb)
-            ssim_list.append(ssim_value.item())
-            self.writer.add_scalar(f'SSIM_LOD{int(lod)}/train', ssim_value.item(), curr_iter)
+                ms, me = self._get_metrics_slice()
+                predicted_rgb = predicted_image[:, ms:me, :, :]
+                predicted_rgb = torch.nan_to_num(predicted_rgb.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0) # Fix NaN or Inf found in input tensor
+                gt_rgb = gt_image[:, ms:me, :, :]
 
-            if lod_height >= 128 and lod_width >= 128:
-                lpips_value = self.lpips(predicted_rgb, gt_rgb)
-                lpips_list.append(lpips_value.item())
-                self.writer.add_scalar(f'LPIPS_LOD{int(lod)}/train', lpips_value.item(), curr_iter)
+                predicted_rgb, gt_rgb = self._downsample_for_metrics(predicted_rgb, gt_rgb)
 
-            if curr_iter % (self.save_interval) == 0:
-                save_image = torch.cat([predicted_image, gt_image], dim=3).squeeze()
+                psnr_value = self.psnr(predicted_rgb, gt_rgb)
+                psnr_list.append(psnr_value.item())
+                self.writer.add_scalar(f'PSNR_LOD{int(lod)}/train', psnr_value.item(), curr_iter)
 
-                for vc in self.vis_configs:
-                    s, e = vc['canonical_channel_slice']
-                    tex_image = save_image[s:e, ...]
-                    tex_image = self._postprocess_for_vis(tex_image, vc['vis_mode'])
-                    save_path = os.path.join(self.media_path, vc['display_name'], f"{curr_iter}_{int(lod)}.png")
-                    TF.to_pil_image(tex_image).save(save_path)
-        
+                ssim_value, ssim_images = self.ssim(predicted_rgb, gt_rgb)
+                ssim_list.append(ssim_value.item())
+                self.writer.add_scalar(f'SSIM_LOD{int(lod)}/train', ssim_value.item(), curr_iter)
+
+                if lod_height >= 128 and lod_width >= 128:
+                    lpips_value = self.lpips(predicted_rgb, gt_rgb)
+                    lpips_list.append(lpips_value.item())
+                    self.writer.add_scalar(f'LPIPS_LOD{int(lod)}/train', lpips_value.item(), curr_iter)
+
+                if curr_iter % (self.save_interval) == 0:
+                    save_image = torch.cat([predicted_image, gt_image], dim=3).squeeze()
+
+                    for vc in self.vis_configs:
+                        s, e = vc['canonical_channel_slice']
+                        tex_image = save_image[s:e, ...]
+                        tex_image = self._postprocess_for_vis(tex_image, vc['vis_mode'])
+                        save_path = os.path.join(self.media_path, vc['display_name'], f"{curr_iter}_{int(lod)}.png")
+                        TF.to_pil_image(tex_image).save(save_path)
+
+        finally:
+            self._restore_hash_grid_state(grid_backup)
+            self.model.train(was_training)
+            self._cuda_trim_eval_mem(synchronize=False)
+
         psnr_aver = torch.tensor(psnr_list).mean()
         ssim_aver = torch.tensor(ssim_list).mean()
         lpips_aver = torch.tensor(lpips_list).mean()
@@ -331,17 +399,8 @@ class Trainer:
 
             lod_height = self.texture_height // (2 ** lod)
             lod_width = self.texture_width // (2 ** lod)
-            x_coords, y_coords = torch.meshgrid(
-                torch.arange(lod_height), torch.arange(lod_width), 
-            indexing='xy')
-            u_coords = (x_coords + 0.5) / lod_height
-            v_coords = (y_coords + 0.5) / lod_width 
-            lod_coords = torch.ones_like(x_coords) * (float(lod) / float(self.num_lods - 1) if self.num_lods > 0 else 0.0)
-            eval_input = torch.stack([u_coords, v_coords, lod_coords, x_coords, y_coords], dim=2).to(self.device)
-            eval_input = eval_input.reshape([-1, 5])
 
-            predicted_image = self.model(eval_input)
-            predicted_image = predicted_image.reshape([lod_height, lod_width, -1])
+            predicted_image = self._fill_predicted_lod(lod, lod_height, lod_width)
             predicted_image = torch.clamp(predicted_image, min=0, max=1)
             gt_slice = self.dataset.lod_cache[lod, :lod_height, :lod_width, :]
             gt_canonical = self.dataset.expand_to_canonical(gt_slice.reshape(-1, gt_slice.shape[-1])).reshape(lod_height, lod_width, -1)
@@ -353,6 +412,8 @@ class Trainer:
             predicted_rgb = predicted_image[:, ms:me, :, :]
             predicted_rgb = torch.nan_to_num(predicted_rgb.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0) # Fix NaN or Inf found in input tensor
             gt_rgb = gt_image[:, ms:me, :, :]
+
+            predicted_rgb, gt_rgb = self._downsample_for_metrics(predicted_rgb, gt_rgb)
                         
             psnr_value = self.psnr(predicted_rgb, gt_rgb)
             psnr_list.append(psnr_value.item())
@@ -456,8 +517,13 @@ if __name__ == "__main__":
                 failed_groups.append(group_name)
                 continue
             finally:
-                # Free GPU memory between groups
-                torch.cuda.empty_cache()
+                try:
+                    if torch.cuda.is_available():
+                        # Free GPU memory between groups
+                        torch.cuda.empty_cache()
+                        tcnn.free_temporary_memory()
+                except Exception:
+                    pass  # empty_cache can fail after CUDA OOM
             print(f"[GroupsBatching] Finished group '{group_name}'")
         print(f"\n[GroupsBatching] All groups completed.")
         if failed_groups:

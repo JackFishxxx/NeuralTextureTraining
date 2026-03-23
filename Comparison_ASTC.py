@@ -269,18 +269,22 @@ def _render_gt_lod0(dataset, texture_height: int, texture_width: int) -> torch.T
 
 @torch.no_grad()
 def _render_model_lod0(model, texture_height: int, texture_width: int, num_lods: int, device: str) -> torch.Tensor:
+    """LOD0 plane; UV / row-col scatter aligned with train.py (tiled path uses the same math)."""
     lod = 0
-    lod_height = texture_height // (2 ** lod)
-    lod_width = texture_width // (2 ** lod)
-    x_coords, y_coords = torch.meshgrid(torch.arange(lod_height), torch.arange(lod_width), indexing="xy")
-    u_coords = (x_coords + 0.5) / lod_height
-    v_coords = (y_coords + 0.5) / lod_width
-    lod_coords = torch.ones_like(x_coords) * lod / (num_lods - 1)
-    eval_input = torch.stack([u_coords, v_coords, lod_coords], dim=2).to(device).reshape([-1, 3])
-    pred = model(eval_input).reshape([lod_height, lod_width, -1])
-    pred = torch.nan_to_num(pred, nan=0.0, posinf=1.0, neginf=0.0)
-    pred = torch.clamp(pred, min=0, max=1)
-    return pred.permute(2, 0, 1)[None, ...]
+    H = texture_height >> lod
+    W = texture_width >> lod
+    rr, cc = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
+    lod_f = float(lod) / max(1, num_lods - 1)
+    inp = torch.stack(
+        ((cc + 0.5) / H, (rr + 0.5) / W, torch.full_like(rr, lod_f)), dim=-1
+    ).to(device).reshape(-1, 3)
+    y = model(inp).float()
+    hwc = torch.empty(H, W, y.shape[-1], device=device, dtype=torch.float32)
+    fr = rr.reshape(-1).to(device=device, dtype=torch.long)
+    fc = cc.reshape(-1).to(device=device, dtype=torch.long)
+    hwc[fr, fc, :] = y
+    hwc = torch.nan_to_num(hwc, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    return hwc.permute(2, 0, 1)[None, ...]
 
 
 # ---------------------------------------------------------------------------

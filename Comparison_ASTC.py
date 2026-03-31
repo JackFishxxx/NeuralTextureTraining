@@ -647,7 +647,7 @@ def run_astc_comparison_pipeline(
     device: str,
     curr_iter: Optional[int] = None,
     ref_astc_resolution: Optional[int] = None,
-) -> None:
+) -> Dict[str, Dict[str, Tuple[float, float, float]]]:
     block_tag = astc_codec.astc_block.replace("x", "_")
     fntc_astc_name = f"fntc_astc_{astc_codec.astc_block}"
     ref_astc_name = f"ref_astc_{astc_codec.astc_block}"
@@ -725,3 +725,5 @@ def run_astc_comparison_pipeline(
         vis_configs=vis_configs,
         postprocess_for_vis=postprocess_for_vis,
     )
+
+    return metrics

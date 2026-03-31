@@ -171,6 +171,9 @@ class Trainer:
 
             self.model.clamp_value()
 
+            # track whether ASTC comparison was already run this iteration (avoid duplicate runs)
+            _astc_already_ran = False
+
             # eval
             if curr_iter % self.eval_interval == 0:
                 eval_psnr = self.eval(curr_iter)
@@ -180,23 +183,39 @@ class Trainer:
                     self._early_stop_avg_psnr += eval_psnr
                     self._early_stop_eval_count += 1
                     if curr_iter > 0 and curr_iter % self.early_stop_interval == 0:
-                        self._early_stop_avg_psnr /= self._early_stop_eval_count
-                        psnr_improvement = self._early_stop_avg_psnr - self._early_stop_prev_psnr
-                        print(f"[EarlyStopCheck] Iter {curr_iter}: PSNR = {self._early_stop_avg_psnr:.4f} dB, "
-                              f"improvement = {psnr_improvement:.4f} dB, threshold = {self.early_stop_psnr_threshold:.4f} dB")
+                        if self.enable_astc_compare:
+                            # Use fntc_astc_{block} average PSNR as early stopping metric
+                            astc_metrics = self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path)
+                            _astc_already_ran = True
+                            fntc_astc_name = f"fntc_astc_{self.astc_block}"
+                            fntc_astc_avg = astc_metrics.get(fntc_astc_name, {}).get("average")
+                            if fntc_astc_avg is not None:
+                                current_psnr = fntc_astc_avg[0]  # (psnr, ssim, lpips)
+                                self.writer.add_scalar(f'EarlyStop/{fntc_astc_name}_avg_PSNR', current_psnr, curr_iter)
+                            else:
+                                # Fallback to eval PSNR if ASTC metrics unavailable
+                                current_psnr = self._early_stop_avg_psnr / self._early_stop_eval_count
+                            psnr_improvement = current_psnr - self._early_stop_prev_psnr
+                            print(f"[EarlyStopCheck] Iter {curr_iter}: {fntc_astc_name} avg PSNR = {current_psnr:.4f} dB, "
+                                  f"improvement = {psnr_improvement:.4f} dB, threshold = {self.early_stop_psnr_threshold:.4f} dB")
+                        else:
+                            self._early_stop_avg_psnr /= self._early_stop_eval_count
+                            current_psnr = self._early_stop_avg_psnr
+                            psnr_improvement = current_psnr - self._early_stop_prev_psnr
+                            print(f"[EarlyStopCheck] Iter {curr_iter}: PSNR = {current_psnr:.4f} dB, "
+                                  f"improvement = {psnr_improvement:.4f} dB, threshold = {self.early_stop_psnr_threshold:.4f} dB")
                         if psnr_improvement < self.early_stop_psnr_threshold:
                             print(f"[EarlyStopCheck] PSNR improvement ({psnr_improvement:.4f} dB) < threshold "
                                   f"({self.early_stop_psnr_threshold:.4f} dB). Stopping training at iter {curr_iter}.")
                             # save model before stopping
                             self.model.save(curr_iter, self.model_path)
-                            if self.enable_astc_compare:
-                                self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path)
+                            # When enable_astc_compare is True, ASTC comparison was already run above for the metric check
                             self.end_time = datetime.datetime.now()
                             self.duration_time = self.end_time - self.start_time
                             print(f"Total training time: {self.duration_time}")
                             return
                         else:
-                            self._early_stop_prev_psnr = self._early_stop_avg_psnr
+                            self._early_stop_prev_psnr = current_psnr
                             self._early_stop_avg_psnr = 0
                             self._early_stop_eval_count = 0
 
@@ -205,7 +224,7 @@ class Trainer:
             
             if curr_iter > 0 and curr_iter % self.save_interval == 0:
                 self.model.save(curr_iter, self.model_path)
-                if self.enable_astc_compare:
+                if self.enable_astc_compare and not _astc_already_ran:
                     self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path)
                 self.end_time = datetime.datetime.now()
                 self.duration_time = self.end_time - self.start_time
@@ -448,10 +467,10 @@ class Trainer:
             self.run_astc_comparison(output_root=self.infer_path)
     
     @torch.no_grad()
-    def run_astc_comparison(self, curr_iter: int = None, output_root: str = None) -> None:
+    def run_astc_comparison(self, curr_iter: int = None, output_root: str = None) -> dict:
         if output_root is None:
             output_root = self.infer_path if hasattr(self, "infer_path") else self.media_path
-        run_astc_comparison_pipeline(
+        return run_astc_comparison_pipeline(
             model=self.model,
             dataset=self.dataset,
             astc_codec=self.astc_codec,

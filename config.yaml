@@ -1,0 +1,38 @@
+# ============================================================
+# FNTC Baseline Configuration
+# This file serves as the persistent default config for training.
+# Priority chain: argparse defaults -> config.yaml -> CLI args
+# ============================================================
+
+# ---------- quantization configs ----------
+qat_noise_schedule: "cosine"
+qat_noise_mult_start: 1.0
+qat_noise_mult_end: 0.25
+qat_noise_warmup_frac: 0.1
+
+# ---------- model configs ----------
+output_activation: "hard_swish"
+
+# ---------- ASTC residual-aware robust training ----------
+astc_aware_train: true
+astc_block_size: 6
+astc_noise_mode: "block_residual"
+astc_noise_prob: 0.0
+astc_noise_std: 0.02
+astc_noise_channel_corr: 0.5
+astc_noise_apply_after_quant: true
+
+astc_curriculum_enable: true
+astc_curriculum_warmup_ratio: 0.2
+astc_curriculum_peak_ratio: 0.7
+
+consistency_loss_enable: true
+consistency_lambda: 0.0
+consistency_start_ratio: 0.45
+consistency_end_ratio: 1.0
+consistency_loss_type: "l1"
+
+sensitive_mask_enable: true
+sensitive_mask_metric: "grad_luma"
+sensitive_mask_percentile: 0.85
+sensitive_mask_detach: true

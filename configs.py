@@ -1,9 +1,36 @@
 import argparse
 import os
 import math
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+import yaml
+
+
+def _load_yaml_defaults(config_path=None):
+    """Load YAML config file as a dict of default values.
+
+    Args:
+        config_path: Explicit path to a YAML config file. If None, auto-discovers
+                     ``config.yaml`` in the project root directory (same dir as this file).
+
+    Returns:
+        dict of parameter defaults, or empty dict if file not found.
+    """
+    if config_path is not None:
+        p = Path(config_path)
+    else:
+        # Auto-discover config.yaml next to this file
+        p = Path(__file__).resolve().parent / "config.yaml"
+
+    if not p.exists():
+        return {}
+
+    with open(p, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    return data if isinstance(data, dict) else {}
 
 class Config():
     
@@ -210,6 +237,10 @@ class Config():
 
 def get_args():
     parser = argparse.ArgumentParser()
+
+    # --config: path to a YAML config file (parsed first, then overridden by CLI args)
+    parser.add_argument('--config', type=str, default=None,
+                        help='path to YAML config file (overrides argparse defaults, overridden by CLI args)')
 
     ### ---------- experiment configs ---------- ###
     parser.add_argument('--data_dir', type=str, default='data/test',

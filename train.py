@@ -22,6 +22,7 @@ from model import TCNNModel
 from dataset import TextureDataset
 from configs import Config
 from Comparison_ASTC import ASTCCodec, ASTCENC_DEFAULT_PATH, run_astc_comparison_pipeline
+from astc_residual_model import ASTCResidualNoiseModel
 
 
 class Trainer:
@@ -116,6 +117,29 @@ class Trainer:
         if self.enable_astc_compare:
             self.astc_codec.ensure_executable()
 
+        # ASTC residual-aware robust training (train-only; inference unchanged)
+        self.astc_aware_train = bool(getattr(configs, "astc_aware_train", False))
+        self.astc_curriculum_enable = bool(getattr(configs, "astc_curriculum_enable", False))
+        self.consistency_loss_enable = bool(getattr(configs, "consistency_loss_enable", False))
+        self.consistency_lambda = float(getattr(configs, "consistency_lambda", 0.0))
+        self.consistency_start_ratio = float(getattr(configs, "consistency_start_ratio", 0.45))
+        self.consistency_end_ratio = float(getattr(configs, "consistency_end_ratio", 1.0))
+        self.consistency_loss_type = str(getattr(configs, "consistency_loss_type", "l1")).lower()
+
+        self.sensitive_mask_enable = bool(getattr(configs, "sensitive_mask_enable", False))
+        self.sensitive_mask_percentile = float(getattr(configs, "sensitive_mask_percentile", 0.85))
+        self.sensitive_mask_detach = bool(getattr(configs, "sensitive_mask_detach", True))
+
+        self.astc_noise_model = ASTCResidualNoiseModel(
+            block_size=int(getattr(configs, "astc_block_size", 6)),
+            noise_std=float(getattr(configs, "astc_noise_std", 0.02)),
+            channel_corr=float(getattr(configs, "astc_noise_channel_corr", 0.5)),
+            noise_prob=float(getattr(configs, "astc_noise_prob", 0.0)),
+            warmup_ratio=float(getattr(configs, "astc_curriculum_warmup_ratio", 0.2)),
+            peak_ratio=float(getattr(configs, "astc_curriculum_peak_ratio", 0.7)),
+            max_iter=int(self.max_iter),
+        ).to(self.device)
+
 
     def train(self) -> None:
 
@@ -150,22 +174,57 @@ class Trainer:
             vs = (ys + 0.5) / self.texture_width
             lods = lods.float() / (self.num_lods - 1) if self.num_lods > 0 else torch.zeros_like(lods, dtype=torch.float32)
             batch_input = torch.cat([us, vs, lods], dim=1)
-            # predict
+            # predict (clean branch)
             predict_texture = self.model(batch_input)  # [batch_size, num_channels]
 
-            # loss
-            loss = self.L2_loss(gt_texture, predict_texture)
-            # custom loss weights for different channels(albedo.rgb, normal.xyz, roughness, ao, displacement)
+            # base reconstruction loss
+            base_loss = self.L2_loss(gt_texture, predict_texture)
             loss_weights = torch.tensor(self.output_loss_weights).to(self.device)
-            loss = loss.mean(dim=0) * loss_weights
-            loss = loss.sum()
+            base_loss = (base_loss.mean(dim=0) * loss_weights).sum()
 
-            self.writer.add_scalar('Loss/train', loss.item(), curr_iter)
+            # ASTC-aware robust branch (noise-injected output + consistency)
+            robust_loss = torch.tensor(0.0, device=self.device)
+            consistency_loss = torch.tensor(0.0, device=self.device)
+            total_loss = base_loss
+
+            if self.astc_aware_train:
+                noisy_input, applied = self.astc_noise_model.perturb_uvlod_input(batch_input, curr_iter, enable=self.astc_curriculum_enable)
+                if applied:
+                    predict_noisy = self.model(noisy_input)
+                    robust_loss = self.L2_loss(gt_texture, predict_noisy)
+                    robust_loss = (robust_loss.mean(dim=0) * loss_weights).sum()
+                    total_loss = 0.5 * base_loss + 0.5 * robust_loss
+
+                    prog = float(curr_iter) / max(1.0, float(self.max_iter - 1))
+                    in_consistency = self.consistency_start_ratio <= prog <= self.consistency_end_ratio
+                    if self.consistency_loss_enable and in_consistency and self.consistency_lambda > 0.0:
+                        diff = predict_texture - predict_noisy
+                        if self.consistency_loss_type == "mse":
+                            c_map = diff.pow(2)
+                        else:
+                            c_map = diff.abs()
+
+                        if self.sensitive_mask_enable:
+                            sens_mask = self.astc_noise_model.build_sensitive_mask(
+                                gt_texture,
+                                percentile=self.sensitive_mask_percentile,
+                                detach_mask=self.sensitive_mask_detach,
+                            )
+                            c_map = c_map * sens_mask
+
+                        consistency_loss = c_map.mean() * self.consistency_lambda
+                        total_loss = total_loss + consistency_loss
+
+            self.writer.add_scalar('Loss/train', total_loss.item(), curr_iter)
+            self.writer.add_scalar('Loss/base', base_loss.item(), curr_iter)
+            if self.astc_aware_train:
+                self.writer.add_scalar('Loss/robust', robust_loss.item(), curr_iter)
+                self.writer.add_scalar('Loss/consistency', consistency_loss.item(), curr_iter)
 
             # optimize
-            loss.backward()
+            total_loss.backward()
             self.model.optimizer.step()
-            self.model.scheduler.step(metrics=loss.item())
+            self.model.scheduler.step(metrics=total_loss.item())
 
             # print(self.model.optimizer.param_groups[0]['lr'], self.model.optimizer.param_groups[1]['lr'])
 

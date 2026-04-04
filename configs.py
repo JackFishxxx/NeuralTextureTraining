@@ -131,6 +131,30 @@ class Config():
         self.astc_block = params.astc_block
         self.ref_astc_resolution = getattr(params, "ref_astc_resolution", None)
 
+        ### ---------- ASTC residual-aware robust training ---------- ###
+        self.astc_aware_train = bool(getattr(params, "astc_aware_train", False))
+        self.astc_block_size = int(getattr(params, "astc_block_size", 6))
+        self.astc_noise_mode = str(getattr(params, "astc_noise_mode", "block_residual"))
+        self.astc_noise_prob = float(getattr(params, "astc_noise_prob", 0.0))
+        self.astc_noise_std = float(getattr(params, "astc_noise_std", 0.02))
+        self.astc_noise_channel_corr = float(getattr(params, "astc_noise_channel_corr", 0.5))
+        self.astc_noise_apply_after_quant = bool(getattr(params, "astc_noise_apply_after_quant", True))
+
+        self.astc_curriculum_enable = bool(getattr(params, "astc_curriculum_enable", False))
+        self.astc_curriculum_warmup_ratio = float(getattr(params, "astc_curriculum_warmup_ratio", 0.2))
+        self.astc_curriculum_peak_ratio = float(getattr(params, "astc_curriculum_peak_ratio", 0.7))
+
+        self.consistency_loss_enable = bool(getattr(params, "consistency_loss_enable", False))
+        self.consistency_lambda = float(getattr(params, "consistency_lambda", 0.0))
+        self.consistency_start_ratio = float(getattr(params, "consistency_start_ratio", 0.45))
+        self.consistency_end_ratio = float(getattr(params, "consistency_end_ratio", 1.0))
+        self.consistency_loss_type = str(getattr(params, "consistency_loss_type", "l1")).lower()
+
+        self.sensitive_mask_enable = bool(getattr(params, "sensitive_mask_enable", False))
+        self.sensitive_mask_metric = str(getattr(params, "sensitive_mask_metric", "grad_luma")).lower()
+        self.sensitive_mask_percentile = float(getattr(params, "sensitive_mask_percentile", 0.85))
+        self.sensitive_mask_detach = bool(getattr(params, "sensitive_mask_detach", True))
+
         # Normalize configs to the internal format expected by the model
         if self.hash_grid_configs is not None:
             processed: List[Dict] = []
@@ -291,4 +315,59 @@ def get_args():
     parser.add_argument('--ref_astc_resolution', type=int, default=1024,
                         help='Traditional ref_astc_* baseline: square edge length (H=W) before astcenc; omit for LOD0 size')
 
+    ### ---------- ASTC residual-aware robust training ---------- ###
+    parser.add_argument('--astc_aware_train', action='store_true', default=False,
+                        help='enable ASTC residual-aware robust training branch (train-only)')
+    parser.add_argument('--astc_block_size', type=int, default=6,
+                        help='block size for pseudo ASTC residual simulation')
+    parser.add_argument('--astc_noise_mode', type=str, default='block_residual',
+                        choices=['block_residual'], help='pseudo ASTC noise mode')
+    parser.add_argument('--astc_noise_prob', type=float, default=0.0,
+                        help='probability of applying pseudo ASTC perturbation in active curriculum stage')
+    parser.add_argument('--astc_noise_std', type=float, default=0.02,
+                        help='base std of pseudo ASTC perturbation')
+    parser.add_argument('--astc_noise_channel_corr', type=float, default=0.5,
+                        help='channel-coupled shift strength in pseudo ASTC perturbation')
+    parser.add_argument('--astc_noise_apply_after_quant', action=argparse.BooleanOptionalAction, default=True,
+                        help='apply pseudo ASTC perturbation after QAT quantization')
+
+    parser.add_argument('--astc_curriculum_enable', action='store_true', default=False,
+                        help='enable curriculum schedule for ASTC robust branch')
+    parser.add_argument('--astc_curriculum_warmup_ratio', type=float, default=0.2,
+                        help='start applying perturbation after this ratio of max_iter')
+    parser.add_argument('--astc_curriculum_peak_ratio', type=float, default=0.7,
+                        help='ramp-up ratio where perturbation reaches full strength')
+
+    parser.add_argument('--consistency_loss_enable', action='store_true', default=False,
+                        help='enable clean/noisy dual-branch consistency loss')
+    parser.add_argument('--consistency_lambda', type=float, default=0.0,
+                        help='consistency loss weight')
+    parser.add_argument('--consistency_start_ratio', type=float, default=0.45,
+                        help='start ratio for consistency loss')
+    parser.add_argument('--consistency_end_ratio', type=float, default=1.0,
+                        help='end ratio for consistency loss')
+    parser.add_argument('--consistency_loss_type', type=str, default='l1', choices=['l1', 'mse'],
+                        help='consistency loss type')
+
+    parser.add_argument('--sensitive_mask_enable', action='store_true', default=False,
+                        help='enable sensitivity mask for consistency weighting')
+    parser.add_argument('--sensitive_mask_metric', type=str, default='grad_luma', choices=['grad_luma'],
+                        help='sensitivity metric')
+    parser.add_argument('--sensitive_mask_percentile', type=float, default=0.85,
+                        help='top percentile threshold for sensitive mask')
+    parser.add_argument('--sensitive_mask_detach', action=argparse.BooleanOptionalAction, default=True,
+                        help='detach sensitive mask from gradient graph')
+
+    # ── Two-stage parsing: YAML defaults → CLI overrides ──
+    # Stage 1: extract --config path only
+    known, _ = parser.parse_known_args()
+    yaml_defaults = _load_yaml_defaults(known.config)
+
+    if yaml_defaults:
+        # Filter to only keys that correspond to valid parser destinations
+        valid_dests = {a.dest for a in parser._actions}
+        filtered = {k: v for k, v in yaml_defaults.items() if k in valid_dests}
+        parser.set_defaults(**filtered)
+
+    # Stage 2: full parse (CLI args override YAML values)
     return parser.parse_args()

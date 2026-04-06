@@ -54,6 +54,7 @@ class Trainer:
         # save and log
         self.save_dir = configs.save_dir
         self.start_time = datetime.datetime.now()
+        self.last_checkpoint_time = self.start_time
         self.end_time = 0
         self.duration_time = 0
         self.save_path = os.path.join(self.save_dir, self.start_time.strftime(r"%y_%m_%d_%H_%M_%S"))
@@ -140,6 +141,16 @@ class Trainer:
             max_iter=int(self.max_iter),
         ).to(self.device)
 
+    def _log_checkpoint_interval(self, curr_iter: int) -> None:
+        now = datetime.datetime.now()
+        interval_time = now - self.last_checkpoint_time
+        self.last_checkpoint_time = now
+        print(f"[Checkpoint] Iter {curr_iter}: interval elapsed time = {interval_time}")
+
+    def _log_total_training_time(self) -> None:
+        self.end_time = datetime.datetime.now()
+        self.duration_time = self.end_time - self.start_time
+        print(f"Total training time: {self.duration_time}")
 
     def train(self) -> None:
 
@@ -268,10 +279,9 @@ class Trainer:
                                   f"({self.early_stop_psnr_threshold:.4f} dB). Stopping training at iter {curr_iter}.")
                             # save model before stopping
                             self.model.save(curr_iter, self.model_path)
+                            self._log_checkpoint_interval(curr_iter)
                             # When enable_astc_compare is True, ASTC comparison was already run above for the metric check
-                            self.end_time = datetime.datetime.now()
-                            self.duration_time = self.end_time - self.start_time
-                            print(f"Total training time: {self.duration_time}")
+                            self._log_total_training_time()
                             return
                         else:
                             self._early_stop_prev_psnr = current_psnr
@@ -285,13 +295,13 @@ class Trainer:
                 self.model.save(curr_iter, self.model_path)
                 if self.enable_astc_compare and not _astc_already_ran:
                     self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path)
-                self.end_time = datetime.datetime.now()
-                self.duration_time = self.end_time - self.start_time
-                print(self.duration_time)
+                self._log_checkpoint_interval(curr_iter)
             
             if curr_iter > 0 and curr_iter % 10000 == 0:
                 torch.cuda.empty_cache()
                 tcnn.free_temporary_memory()
+
+        self._log_total_training_time()
 
     def _cuda_trim_eval_mem(self, synchronize: bool = False) -> None:
         if self.device != "cuda":

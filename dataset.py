@@ -1,6 +1,6 @@
 from torch.utils.data import Dataset
 from configs import Config
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from torchtyping import TensorType
 
 import torch
@@ -110,6 +110,62 @@ class TextureDataset(torch.nn.Module):
         return batch_data
         
 
+    @staticmethod
+    def _is_single_channel_content(tensor: torch.Tensor, atol: float = 1.0 / 255.0) -> bool:
+        """Return True if a multi-channel scalar texture carries identical color values.
+
+        Opaque alpha introduced by PNG/RGBA files is ignored for this test so RGB+constant-alpha
+        scalar maps are still treated as single-channel photos.
+        """
+        if tensor.shape[0] <= 1:
+            return True
+        comparable = tensor
+        if comparable.shape[0] == 4 and torch.allclose(
+            comparable[3], torch.ones_like(comparable[3]), atol=atol, rtol=0.0
+        ):
+            comparable = comparable[:3]
+        reference = comparable[:1]
+        return bool(torch.allclose(comparable, reference.expand_as(comparable), atol=atol, rtol=0.0))
+
+    @staticmethod
+    def _split_packed_romd_channels(filename: str, tensor: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Map packed scalar texture channels to roughness/occlusion/metallic/displacement when encoded together.
+
+        Common game-engine packed maps (e.g. MetallicSmoothness) often store multiple scalar material
+        channels in RGB(A). If the channels are actually identical, keep the image as a single-channel
+        texture; otherwise treat available channels as a packed ROMD source.
+        """
+        name = filename.lower()
+        channel_map: List[Tuple[str, int]]
+
+        if "metallicsmoothness" in name or "metallic_smoothness" in name or "metallic-smoothness" in name:
+            # Unity-style packed map observed in data_batch: R=metallic, A=smoothness/roughness proxy.
+            # Use alpha when present; otherwise fall back to green.
+            rough_idx = 3 if tensor.shape[0] >= 4 else min(1, tensor.shape[0] - 1)
+            channel_map = [("metallic", 0), ("roughness", rough_idx)]
+        else:
+            # Generic packed ROMD convention: R=roughness, G=occlusion, B=metallic, A=displacement.
+            channel_map = [("roughness", 0), ("occlusion", 1), ("metallic", 2), ("displacement", 3)]
+
+        packed: Dict[str, torch.Tensor] = {}
+        for tex_type, channel_idx in channel_map:
+            if channel_idx < tensor.shape[0]:
+                packed[tex_type] = tensor[channel_idx:channel_idx + 1]
+        return packed
+
+    def _load_texture_tensor(self, filepath: str, texture_type: str) -> torch.Tensor:
+        with Image.open(filepath) as image:
+            if texture_type in {"roughness", "occlusion", "metallic", "displacement"}:
+                # Preserve scalar-map packing channels instead of blindly converting to L.
+                color_mode = "RGBA" if "A" in image.getbands() else "RGB"
+            else:
+                color_mode = self.texture_configs[texture_type]['color_mode']
+            image = image.convert(color_mode)
+            tensor = TF.to_tensor(image)
+            if texture_type != "normal":
+                tensor = torch.pow(tensor, 2.2)
+        return tensor
+
     def load_data(self) -> TensorType["texture_height", "texture_width", "num_channels"]:
 
         filenames = os.listdir(self.data_dir)
@@ -126,24 +182,21 @@ class TextureDataset(torch.nn.Module):
 
             if texture_type not in self.texture_configs:
                 raise ValueError(f"Unknown texture type: {texture_type}")
-            color_mode = self.texture_configs[texture_type]['color_mode']
             expected_channels = self.texture_configs[texture_type]['expected_channels']
+            tensor = self._load_texture_tensor(filepath, texture_type)
 
-            with Image.open(filepath) as image:
-                
-                image = image.convert(color_mode)
-                tensor = TF.to_tensor(image)   # [C, H, W]
-                # tensor = torch.from_numpy(np.array(image))
-                # if len(tensor.shape) == 2:
-                #     tensor = tensor.unsqueeze(2)
-                # tensor = tensor.permute(2, 0, 1)
+            if texture_type in {"roughness", "occlusion", "metallic", "displacement"} and tensor.shape[0] > 1:
+                if self._is_single_channel_content(tensor):
+                    tensor = tensor[:1]
+                else:
+                    for packed_type, packed_tensor in self._split_packed_romd_channels(filename, tensor).items():
+                        if packed_type not in textures:
+                            print(f"Packed ROMD Texture: type='{packed_type}' from filename='{filename}'")
+                            textures[packed_type] = packed_tensor
+                    continue
 
-                # change srgb to linear to fit ue5 when image is not Normal texture.
-                if texture_type != "normal":
-                    tensor = torch.pow(tensor, 2.2)
-
-                if tensor.shape[0] != expected_channels:
-                    raise ValueError(f"Expected {expected_channels} channels, got {tensor.shape[0]}")
+            if tensor.shape[0] != expected_channels:
+                raise ValueError(f"Expected {expected_channels} channels for {texture_type}, got {tensor.shape[0]}")
 
             textures[texture_type] = tensor
         
@@ -286,6 +339,9 @@ class TextureDataset(torch.nn.Module):
 
     def identify_texture_type(self, filename: str) -> str:
         
+        if "ROM" in filename:
+            return "roughness"
+
         filename_lower = filename.lower()
 
         # Identify the texture type based on keywords in the filename

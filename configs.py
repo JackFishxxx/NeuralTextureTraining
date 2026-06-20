@@ -125,6 +125,19 @@ class Config():
                 f"Supported values: {sorted(supported_output_activations)}"
             )
 
+        direct_mode = getattr(params, "direct_diffuse_infer_mode", None)
+        if direct_mode is None:
+            legacy_enable = bool(getattr(params, "direct_diffuse_feature_enable", False))
+            legacy_mapping = str(getattr(params, "direct_diffuse_feature_mapping", "rgb")).strip().lower()
+            direct_mode = legacy_mapping if legacy_enable else "disable"
+        self.direct_diffuse_infer_mode = str(direct_mode).strip().lower()
+        if self.direct_diffuse_infer_mode not in {"disable", "rgb", "ycocg"}:
+            raise ValueError("direct_diffuse_infer_mode must be one of: disable, rgb, ycocg")
+        self.direct_diffuse_feature_enable = self.direct_diffuse_infer_mode != "disable"
+        self.direct_diffuse_feature_mapping = (
+            "rgb" if self.direct_diffuse_infer_mode == "disable" else self.direct_diffuse_infer_mode
+        )
+
         # By default, None → use legacy behavior (uniform grids based on n_features_per_level).
         self.hash_grid_configs: Optional[List[Dict]] = getattr(params, 'hash_grid_configs', None)
         # Multi-HashGrid configs
@@ -211,6 +224,7 @@ class Config():
                     "quantize_bits": qbits,
                     "save_bits": sbits,
                     "learning_rate": lr,
+                    "interpolation": str(cfg.get("interpolation", "Linear")),
                 })
 
             self.hash_grid_configs = processed
@@ -388,6 +402,9 @@ def get_args():
                         help='top percentile threshold for sensitive mask')
     parser.add_argument('--sensitive_mask_detach', action=argparse.BooleanOptionalAction, default=True,
                         help='detach sensitive mask from gradient graph')
+    parser.add_argument('--direct_diffuse_infer_mode', type=str, default='disable',
+                        choices=['disable', 'rgb', 'ycocg'],
+                        help='direct diffuse inference mode: disable, or store diffuse in feature0 RGB as rgb/ycocg')
 
     # ── Two-stage parsing: YAML defaults → CLI overrides ──
     # Stage 1: extract --config path only

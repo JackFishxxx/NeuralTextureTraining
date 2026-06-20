@@ -247,8 +247,15 @@ def apply_astc_to_feature_grids(astc_model, roundtrip_rgba: Callable[[np.ndarray
                     float(n_k - 1),
                 )
 
-        for start in range(0, n_fpl, 4):
-            _roundtrip_feature_channels(list(range(start, min(start + 4, n_fpl))))
+        if getattr(astc_model, "direct_diffuse_enabled", False) and grid_idx == 0 and n_fpl >= 3:
+            # Direct diffuse RGB should be compared as RGB only.  Do not let the
+            # learned feature in channel A participate in the RGB ASTC encode.
+            _roundtrip_feature_channels([0, 1, 2])
+            for start in range(3, n_fpl, 4):
+                _roundtrip_feature_channels(list(range(start, min(start + 4, n_fpl))))
+        else:
+            for start in range(0, n_fpl, 4):
+                _roundtrip_feature_channels(list(range(start, min(start + 4, n_fpl))))
 
         recovered_tensor = torch.from_numpy(recovered.reshape(-1)).to(params.device).float()
         recovered_quant = recovered_tensor / float(n_k) + min_q
@@ -287,6 +294,9 @@ def _render_model_lod0(model, texture_height: int, texture_width: int, num_lods:
     fr = rr.reshape(-1).to(device=device, dtype=torch.long)
     fc = cc.reshape(-1).to(device=device, dtype=torch.long)
     hwc[fr, fc, :] = y
+    if getattr(model, "direct_diffuse_enabled", False) and hasattr(model, "render_direct_diffuse_lod"):
+        direct = model.render_direct_diffuse_lod(lod, H, W, resize_fn=_comparison_resize)
+        hwc[:, :, :3] = direct.squeeze(0).permute(1, 2, 0).to(hwc.dtype)
     hwc = torch.nan_to_num(hwc, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     return hwc.permute(2, 0, 1)[None, ...]
 

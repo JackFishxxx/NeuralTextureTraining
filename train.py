@@ -37,6 +37,7 @@ class Trainer:
         dataset = TextureDataset(configs)
         configs.num_lods = dataset.num_lods
         model = TCNNModel(configs)
+        model.configure_direct_diffuse_from_dataset(dataset)
         # Network output is fixed to 11 channels (aligned with diffuse->displacement); missing filled by dataset with 0
         configs.num_channels = model.num_channels
 
@@ -78,6 +79,9 @@ class Trainer:
         self.output_loss_weights = configs.output_loss_weights or dataset.get_canonical_loss_weights(
             config_weights=getattr(configs, 'texture_loss_weights', None)
         )
+        if getattr(model, "direct_diffuse_enabled", False) and "diffuse" in dataset.available_textures:
+            s, e = dataset.canonical_channel_slices["diffuse"]
+            self.output_loss_weights[s:e] = [0.0] * (e - s)
 
         # visualization configs for eval/infer (data-driven, not hardcoded)
         self.vis_configs = dataset.get_vis_configs()
@@ -346,6 +350,10 @@ class Trainer:
                 w1 = min(w0 + step, lod_width)
                 inp, fr, fc = self._lod_plane_tile(h0, h1, w0, w1, lod_height, lod_width, lod_f, device)
                 out[fr, fc, :] = self.model(inp).float()
+        if getattr(self.model, "direct_diffuse_enabled", False) and "diffuse" in self.dataset.available_textures:
+            s, e = self.dataset.canonical_channel_slices["diffuse"]
+            direct = self.model.render_direct_diffuse_lod(lod, lod_height, lod_width)
+            out[:, :, s:e] = direct.squeeze(0).permute(1, 2, 0).to(out.dtype)
         return out
 
     def _downsample_for_metrics(self, pred: torch.Tensor, gt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

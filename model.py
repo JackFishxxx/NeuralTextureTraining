@@ -53,6 +53,13 @@ class TCNNModel(torch.nn.Module):
         self.output_activation = getattr(config, "output_activation", "hard_swish")
         # Network output is fixed to 11 channels aligned with the 7 texture types; missing textures filled with 0 externally
         self.num_channels = NUM_CANONICAL_CHANNELS
+        self.direct_diffuse_infer_mode = str(getattr(config, "direct_diffuse_infer_mode", "disable")).lower()
+        if self.direct_diffuse_infer_mode not in {"disable", "rgb", "ycocg"}:
+            raise ValueError("direct_diffuse_infer_mode must be one of: disable, rgb, ycocg")
+        self.direct_diffuse_enabled = self.direct_diffuse_infer_mode != "disable"
+        if self.direct_diffuse_enabled:
+            self.register_buffer("_direct_diffuse_values", torch.empty(0), persistent=False)
+            self.register_buffer("_direct_diffuse_mask", torch.empty(0, dtype=torch.bool), persistent=False)
 
         # Make feature grids tile seamlessly under wrap/repeat sampling.
         # Can be disabled or softened from config if needed.
@@ -65,7 +72,7 @@ class TCNNModel(torch.nn.Module):
         self.wrap_boundary_levels = max(1, int(getattr(config, 'wrap_boundary_levels', 1)))
 
         self.hash_grid_learning_rates = []
-        for grid_cfg in config.hash_grid_configs:
+        for grid_idx, grid_cfg in enumerate(config.hash_grid_configs):
             self.hash_grid_learning_rates.append(grid_cfg.get('learning_rate', config.learning_rate))
 
         self.init_model(config)
@@ -99,7 +106,7 @@ class TCNNModel(torch.nn.Module):
         self.hash_grid_quantize_bits = []  # per-grid quantize bits (fallback to global)
         self.hash_grid_save_bits = []      # per-grid save bits (fallback to global)
 
-        for grid_cfg in config.hash_grid_configs:
+        for grid_idx, grid_cfg in enumerate(config.hash_grid_configs):
             max_res = int(grid_cfg.get('max_resolution', 0))
             n_levels = int(grid_cfg.get("n_levels", 0))
             qbits = int(grid_cfg.get('quantize_bits', self.quantize_bits))
@@ -122,7 +129,7 @@ class TCNNModel(torch.nn.Module):
                 "base_resolution": base_res,
                 "per_level_scale": 2.0,
                 # "log2_hashmap_size": log2_hashmap_size,
-                "interpolation": "Linear",
+                "interpolation": "Nearest" if self.direct_diffuse_enabled and grid_idx == 0 else "Linear",
             }
             hash_grid = tcnn.Encoding(
                 n_input_dims=2,
@@ -150,6 +157,10 @@ class TCNNModel(torch.nn.Module):
             "n_hidden_layers": config.n_hidden_layers
         }
         total_grid_features = sum(self.hash_grid_n_features_per_level) * self.num_sampled_lods
+        if self.direct_diffuse_enabled:
+            if not self.hash_grid_n_features_per_level or self.hash_grid_n_features_per_level[0] < 3:
+                raise ValueError("direct_diffuse_infer_mode requires feature grid 0 to have at least 3 channels")
+            total_grid_features -= 3 * self.num_sampled_lods
         n_input_dims = config.n_frequencies * 2 + total_grid_features + 1
         print(f"total_grid_features={total_grid_features}, n_input_dims={n_input_dims}")
         self.network = tcnn.Network(
@@ -233,6 +244,103 @@ class TCNNModel(torch.nn.Module):
         ckpt_path = os.path.join(ckpt_dir, f"{ckpt_iter}.pth")
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         self.load_state_dict(ckpt)
+
+    @staticmethod
+    def _rgb_to_ycocg(rgb: torch.Tensor) -> torch.Tensor:
+        r, g, b = rgb[..., 0:1], rgb[..., 1:2], rgb[..., 2:3]
+        return torch.cat([0.25 * r + 0.5 * g + 0.25 * b,
+                          0.5 * r - 0.5 * b + 0.5,
+                          -0.25 * r + 0.5 * g - 0.25 * b + 0.5], dim=-1).clamp(0, 1)
+
+    @staticmethod
+    def _ycocg_to_rgb(v: torch.Tensor) -> torch.Tensor:
+        y, co, cg = v[..., 0:1], v[..., 1:2] - 0.5, v[..., 2:3] - 0.5
+        return torch.cat([y + co - cg, y + cg, y - co - cg], dim=-1).clamp(0, 1)
+
+    def _feature_to_unorm(self, x: torch.Tensor, qbits: int) -> torch.Tensor:
+        n = 2 ** int(qbits)
+        min_q = - (n - 1) / (2 * n)
+        return ((x - min_q) * n / (n - 1)).clamp(0, 1)
+
+    def _unorm_to_feature(self, x: torch.Tensor, qbits: int) -> torch.Tensor:
+        n = 2 ** int(qbits)
+        min_q = - (n - 1) / (2 * n)
+        return torch.round(x.clamp(0, 1) * (n - 1)) / n + min_q
+
+    @torch.no_grad()
+    def configure_direct_diffuse_from_dataset(self, dataset) -> None:
+        if not self.direct_diffuse_enabled:
+            return
+        if "diffuse" not in getattr(dataset, "available_textures", []):
+            raise ValueError("direct_diffuse_infer_mode requires diffuse texture")
+
+        s, e = dataset.channel_slices["diffuse"]
+        diffuse = dataset.textures[:, :, s:e].to(self.device).float().permute(2, 0, 1)[None]
+        params = self._get_grid_params_tensor(self.hash_grids[0])
+        base_res, n_levels = self.hash_grid_base_res[0], self.hash_grid_n_levels[0]
+        n_fpl, qbits = self.hash_grid_n_features_per_level[0], self.hash_grid_quantize_bits[0]
+        values, mask, offset = torch.zeros_like(params), torch.zeros_like(params, dtype=torch.bool), 0
+
+        for level in range(n_levels):
+            res = base_res * (2 ** level)
+            count = res * res * n_fpl
+            rgb = F.interpolate(diffuse, size=(res, res), mode="bilinear", align_corners=False)
+            payload = rgb.squeeze(0).permute(1, 2, 0)
+            if self.direct_diffuse_infer_mode == "ycocg":
+                payload = self._rgb_to_ycocg(payload)
+            encoded = self._unorm_to_feature(payload, qbits)
+            params.data[offset:offset + count].view(res, res, n_fpl)[:, :, :3] = encoded
+            values[offset:offset + count].view(res, res, n_fpl)[:, :, :3] = encoded
+            mask[offset:offset + count].view(res, res, n_fpl)[:, :, :3] = True
+            offset += count
+
+        self._direct_diffuse_values = values
+        self._direct_diffuse_mask = mask
+        params.register_hook(lambda grad: torch.where(self._direct_diffuse_mask.to(grad.device), torch.zeros_like(grad), grad))
+        print(f"[DirectDiffuse] mode={self.direct_diffuse_infer_mode}")
+
+    @torch.no_grad()
+    def _restore_direct_diffuse(self) -> None:
+        if self.direct_diffuse_enabled and self._direct_diffuse_mask.numel():
+            p = self._get_grid_params_tensor(self.hash_grids[0])
+            m = self._direct_diffuse_mask.to(p.device)
+            p.data[m] = self._direct_diffuse_values.to(p.device)[m]
+
+    def _decode_direct_diffuse_features(self, features: torch.Tensor, qbits: int) -> torch.Tensor:
+        payload = self._feature_to_unorm(features[:, :3], qbits)
+        return self._ycocg_to_rgb(payload) if self.direct_diffuse_infer_mode == "ycocg" else payload
+
+    @torch.no_grad()
+    def render_direct_diffuse_lod(self, lod: int, out_h: int, out_w: int, resize_fn=None) -> torch.Tensor:
+        """Render direct diffuse as low-res feature payload, then bilinear upsample to output size."""
+        if not self.direct_diffuse_enabled:
+            raise RuntimeError("render_direct_diffuse_lod requires direct_diffuse_infer_mode != disable")
+
+        grid_levels = self.hash_grid_n_levels[0]
+        grid_fpl = self.hash_grid_n_features_per_level[0]
+        base_res = self.hash_grid_base_res[0]
+        qbits = self.hash_grid_quantize_bits[0]
+        lod_f = 0.0 if self.num_lods <= 1 else float(lod) / float(self.num_lods - 1)
+        selected_level = int(round(grid_levels - self.num_sampled_lods - min(
+            lod_f * (self.num_lods - self.num_sampled_lods),
+            grid_levels - self.num_sampled_lods,
+        )))
+        selected_level = max(0, min(grid_levels - 1, selected_level))
+        res = base_res * (2 ** selected_level)
+
+        offset = 0
+        for level in range(selected_level):
+            level_res = base_res * (2 ** level)
+            offset += level_res * level_res * grid_fpl
+        params = self._get_grid_params_tensor(self.hash_grids[0])
+        sampled = params[offset: offset + res * res * grid_fpl].view(-1, grid_fpl)
+        tex = self._decode_direct_diffuse_features(sampled, qbits).reshape(res, res, 3)
+        tex = tex.permute(2, 0, 1)[None].contiguous()
+        if (res, res) != (int(out_h), int(out_w)):
+            resize_fn = resize_fn or (lambda image, size: F.interpolate(image, size=size, mode="bilinear", align_corners=False))
+            tex = resize_fn(tex, size=(int(out_h), int(out_w)))
+        return tex.clamp(0, 1)
+
     def _texel_aligned_grid_uv(self, uvs: torch.Tensor, selected_level, base_res: int) -> torch.Tensor:
         """Map texel-center UVs to tiny-cuda-nn dense-grid point coordinates."""
         if not torch.is_tensor(selected_level):
@@ -263,6 +371,7 @@ class TCNNModel(torch.nn.Module):
 
         # get the results from hash grid
         features = []
+        direct_diffuse = None
         for idx, hash_grid in enumerate(self.hash_grids):
             grid_levels = self.hash_grid_n_levels[idx]
             grid_fpl = self.hash_grid_n_features_per_level[idx]
@@ -290,6 +399,10 @@ class TCNNModel(torch.nn.Module):
                 quantized = torch.round(sampled_features_noisy / Q_k) * Q_k
                 # Straight-through: forward uses quantized, backward uses sampled_features
                 sampled_features = sampled_features + (quantized - sampled_features).detach()
+
+            if self.direct_diffuse_enabled and idx == 0:
+                direct_diffuse = self._decode_direct_diffuse_features(sampled_features, qbits)
+                sampled_features = sampled_features[:, 3:]
             
             features.append(sampled_features)
         features = torch.cat(features, dim=1)
@@ -298,6 +411,9 @@ class TCNNModel(torch.nn.Module):
 
         outputs = self.network(inputs)
         outputs = self._apply_output_activation(outputs)
+        if direct_diffuse is not None:
+            outputs = outputs.clone()
+            outputs[:, :3] = direct_diffuse
 
         return outputs
     
@@ -349,6 +465,7 @@ class TCNNModel(torch.nn.Module):
                         strength=self.wrap_boundary_strength,
                         highest_k_levels=self.wrap_boundary_levels,
                     )
+        self._restore_direct_diffuse()
 
     def _get_grid_params_tensor(self, hash_grid: torch.nn.Module) -> torch.nn.Parameter:
         # tiny-cuda-nn grid usually exposes a single parameter named "params".

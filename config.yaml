@@ -12,6 +12,7 @@ qat_noise_warmup_frac: 0.1
 
 # ---------- model configs ----------
 output_activation: "hard_swish"
+direct_diffuse_infer_mode: "rgb"  # disable | rgb | ycocg
 
 # ---------- ASTC residual-aware robust training ----------
 astc_aware_train: true

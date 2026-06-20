@@ -228,23 +228,27 @@ def apply_astc_to_feature_grids(astc_model, roundtrip_rgba: Callable[[np.ndarray
         quant_int = torch.round((params - min_q) * n_k)
         quant_int = torch.clamp(quant_int, min=0.0, max=float(n_k - 1)).to(torch.int64)
         level = quant_int[offset : offset + level_count].reshape(max_res, max_res, n_fpl).detach().cpu().numpy()
-
-        rgba = np.zeros((max_res, max_res, 4), dtype=np.uint8)
-        for c in range(min(4, n_fpl)):
-            rgba[:, :, c] = np.clip(
-                np.round(level[:, :, c].astype(np.float32) * (255.0 / float(n_k - 1))),
-                0,
-                255,
-            ).astype(np.uint8)
-
-        rgba_rt = roundtrip_rgba(rgba)
         recovered = level.astype(np.float32).copy()
-        for c in range(min(4, n_fpl)):
-            recovered[:, :, c] = np.clip(
-                np.round(rgba_rt[:, :, c].astype(np.float32) * (float(n_k - 1) / 255.0)),
-                0,
-                float(n_k - 1),
-            )
+
+        def _roundtrip_feature_channels(channel_indices):
+            rgba = np.zeros((max_res, max_res, 4), dtype=np.uint8)
+            for rgba_c, feature_c in enumerate(channel_indices[:4]):
+                rgba[:, :, rgba_c] = np.clip(
+                    np.round(level[:, :, feature_c].astype(np.float32) * (255.0 / float(n_k - 1))),
+                    0,
+                    255,
+                ).astype(np.uint8)
+
+            rgba_rt = roundtrip_rgba(rgba)
+            for rgba_c, feature_c in enumerate(channel_indices[:4]):
+                recovered[:, :, feature_c] = np.clip(
+                    np.round(rgba_rt[:, :, rgba_c].astype(np.float32) * (float(n_k - 1) / 255.0)),
+                    0,
+                    float(n_k - 1),
+                )
+
+        for start in range(0, n_fpl, 4):
+            _roundtrip_feature_channels(list(range(start, min(start + 4, n_fpl))))
 
         recovered_tensor = torch.from_numpy(recovered.reshape(-1)).to(params.device).float()
         recovered_quant = recovered_tensor / float(n_k) + min_q
@@ -276,7 +280,7 @@ def _render_model_lod0(model, texture_height: int, texture_width: int, num_lods:
     rr, cc = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
     lod_f = float(lod) / max(1, num_lods - 1)
     inp = torch.stack(
-        ((cc + 0.5) / H, (rr + 0.5) / W, torch.full_like(rr, lod_f)), dim=-1
+        ((cc + 0.5) / W, (rr + 0.5) / H, torch.full_like(rr, lod_f)), dim=-1
     ).to(device).reshape(-1, 3)
     y = model(inp).float()
     hwc = torch.empty(H, W, y.shape[-1], device=device, dtype=torch.float32)

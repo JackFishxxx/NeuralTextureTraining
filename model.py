@@ -233,7 +233,19 @@ class TCNNModel(torch.nn.Module):
         ckpt_path = os.path.join(ckpt_dir, f"{ckpt_iter}.pth")
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         self.load_state_dict(ckpt)
-   
+    def _texel_aligned_grid_uv(self, uvs: torch.Tensor, selected_level, base_res: int) -> torch.Tensor:
+        """Map texel-center UVs to tiny-cuda-nn dense-grid point coordinates."""
+        if not torch.is_tensor(selected_level):
+            selected_level = torch.full((uvs.shape[0], 1), float(selected_level), device=uvs.device, dtype=uvs.dtype)
+        level_int = torch.round(selected_level).to(torch.int64)
+        res = int(base_res) * torch.pow(
+            torch.full_like(selected_level, 2.0),
+            level_int.to(dtype=selected_level.dtype),
+        )
+        if bool(torch.all(res <= 1)):
+            return torch.zeros_like(uvs)
+        return torch.clamp((uvs * res - 0.5) / torch.clamp(res - 1.0, min=1.0), 0.0, 1.0)
+
     def forward(self, x: TensorType["batch_size", 3]) -> TensorType["batch_size", "num_channels"]:
 
         [batch_size, _] = x.shape
@@ -256,8 +268,10 @@ class TCNNModel(torch.nn.Module):
             grid_fpl = self.hash_grid_n_features_per_level[idx]
             qbits = self.hash_grid_quantize_bits[idx]
 
-            all_features = hash_grid(uvs)  # [B, grid_levels * grid_fpl]
             clipped_mips = torch.clamp(mips, max=grid_levels - num_sampled_lods)
+            selected_level_f = grid_levels - num_sampled_lods - clipped_mips
+            grid_uvs = self._texel_aligned_grid_uv(uvs, selected_level_f, self.hash_grid_base_res[idx])
+            all_features = hash_grid(grid_uvs)  # [B, grid_levels * grid_fpl]
             cols = (grid_levels - num_sampled_lods - clipped_mips) * grid_fpl + torch.arange(grid_fpl * num_sampled_lods).to(self.device)
             sampled_features = torch.gather(all_features, 1, cols.to(torch.int64))
 
@@ -289,18 +303,21 @@ class TCNNModel(torch.nn.Module):
     
     def simulate_quantize(self):
         # only quantize the features
-        for hash_grid in self.hash_grids:
+        for idx, hash_grid in enumerate(self.hash_grids):
             state_dict = hash_grid.state_dict()
 
             # transfer the params to 4 bit quantized tensor
             # [min_quantize_range, max_quantize_range] -> [0, 2 ** self.quantize_bits - 1]
+            qbits = self.hash_grid_quantize_bits[idx]
+            n_k = 2 ** qbits
+            min_q = - (n_k - 1) / (2 * n_k)
             params = state_dict['params']
-            params = (params + (-self.min_quantize_range)) * (2 ** self.quantize_bits)
+            params = (params + (-min_q)) * n_k
             params = torch.round(params)
             # torch.round would round params to an even number
             # so we need to clamp value
-            params = torch.clamp(params, min=0., max=2 ** self.quantize_bits - 1)
-            params = params / (2 ** self.quantize_bits) + self.min_quantize_range
+            params = torch.clamp(params, min=0., max=n_k - 1)
+            params = params / n_k + min_q
             state_dict['params'] = params
             hash_grid.load_state_dict(state_dict)
     

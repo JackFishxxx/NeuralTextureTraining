@@ -138,13 +138,13 @@ class Config():
         # Keys: texture type names (diffuse, normal, roughness, etc.)
         # Values: per-channel weight
         self.texture_loss_weights: Optional[Dict[str, float]] = {
-            "diffuse": 1.0,
-            "normal": 0.8,
-            "roughness": 0.3,
-            "occlusion": 0.3,
-            "metallic": 0.3,
-            "specular": 0.3,
-            "displacement": 0.3,
+            "diffuse": 1.5,
+            "normal": 0.3,
+            "roughness": 0.1,
+            "occlusion": 0.1,
+            "metallic": 0.1,
+            "specular": 0.1,
+            "displacement": 0.1,
         }
         
         # Final per-channel loss weights list (generated from texture_loss_weights and available textures)
@@ -322,7 +322,7 @@ def get_args():
                         help='the interval of iteration for saving model')
     parser.add_argument('--eval_inference_tile', type=int, default=512,
                         help='eval/infer: tile edge in pixels (0 = one batch over full plane, may OOM)')
-    parser.add_argument('--eval_metrics_max_edge', type=int, default=1024,
+    parser.add_argument('--eval_metrics_max_edge', type=int, default=0,
                         help='area-downsample to this max(H,W) before PSNR/SSIM/LPIPS (0 = full res)')
 
     ### ---------- early stopping configs ---------- ###

@@ -181,8 +181,8 @@ class Trainer:
             # xys -> uvs
             # shift the sample position from [0, 1, ..., 1023] -> [0.5, 1.5, ..., 1023.5]
             # uvs = ((xys + 0.5) / lod_scale) / (texture_weight / lod_scale)
-            us = (xs + 0.5) / self.texture_height 
-            vs = (ys + 0.5) / self.texture_width
+            us = (xs + 0.5) / self.texture_width
+            vs = (ys + 0.5) / self.texture_height
             lods = lods.float() / (self.num_lods - 1) if self.num_lods > 0 else torch.zeros_like(lods, dtype=torch.float32)
             batch_input = torch.cat([us, vs, lods], dim=1)
             # predict (clean branch)
@@ -322,14 +322,14 @@ class Trainer:
     def _lod_plane_tile(
         h0: int, h1: int, w0: int, w1: int, plane_h: int, plane_w: int, lod_f: float, device: str
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """[N,3] batch and (row,col) indices; same UV as train (us=(col+0.5)/H, vs=(row+0.5)/W)."""
+        """[N,3] batch and (row,col) indices; UV=(col+0.5)/W, (row+0.5)/H."""
         rr, cc = torch.meshgrid(
             torch.arange(h0, h1, device=device),
             torch.arange(w0, w1, device=device),
             indexing="ij",
         )
         z = torch.full_like(rr, lod_f)
-        inp = torch.stack(((cc + 0.5) / plane_h, (rr + 0.5) / plane_w, z), dim=-1).reshape(-1, 3)
+        inp = torch.stack(((cc + 0.5) / plane_w, (rr + 0.5) / plane_h, z), dim=-1).reshape(-1, 3)
         return inp, rr.reshape(-1).long(), cc.reshape(-1).long()
 
     @torch.no_grad()

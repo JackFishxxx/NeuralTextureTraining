@@ -14,12 +14,19 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from utils import write_dds_r8g8b8a8
 from feature_grid import FeatureGridSpec, feature_tensor_to_int, feature_to_unorm, quantize_feature_tensor, unorm_to_feature
+from normal_encoding import normal_encoding_channels
 
 # Fixed channel order aligned with: diffuse, normal, roughness, occlusion, metallic, specular, displacement
-# Channel counts: 3, 3, 1, 1, 1, 1, 1 -> 11 channels total; missing textures are filled with 0 at train/infer
+# Fixed texture order; normal can be 3 channels (xyz) or 2 channels (xy/hemi_oct).
 CANONICAL_CHANNEL_ORDER = ["diffuse", "normal", "roughness", "occlusion", "metallic", "specular", "displacement"]
-CANONICAL_CHANNEL_COUNTS = [3, 3, 1, 1, 1, 1, 1]
-NUM_CANONICAL_CHANNELS = sum(CANONICAL_CHANNEL_COUNTS)  # 11
+
+
+def canonical_channel_counts(normal_encoding: str = "xyz"):
+    return [3, normal_encoding_channels(normal_encoding), 1, 1, 1, 1, 1]
+
+
+def canonical_num_channels(normal_encoding: str = "xyz") -> int:
+    return sum(canonical_channel_counts(normal_encoding))
 
 
 class TCNNModel(torch.nn.Module):
@@ -52,8 +59,9 @@ class TCNNModel(torch.nn.Module):
         self.n_neurons = config.n_neurons
         self.n_hidden_layers = config.n_hidden_layers
         self.output_activation = getattr(config, "output_activation", "hard_swish")
-        # Network output is fixed to 11 channels aligned with the 7 texture types; missing textures filled with 0 externally
-        self.num_channels = NUM_CANONICAL_CHANNELS
+        # Network output matches the selected canonical texture layout.
+        self.normal_encoding = str(getattr(config, "normal_encoding", "xyz")).lower()
+        self.num_channels = canonical_num_channels(self.normal_encoding)
         self.direct_diffuse_infer_mode = str(getattr(config, "direct_diffuse_infer_mode", "disable")).lower()
         if self.direct_diffuse_infer_mode not in {"disable", "rgb", "ycocg"}:
             raise ValueError("direct_diffuse_infer_mode must be one of: disable, rgb, ycocg")
@@ -159,7 +167,7 @@ class TCNNModel(torch.nn.Module):
         print(f"total_grid_features={total_grid_features}, n_input_dims={n_input_dims}")
         self.network = tcnn.Network(
             n_input_dims=n_input_dims,
-            n_output_dims=NUM_CANONICAL_CHANNELS,
+            n_output_dims=self.num_channels,
             network_config=network_config,
         )
 

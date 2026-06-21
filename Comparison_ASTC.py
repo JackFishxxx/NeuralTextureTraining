@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 import torchvision.transforms.functional as TF
 from feature_grid import feature_tensor_to_int, int_to_feature_tensor
+from normal_encoding import decode_normal, normal_angular_psnr
 
 
 # ---------------------------------------------------------------------------
@@ -312,11 +313,17 @@ def _compute_ssim_safe(pred_ref: torch.Tensor, gt_ref: torch.Tensor, ssim_metric
 
 
 def _compute_metrics_from_refs(
-    pred_ref: torch.Tensor, gt_ref: torch.Tensor, psnr_metric, ssim_metric, lpips_metric
+    pred_ref: torch.Tensor, gt_ref: torch.Tensor, psnr_metric, ssim_metric, lpips_metric,
+    is_normal: bool = False, normal_encoding: str = "xyz",
 ) -> Tuple[float, float, float]:
     pred_ref = torch.nan_to_num(pred_ref.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     gt_ref = torch.nan_to_num(gt_ref.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-    psnr_value = float(psnr_metric(pred_ref, gt_ref).item())
+    if is_normal:
+        psnr_value = float(normal_angular_psnr(pred_ref, gt_ref, normal_encoding).item())
+        pred_ref = decode_normal(pred_ref, normal_encoding)
+        gt_ref = decode_normal(gt_ref, normal_encoding)
+    else:
+        psnr_value = float(psnr_metric(pred_ref, gt_ref).item())
     if not math.isfinite(psnr_value):
         psnr_value = 0.0
     ssim_value = _compute_ssim_safe(pred_ref, gt_ref, ssim_metric)
@@ -368,7 +375,9 @@ def _compute_group_metrics(pred_image, gt_image, dataset, psnr_metric, ssim_metr
         pred_ref = torch.index_select(pred_image, dim=1, index=ch_idx)
         gt_ref = torch.index_select(gt_image, dim=1, index=ch_idx)
         group_metrics[group_name] = _compute_metrics_from_refs(
-            pred_ref, gt_ref, psnr_metric, ssim_metric, lpips_metric
+            pred_ref, gt_ref, psnr_metric, ssim_metric, lpips_metric,
+            is_normal=(group_name == "normal"),
+            normal_encoding=str(getattr(dataset, "normal_encoding", "xyz")),
         )
 
     if group_metrics:
@@ -390,15 +399,25 @@ def _compute_group_metrics(pred_image, gt_image, dataset, psnr_metric, ssim_metr
 # Comparison strip + annotated tiles
 # ---------------------------------------------------------------------------
 
-def _format_metric_triplet(metric: Optional[Tuple[float, float, float]]) -> str:
+def _metric_labels(metric_group: Optional[str] = None) -> Tuple[str, str, str]:
+    if metric_group == "normal":
+        return "AngularPSNR", "AngularSSIM", "AngularLPIPS"
+    return "PSNR", "SSIM", "LPIPS"
+
+
+def _format_metric_triplet(
+    metric: Optional[Tuple[float, float, float]],
+    metric_group: Optional[str] = None,
+) -> str:
+    psnr_label, ssim_label, lpips_label = _metric_labels(metric_group)
     if metric is None:
-        return "PSNR:-  SSIM:-  LPIPS:-"
-    return f"PSNR:{metric[0]:.3f}  SSIM:{metric[1]:.4f}  LPIPS:{metric[2]:.4f}"
+        return f"{psnr_label}:-  {ssim_label}:-  {lpips_label}:-"
+    return f"{psnr_label}:{metric[0]:.3f}  {ssim_label}:{metric[1]:.4f}  {lpips_label}:{metric[2]:.4f}"
 
 
 def _resolve_metric_group_for_texture(texture_name: str) -> str:
     name = str(texture_name).lower()
-    if "diffuse" in name or "albedo" in name:
+    if any(k in name for k in ("diffuse", "albedo", "basecolor", "base_color", "color", "rgb")):
         return "diffuse"
     if "normal" in name:
         return "normal"
@@ -439,12 +458,12 @@ def _make_annotated_tile(
     w, h = tile_pil.size
 
     if metric is None:
-        text = f"{method_name}\nPSNR:-  SSIM:-  LPIPS:-"
+        text = f"{method_name}\n{_format_metric_triplet(None, metric_group)}"
     else:
         selected_group = metric_group if metric_group in metric else "average"
         selected_metric = metric.get(selected_group)
-        group_name = selected_group.upper()
-        text = f"{method_name} [{group_name}]\n{_format_metric_triplet(selected_metric)}"
+        group_name = "NORMAL ANGULAR" if selected_group == "normal" else selected_group.upper()
+        text = f"{method_name} [{group_name}]\n{_format_metric_triplet(selected_metric, selected_group)}"
 
     font_size = max(18, min(36, h // 40, w // 28))
     font = _load_overlay_font(font_size)
@@ -702,7 +721,9 @@ def run_astc_comparison_pipeline(
                 if group_name not in method_metrics:
                     continue
                 p, s, l = method_metrics[group_name]
-                f.write(f"{method_name} {group_name} {p:.6f} {s:.6f} {l:.6f}\n")
+                metric_name = "normal_angular" if group_name == "normal" else group_name
+                labels = _metric_labels("normal" if group_name == "normal" else None)
+                f.write(f"{method_name} {metric_name} {labels[0]} {p:.6f} {labels[1]} {s:.6f} {labels[2]} {l:.6f}\n")
 
     for method_name, method_metrics in metrics.items():
         avg = method_metrics.get("average")
@@ -712,7 +733,7 @@ def run_astc_comparison_pipeline(
         print(
             f"[ASTC Test] {method_name} \t Average {_format_metric_triplet(avg)} "
             f"(Diffuse {_format_metric_triplet(diff)}, "
-            f"Normal {_format_metric_triplet(norm)}, "
+            f"NormalAngular {_format_metric_triplet(norm, 'normal')}, "
             f"ROMD {_format_metric_triplet(romd)})"
         )
 

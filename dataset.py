@@ -9,9 +9,19 @@ import math
 import numpy as np
 from PIL import Image
 import torchvision.transforms.functional as TF
+from normal_encoding import (
+    decode_normal,
+    encode_normal,
+    normal_encoding_channels,
+    normal_encoding_vis_mode,
+    normalize_normal_rgb,
+    normal_to_rgb,
+)
 
 
-def get_texture_config() -> List[Dict]:
+def get_texture_config(normal_encoding: str = "xyz") -> List[Dict]:
+    normal_channels = normal_encoding_channels(normal_encoding)
+    normal_vis_mode = normal_encoding_vis_mode(normal_encoding)
 
     keyword_order = ["diffuse", "normal", "roughness", "occlusion", "metallic", "specular", "displacement"]
     texture_keywords = {
@@ -30,7 +40,7 @@ def get_texture_config() -> List[Dict]:
     # display_name: subfolder name used when saving evaluation images
     texture_configs = {
         keyword_order[0]: {"expected_channels": 3, "color_mode": "RGB", "vis_mode": "srgb",   "loss_weight": 1.0, "display_name": "rgb"},
-        keyword_order[1]: {"expected_channels": 3, "color_mode": "RGB", "vis_mode": "normal", "loss_weight": 0.8, "display_name": "normal"},
+        keyword_order[1]: {"expected_channels": normal_channels, "color_mode": "RGB", "vis_mode": normal_vis_mode, "loss_weight": 0.8, "display_name": "normal"},
         keyword_order[2]: {"expected_channels": 1, "color_mode": "L",   "vis_mode": "linear", "loss_weight": 0.3, "display_name": "roughness"},
         keyword_order[3]: {"expected_channels": 1, "color_mode": "L",   "vis_mode": "linear", "loss_weight": 0.3, "display_name": "occlusion"},
         keyword_order[4]: {"expected_channels": 1, "color_mode": "L",   "vis_mode": "linear", "loss_weight": 0.3, "display_name": "metallic"},
@@ -42,15 +52,15 @@ def get_texture_config() -> List[Dict]:
     return keyword_order, texture_keywords, texture_configs
 
 
-def get_canonical_num_channels() -> int:
-    """Fixed total number of channels (11) aligned with model.CANONICAL_CHANNEL_ORDER."""
-    keyword_order, _, texture_configs = get_texture_config()
+def get_canonical_num_channels(normal_encoding: str = "xyz") -> int:
+    """Total canonical channels aligned with the selected normal encoding."""
+    keyword_order, _, texture_configs = get_texture_config(normal_encoding)
     return sum(texture_configs[t]["expected_channels"] for t in keyword_order)
 
 
-def get_canonical_channel_slices_static() -> Dict[str, tuple]:
-    """Return (start, end) slice in the 11-channel layout for each texture type (aligned with model)."""
-    keyword_order, _, texture_configs = get_texture_config()
+def get_canonical_channel_slices_static(normal_encoding: str = "xyz") -> Dict[str, tuple]:
+    """Return (start, end) slice in the canonical layout for each texture type."""
+    keyword_order, _, texture_configs = get_texture_config(normal_encoding)
     out = {}
     idx = 0
     for t in keyword_order:
@@ -69,13 +79,14 @@ class TextureDataset(torch.nn.Module):
         self.device = config.device
         
         self.data_dir = config.data_dir
+        self.normal_encoding = str(getattr(config, "normal_encoding", "xyz")).lower()
 
-        self.keyword_order, self.texture_keywords, self.texture_configs = get_texture_config()
+        self.keyword_order, self.texture_keywords, self.texture_configs = get_texture_config(self.normal_encoding)
         # mapping from texture type to channel slice [start, end) in current loaded data
         self.channel_slices = {}
         # (start, end) in the canonical 11-channel layout for each texture type, aligned with model
-        self.canonical_channel_slices = get_canonical_channel_slices_static()
-        self.canonical_num_channels = get_canonical_num_channels()
+        self.canonical_channel_slices = get_canonical_channel_slices_static(self.normal_encoding)
+        self.canonical_num_channels = get_canonical_num_channels(self.normal_encoding)
         # ordered available texture types that were found and concatenated
         self.available_textures = []
 
@@ -164,6 +175,8 @@ class TextureDataset(torch.nn.Module):
             tensor = TF.to_tensor(image)
             if texture_type != "normal":
                 tensor = torch.pow(tensor, 2.2)
+            else:
+                tensor = encode_normal(tensor, self.normal_encoding)
         return tensor
 
     def load_data(self) -> TensorType["texture_height", "texture_width", "num_channels"]:
@@ -237,6 +250,23 @@ class TextureDataset(torch.nn.Module):
 
         return textures_ordered
     
+    def _resize_texture_for_lod(self, texture_type: str, tex_chw: torch.Tensor, lod_height: int, lod_width: int) -> torch.Tensor:
+        if texture_type == "normal":
+            normal_vec = normalize_normal_rgb(decode_normal(tex_chw, self.normal_encoding))
+            lod_vec = TF.resize(
+                normal_vec, [lod_height, lod_width],
+                interpolation=TF.InterpolationMode.BICUBIC,
+                antialias=True,
+            )
+            return encode_normal(normal_to_rgb(lod_vec), self.normal_encoding)
+
+        lod_texture = TF.resize(
+            tex_chw, [lod_height, lod_width],
+            interpolation=TF.InterpolationMode.BICUBIC,
+            antialias=True,
+        )
+        return torch.clamp(lod_texture, min=0., max=1.)
+
     def generate_lod(self) -> TensorType["num_lods", "lod_height", "lod_width", "num_channels"]:
 
         lod_cache = torch.zeros(
@@ -251,13 +281,12 @@ class TextureDataset(torch.nn.Module):
         for lod in range(self.num_lods):
             lod_height = self.texture_height // (2 ** lod)
             lod_width = self.texture_width // (2 ** lod)
-            # [H, W, C] -> [C, H, W] -> TF.resize -> [C, lod_H, lod_W] -> [lod_H, lod_W, C]
-            lod_texture = TF.resize(
-                textures.permute(2, 0, 1), [lod_height, lod_width],
-                interpolation=TF.InterpolationMode.BICUBIC,
-                antialias=True,
-            ).permute(1, 2, 0)
-            lod_texture = torch.clamp(lod_texture, min=0., max=1.)
+            lod_parts = []
+            for texture_type in self.available_textures:
+                ds_start, ds_end = self.channel_slices[texture_type]
+                tex_chw = textures[:, :, ds_start:ds_end].permute(2, 0, 1)
+                lod_parts.append(self._resize_texture_for_lod(texture_type, tex_chw, lod_height, lod_width))
+            lod_texture = torch.cat(lod_parts, dim=0).permute(1, 2, 0)
             # [lod, H, W, C] <- [lod_H, lod_W, C]
             lod_cache[lod, :lod_height, :lod_width, :] = lod_texture
 
@@ -285,7 +314,7 @@ class TextureDataset(torch.nn.Module):
         return weights
 
     def expand_to_canonical(self, x: TensorType["batch_size", "num_channels"]) -> TensorType["batch_size", 11]:
-        """Expand [B, num_channels] to canonical 11 channels; fill missing texture positions with 0."""
+        """Expand [B, num_channels] to canonical channels; fill missing texture positions with 0."""
         device = x.device
         dtype = x.dtype
         batch_size = x.shape[0]
@@ -297,7 +326,7 @@ class TextureDataset(torch.nn.Module):
         return out
 
     def expand_lod_to_canonical(self, lod_tensor: TensorType["num_lods", "H", "W", "num_channels"]) -> TensorType["num_lods", "H", "W", 11]:
-        """Expand lod_cache [num_lods, H, W, num_channels] to [num_lods, H, W, 11]; fill missing with 0."""
+        """Expand lod_cache [num_lods, H, W, num_channels] to [num_lods, H, W, canonical_channels]; fill missing with 0."""
         num_lods, h, w, c = lod_tensor.shape
         device = lod_tensor.device
         dtype = lod_tensor.dtype
@@ -309,7 +338,7 @@ class TextureDataset(torch.nn.Module):
         return out
 
     def get_canonical_loss_weights(self, config_weights: Optional[Dict[str, float]] = None) -> List[float]:
-        """Return per-channel loss weights of length 11; channels for missing textures are 0."""
+        """Return per-channel loss weights of canonical length; channels for missing textures are 0."""
         weights = [0.0] * self.canonical_num_channels
         for tex_type in self.keyword_order:
             canon_start, canon_end = self.canonical_channel_slices[tex_type]

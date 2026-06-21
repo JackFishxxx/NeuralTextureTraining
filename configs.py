@@ -125,6 +125,14 @@ class Config():
                 f"Supported values: {sorted(supported_output_activations)}"
             )
 
+        self.normal_encoding = str(getattr(params, "normal_encoding", "xyz")).strip().lower().replace("-", "_")
+        if self.normal_encoding == "rgb":
+            self.normal_encoding = "xyz"
+        if self.normal_encoding == "hemi_octa":
+            self.normal_encoding = "hemi_oct"
+        if self.normal_encoding not in {"xyz", "xy", "hemi_oct"}:
+            raise ValueError("normal_encoding must be one of: xyz, xy, hemi_oct")
+
         self.direct_diffuse_infer_mode = str(params.direct_diffuse_infer_mode).strip().lower()
         if self.direct_diffuse_infer_mode not in {"disable", "rgb", "ycocg"}:
             raise ValueError("direct_diffuse_infer_mode must be one of: disable, rgb, ycocg")
@@ -141,13 +149,13 @@ class Config():
         # Keys: texture type names (diffuse, normal, roughness, etc.)
         # Values: per-channel weight
         self.texture_loss_weights: Optional[Dict[str, float]] = {
-            "diffuse": 1.5,
-            "normal": 0.3,
-            "roughness": 0.1,
-            "occlusion": 0.1,
-            "metallic": 0.1,
-            "specular": 0.1,
-            "displacement": 0.1,
+            "diffuse": 1.0,
+            "normal": 0.2,
+            "roughness": 0.3,
+            "occlusion": 0.3,
+            "metallic": 0.3,
+            "specular": 0.3,
+            "displacement": 0.3,
         }
 
         # Final per-channel loss weights list (generated from texture_loss_weights and available textures)
@@ -392,6 +400,8 @@ def get_args():
                         help='top percentile threshold for sensitive mask')
     parser.add_argument('--sensitive_mask_detach', action=argparse.BooleanOptionalAction, default=True,
                         help='detach sensitive mask from gradient graph')
+    parser.add_argument('--normal_encoding', type=str, default='xyz', choices=['xyz', 'xy', 'hemi_oct'],
+                        help='normal target encoding: xyz=3 channels, xy/hemi_oct=2 channels')
     parser.add_argument('--direct_diffuse_infer_mode', type=str, default='disable',
                         choices=['disable', 'rgb', 'ycocg'],
                         help='direct diffuse inference mode: disable, or store diffuse in feature0 RGB as rgb/ycocg')

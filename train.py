@@ -19,6 +19,7 @@ import tinycudann as tcnn
 from configs import get_args
 from model import TCNNModel
 from dataset import TextureDataset
+from normal_encoding import decode_normal, normal_angular_loss, normal_angular_psnr
 from configs import Config
 from Comparison_ASTC import ASTCCodec, ASTCENC_DEFAULT_PATH, run_astc_comparison_pipeline
 from astc_residual_model import ASTCResidualNoiseModel
@@ -34,6 +35,7 @@ class Trainer:
         else:
             configs = Config(params)
         dataset = TextureDataset(configs)
+        print(f"[NormalEncoding] mode={dataset.normal_encoding}")
         configs.num_lods = dataset.num_lods
         model = TCNNModel(configs)
         model.configure_direct_diffuse_from_dataset(dataset)
@@ -81,6 +83,7 @@ class Trainer:
         if getattr(model, "direct_diffuse_enabled", False) and "diffuse" in dataset.available_textures:
             s, e = dataset.canonical_channel_slices["diffuse"]
             self.output_loss_weights[s:e] = [0.0] * (e - s)
+        self._last_loss_stats = {}
 
         # visualization configs for eval/infer (data-driven, not hardcoded)
         self.vis_configs = dataset.get_vis_configs()
@@ -113,6 +116,7 @@ class Trainer:
         self.astcenc_quality = str(getattr(configs, "astcenc_quality", "medium"))
         self.astc_block = str(getattr(configs, "astc_block", "6x6"))
         self.ref_astc_resolution = getattr(configs, "ref_astc_resolution", None)
+        self.normal_encoding = str(getattr(configs, "normal_encoding", "xyz")).lower()
         self.astc_codec = ASTCCodec(
             astcenc_path=self.astcenc_path,
             astcenc_quality=self.astcenc_quality,
@@ -155,6 +159,79 @@ class Trainer:
         self.duration_time = self.end_time - self.start_time
         print(f"Total training time: {self.duration_time}")
 
+    def _group_indices(self, textures: List[str], device: torch.device) -> torch.Tensor:
+        idx = []
+        for tex in textures:
+            if tex not in self.dataset.available_textures:
+                continue
+            s, e = self.dataset.canonical_channel_slices[tex]
+            idx.extend(range(s, e))
+        return torch.tensor(idx, device=device, dtype=torch.long)
+
+    def _compute_reconstruction_loss(
+        self,
+        gt_texture: torch.Tensor,
+        predict_texture: torch.Tensor,
+        loss_weights: torch.Tensor,
+        curr_iter: Optional[int] = None,
+    ) -> torch.Tensor:
+        groups = {
+            "diffuse": ["diffuse"],
+            "normal": ["normal"],
+            "romd": ["roughness", "occlusion", "metallic", "displacement"],
+        }
+        total_loss = torch.tensor(0.0, device=gt_texture.device, dtype=torch.float32)
+        stats = {}
+
+        for group, textures in groups.items():
+            idx = self._group_indices(textures, gt_texture.device)
+            if idx.numel() == 0:
+                stats[group] = None
+                continue
+
+            pred = torch.index_select(predict_texture.float(), dim=1, index=idx)
+            gt = torch.index_select(gt_texture.float(), dim=1, index=idx)
+            weights = loss_weights.index_select(0, idx).float()
+            weight = weights.mean()
+
+            if group == "normal":
+                raw_loss = normal_angular_loss(pred, gt, self.normal_encoding)
+                weighted_loss = raw_loss * weights.sum()
+            else:
+                mse = (gt - pred).pow(2).mean(dim=0)
+                raw_loss = mse.mean()
+                weighted_loss = (mse * weights).sum()
+
+            total_loss = total_loss + weighted_loss
+            stats[group] = {
+                "loss": float(weighted_loss.detach().item()),
+                "raw_loss": float(raw_loss.detach().item()),
+                "weight": float(weight.detach().item()),
+            }
+
+            if curr_iter is not None:
+                loss_name = "normal_angular" if group == "normal" else group
+                self.writer.add_scalar(f'Loss/{loss_name}', stats[group]["loss"], curr_iter)
+                self.writer.add_scalar(f'LossRaw/{loss_name}', stats[group]["raw_loss"], curr_iter)
+                self.writer.add_scalar(f'LossWeight/{loss_name}', stats[group]["weight"], curr_iter)
+
+        if curr_iter is not None:
+            self._last_loss_stats = stats
+        return total_loss
+
+    def _loss_stats_str(self) -> str:
+        labels = {
+            "diffuse": "Weighted diffuse loss",
+            "normal": "Weighted normal angular loss",
+            "romd": "Weighted ROMD loss",
+        }
+        parts = []
+        for group in ("diffuse", "normal", "romd"):
+            stat = self._last_loss_stats.get(group)
+            value = "-" if stat is None else f"{stat['loss']:.6f}"
+            parts.append(f"{labels[group]}:{value}")
+        return ", ".join(parts)
+
     def train(self) -> None:
 
         for curr_iter in range(self.trained_iter, self.max_iter):
@@ -191,10 +268,9 @@ class Trainer:
             # predict (clean branch)
             predict_texture = self.model(batch_input)  # [batch_size, num_channels]
 
-            # base reconstruction loss
-            base_loss = self.L2_loss(gt_texture, predict_texture)
-            loss_weights = torch.tensor(self.output_loss_weights).to(self.device)
-            base_loss = (base_loss.mean(dim=0) * loss_weights).sum()
+            # base reconstruction loss; normal uses angular loss, others use channel MSE
+            loss_weights = torch.tensor(self.output_loss_weights, device=self.device, dtype=torch.float32)
+            base_loss = self._compute_reconstruction_loss(gt_texture, predict_texture, loss_weights, curr_iter)
 
             # ASTC-aware robust branch (noise-injected output + consistency)
             robust_loss = torch.tensor(0.0, device=self.device)
@@ -205,8 +281,7 @@ class Trainer:
                 noisy_input, applied = self.astc_noise_model.perturb_uvlod_input(batch_input, curr_iter, enable=self.astc_curriculum_enable)
                 if applied:
                     predict_noisy = self.model(noisy_input)
-                    robust_loss = self.L2_loss(gt_texture, predict_noisy)
-                    robust_loss = (robust_loss.mean(dim=0) * loss_weights).sum()
+                    robust_loss = self._compute_reconstruction_loss(gt_texture, predict_noisy, loss_weights, None)
                     total_loss = 0.5 * base_loss + 0.5 * robust_loss
 
                     prog = float(curr_iter) / max(1.0, float(self.max_iter - 1))
@@ -401,6 +476,15 @@ class Trainer:
         gt_rgb = gt[:, ms:me, :, :]
         return self._downsample_for_metrics(pred_rgb, gt_rgb)
 
+    def _metric_texture_name(self) -> str:
+        return "diffuse" if "diffuse" in self.dataset.available_textures else self.dataset.available_textures[0]
+
+    def _metric_visual_pair(self, pred_ref: torch.Tensor, gt_ref: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._metric_texture_name() == "normal":
+            pred_ref = decode_normal(pred_ref, self.normal_encoding)
+            gt_ref = decode_normal(gt_ref, self.normal_encoding)
+        return pred_ref, gt_ref
+
     def _compute_lod_metrics(
         self,
         pred: torch.Tensor,
@@ -408,12 +492,16 @@ class Trainer:
         lod_height: int,
         lod_width: int,
     ) -> Tuple[float, float, Optional[float]]:
-        pred_rgb, gt_rgb = self._metric_rgb_pair(pred, gt)
-        psnr_value = float(self.psnr(pred_rgb, gt_rgb).item())
-        ssim_value, _ = self.ssim(pred_rgb, gt_rgb)
+        pred_ref, gt_ref = self._metric_rgb_pair(pred, gt)
+        if self._metric_texture_name() == "normal":
+            psnr_value = float(normal_angular_psnr(pred_ref, gt_ref, self.normal_encoding).item())
+        else:
+            psnr_value = float(self.psnr(pred_ref, gt_ref).item())
+        visual_pred, visual_gt = self._metric_visual_pair(pred_ref, gt_ref)
+        ssim_value, _ = self.ssim(visual_pred, visual_gt)
         ssim_value = float(ssim_value.item())
         if lod_height >= 128 and lod_width >= 128:
-            return psnr_value, ssim_value, float(self.lpips(pred_rgb, gt_rgb).item())
+            return psnr_value, ssim_value, float(self.lpips(visual_pred, visual_gt).item())
         return psnr_value, ssim_value, None
 
     def _save_lod_visuals(self, pred: torch.Tensor, gt: torch.Tensor, output_root: str, filename: str) -> None:
@@ -451,11 +539,12 @@ class Trainer:
 
                 psnr_list.append(psnr_value)
                 ssim_list.append(ssim_value)
-                self.writer.add_scalar(f'PSNR_LOD{lod}/train', psnr_value, curr_iter)
-                self.writer.add_scalar(f'SSIM_LOD{lod}/train', ssim_value, curr_iter)
+                metric_prefix = "NormalAngular" if self._metric_texture_name() == "normal" else ""
+                self.writer.add_scalar(f'{metric_prefix}PSNR_LOD{lod}/train', psnr_value, curr_iter)
+                self.writer.add_scalar(f'{metric_prefix}SSIM_LOD{lod}/train', ssim_value, curr_iter)
                 if lpips_value is not None:
                     lpips_list.append(lpips_value)
-                    self.writer.add_scalar(f'LPIPS_LOD{lod}/train', lpips_value, curr_iter)
+                    self.writer.add_scalar(f'{metric_prefix}LPIPS_LOD{lod}/train', lpips_value, curr_iter)
 
                 if should_save_visuals:
                     self._save_lod_visuals(pred, gt, self.media_path, f"{curr_iter}_{lod}.png")
@@ -468,11 +557,13 @@ class Trainer:
         psnr_avg = self._mean_metric(psnr_list)
         ssim_avg = self._mean_metric(ssim_list)
         lpips_avg = self._mean_metric(lpips_list)
-        self.writer.add_scalar('PSNR/train', psnr_avg, curr_iter)
-        self.writer.add_scalar('SSIM/train', ssim_avg, curr_iter)
-        self.writer.add_scalar('LPIPS/train', lpips_avg, curr_iter)
+        metric_prefix = "NormalAngular" if self._metric_texture_name() == "normal" else ""
+        self.writer.add_scalar(f'{metric_prefix}PSNR/train', psnr_avg, curr_iter)
+        self.writer.add_scalar(f'{metric_prefix}SSIM/train', ssim_avg, curr_iter)
+        self.writer.add_scalar(f'{metric_prefix}LPIPS/train', lpips_avg, curr_iter)
 
-        print(f"Iter:{curr_iter}, PSNR:{psnr_avg:.4f}, SSIM:{ssim_avg:.4f}, LPIPS:{lpips_avg:.4f}")
+        psnr_label = "NormalAngularPSNR" if self._metric_texture_name() == "normal" else "DiffusePSNR"
+        print(f"Iter:{curr_iter}, {psnr_label}:{psnr_avg:.4f}. {self._loss_stats_str()}")
         return psnr_avg
 
     def _postprocess_for_vis(self, image: torch.Tensor, vis_mode: str) -> torch.Tensor:
@@ -489,6 +580,8 @@ class Trainer:
             norm = torch.sqrt(torch.clamp((n ** 2).sum(dim=0, keepdim=True), min=1e-8))
             n = n / norm
             image = torch.clamp((n + 1.0) * 0.5, 0.0, 1.0)
+        elif vis_mode == 'normal_encoded':
+            image = decode_normal(image, self.normal_encoding)
         # 'linear' -> no transform
         return image
 
@@ -514,7 +607,10 @@ class Trainer:
         psnr_list: List[float] = []
         ssim_list: List[float] = []
         lpips_list: List[float] = []
-        metric_lines = ["LOD PSNR SSIM LPIPS\n"]
+        if self._metric_texture_name() == "normal":
+            metric_lines = ["LOD NormalAngularPSNR NormalAngularSSIM NormalAngularLPIPS\n"]
+        else:
+            metric_lines = ["LOD PSNR SSIM LPIPS\n"]
 
         was_training = self.model.training
         try:

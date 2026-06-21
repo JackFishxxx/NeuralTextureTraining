@@ -366,8 +366,23 @@ def _metric_channel_groups(dataset) -> Dict[str, list]:
     return groups
 
 
+def _group_metric_weights(dataset, eval_weights=None) -> Dict[str, float]:
+    group_channels = _metric_channel_groups(dataset)
+    if eval_weights is None:
+        return {name: 1.0 for name in group_channels}
+
+    w = torch.as_tensor(eval_weights, dtype=torch.float32)
+    out: Dict[str, float] = {}
+    for group_name, channels in group_channels.items():
+        if not channels:
+            continue
+        idx = torch.tensor(channels, dtype=torch.long)
+        out[group_name] = float(w.index_select(0, idx).sum().item())
+    return out
+
+
 @torch.no_grad()
-def _compute_group_metrics(pred_image, gt_image, dataset, psnr_metric, ssim_metric, lpips_metric):
+def _compute_group_metrics(pred_image, gt_image, dataset, psnr_metric, ssim_metric, lpips_metric, eval_weights=None):
     group_channels = _metric_channel_groups(dataset)
     group_metrics: Dict[str, Tuple[float, float, float]] = {}
     for group_name, channels in group_channels.items():
@@ -382,9 +397,13 @@ def _compute_group_metrics(pred_image, gt_image, dataset, psnr_metric, ssim_metr
 
     if group_metrics:
         order = [n for n in ("diffuse", "normal", "romd") if n in group_metrics]
-        avg_psnr = float(np.nanmean([group_metrics[n][0] for n in order]))
-        avg_ssim = float(np.nanmean([group_metrics[n][1] for n in order]))
-        avg_lpips = float(np.nanmean([group_metrics[n][2] for n in order]))
+        weights = _group_metric_weights(dataset, eval_weights)
+        vals = np.array([group_metrics[n] for n in order], dtype=np.float64)
+        ws = np.array([max(0.0, weights.get(n, 1.0)) for n in order], dtype=np.float64)
+        if ws.sum() <= 0:
+            ws = np.ones_like(ws)
+        ws = ws / ws.sum()
+        avg_psnr, avg_ssim, avg_lpips = [float(v) for v in (vals * ws[:, None]).sum(axis=0)]
         if not math.isfinite(avg_ssim):
             avg_ssim = 0.0
         if not math.isfinite(avg_psnr):
@@ -669,6 +688,7 @@ def run_astc_comparison_pipeline(
     device: str,
     curr_iter: Optional[int] = None,
     ref_astc_resolution: Optional[int] = None,
+    eval_weights=None,
 ) -> Dict[str, Dict[str, Tuple[float, float, float]]]:
     block_tag = astc_codec.astc_block.replace("x", "_")
     fntc_astc_name = f"fntc_astc_{astc_codec.astc_block}"
@@ -704,12 +724,14 @@ def run_astc_comparison_pipeline(
     )
 
     metrics = {
-        "fntc_quantized": _compute_group_metrics(pred_fntc, gt_image, dataset, psnr_metric, ssim_metric, lpips_metric),
+        "fntc_quantized": _compute_group_metrics(
+            pred_fntc, gt_image, dataset, psnr_metric, ssim_metric, lpips_metric, eval_weights=eval_weights
+        ),
         fntc_astc_name: _compute_group_metrics(
-            pred_fntc_grid_astc, gt_image, dataset, psnr_metric, ssim_metric, lpips_metric
+            pred_fntc_grid_astc, gt_image, dataset, psnr_metric, ssim_metric, lpips_metric, eval_weights=eval_weights
         ),
         ref_astc_name: _compute_group_metrics(
-            pred_traditional_astc, gt_image, dataset, psnr_metric, ssim_metric, lpips_metric
+            pred_traditional_astc, gt_image, dataset, psnr_metric, ssim_metric, lpips_metric, eval_weights=eval_weights
         ),
     }
 
@@ -731,7 +753,7 @@ def run_astc_comparison_pipeline(
         norm = method_metrics.get("normal")
         romd = method_metrics.get("romd")
         print(
-            f"[ASTC Test] {method_name} \t Average {_format_metric_triplet(avg)} "
+            f"[ASTC Test] {method_name} \t Weighted {_format_metric_triplet(avg)} "
             f"(Diffuse {_format_metric_triplet(diff)}, "
             f"NormalAngular {_format_metric_triplet(norm, 'normal')}, "
             f"ROMD {_format_metric_triplet(romd)})"

@@ -114,8 +114,8 @@ class TCNNModel(torch.nn.Module):
 
         for grid_idx, grid_cfg in enumerate(config.feature_grid_configs):
             spec = FeatureGridSpec.from_config(grid_cfg, self.quantize_bits, self.save_bits, config.learning_rate)
-            if self.direct_diffuse_enabled and grid_idx == 0:
-                spec = FeatureGridSpec(**{**spec.__dict__, "interpolation": "Nearest"})
+            if self.direct_diffuse_enabled:
+                spec = FeatureGridSpec(**{**spec.__dict__, "interpolation": "Linear"})
             self.feature_grid_specs.append(spec)
             max_res = spec.max_resolution
             n_levels = spec.n_levels
@@ -162,7 +162,6 @@ class TCNNModel(torch.nn.Module):
         if self.direct_diffuse_enabled:
             if not self.feature_grid_n_features_per_level or self.feature_grid_n_features_per_level[0] < 3:
                 raise ValueError("direct_diffuse_infer_mode requires feature grid 0 to have at least 3 channels")
-            total_grid_features -= 3 * self.num_sampled_lods
         n_input_dims = config.n_frequencies * 2 + total_grid_features + 1
         print(f"total_grid_features={total_grid_features}, n_input_dims={n_input_dims}")
         self.network = tcnn.Network(
@@ -310,7 +309,7 @@ class TCNNModel(torch.nn.Module):
 
     @torch.no_grad()
     def render_direct_diffuse_lod(self, lod: int, out_h: int, out_w: int, resize_fn=None) -> torch.Tensor:
-        """Render direct diffuse as low-res feature payload, then bilinear upsample to output size."""
+        """Render direct diffuse from feature-grid RGB, then bilinear upsample to output size."""
         if not self.direct_diffuse_enabled:
             raise RuntimeError("render_direct_diffuse_lod requires direct_diffuse_infer_mode != disable")
 
@@ -350,6 +349,21 @@ class TCNNModel(torch.nn.Module):
         if bool(torch.all(res <= 1)):
             return torch.zeros_like(uvs)
         return torch.clamp((uvs * res - 0.5) / torch.clamp(res - 1.0, min=1.0), 0.0, 1.0)
+
+    def _nearest_grid_uv(self, uvs: torch.Tensor, selected_level, base_res: int) -> torch.Tensor:
+        """Nearest texel center in tiny-cuda-nn grid coordinates."""
+        if not torch.is_tensor(selected_level):
+            selected_level = torch.full((uvs.shape[0], 1), float(selected_level), device=uvs.device, dtype=uvs.dtype)
+        level_int = torch.round(selected_level).to(torch.int64)
+        res = int(base_res) * torch.pow(
+            torch.full_like(selected_level, 2.0),
+            level_int.to(dtype=selected_level.dtype),
+        )
+        if bool(torch.all(res <= 1)):
+            return torch.zeros_like(uvs)
+        texel = torch.floor(uvs * res).clamp(min=0.0)
+        texel = torch.minimum(texel, torch.clamp(res - 1.0, min=0.0))
+        return torch.clamp(texel / torch.clamp(res - 1.0, min=1.0), 0.0, 1.0)
 
     def forward(self, x: TensorType["batch_size", 3]) -> TensorType["batch_size", "num_channels"]:
 
@@ -396,8 +410,9 @@ class TCNNModel(torch.nn.Module):
                 sampled_features = sampled_features + (quantized - sampled_features).detach()
 
             if self.direct_diffuse_enabled and idx == 0:
-                direct_diffuse = self._decode_direct_diffuse_features(sampled_features)
-                sampled_features = sampled_features[:, 3:]
+                nearest_uvs = self._nearest_grid_uv(uvs, selected_level_f, self.feature_grid_base_res[idx])
+                nearest_features = torch.gather(feature_grid(nearest_uvs), 1, cols.to(torch.int64))
+                direct_diffuse = self._decode_direct_diffuse_features(nearest_features)
 
             features.append(sampled_features)
         features = torch.cat(features, dim=1)

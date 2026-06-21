@@ -76,10 +76,11 @@ class Trainer:
         self.texture_height = dataset.texture_height
         self.texture_width = dataset.texture_width
 
-        # 11-channel loss weights; channels for missing textures are 0
-        self.output_loss_weights = configs.output_loss_weights or dataset.get_canonical_loss_weights(
-            config_weights=getattr(configs, 'texture_loss_weights', None)
+        # Canonical per-channel weights; eval keeps diffuse weight, training loss may zero direct diffuse.
+        self.eval_weights = dataset.get_canonical_loss_weights(
+            config_weights=getattr(configs, 'texture_weights', getattr(configs, 'texture_loss_weights', None))
         )
+        self.output_loss_weights = list(configs.output_loss_weights or self.eval_weights)
         if getattr(model, "direct_diffuse_enabled", False) and "diffuse" in dataset.available_textures:
             s, e = dataset.canonical_channel_slices["diffuse"]
             self.output_loss_weights[s:e] = [0.0] * (e - s)
@@ -660,6 +661,7 @@ class Trainer:
             device=self.device,
             curr_iter=curr_iter,
             ref_astc_resolution=self.ref_astc_resolution,
+            eval_weights=self.eval_weights,
         )
 
     @torch.no_grad()

@@ -144,21 +144,23 @@ class Config():
         ]
         self.feature_grid_configs: Optional[List[Dict]] = params.feature_grid_configs or default_feature_grids
 
-        # Per-texture-type loss weights (optional)
+        # Per-texture-type weights shared by training loss and evaluation aggregation.
         # If None, weights from dataset.get_texture_config() will be used
         # Keys: texture type names (diffuse, normal, roughness, etc.)
         # Values: per-channel weight
-        self.texture_loss_weights: Optional[Dict[str, float]] = {
+        self.texture_weights: Optional[Dict[str, float]] = {
             "diffuse": 1.0,
-            "normal": 0.2,
-            "roughness": 0.3,
-            "occlusion": 0.3,
-            "metallic": 0.3,
-            "specular": 0.3,
-            "displacement": 0.3,
+            "normal": 0.3,
+            "roughness": 0.15,
+            "occlusion": 0.15,
+            "metallic": 0.15,
+            "specular": 0.15,
+            "displacement": 0.15,
         }
+        # Backward-compatible alias for older call sites/configs.
+        self.texture_loss_weights = self.texture_weights
 
-        # Final per-channel loss weights list (generated from texture_loss_weights and available textures)
+        # Final per-channel loss weights list (generated from texture_weights and available textures)
         self.output_loss_weights: Optional[List[float]] = None
         self.network_learning_rate = params.learning_rate
 

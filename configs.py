@@ -33,14 +33,14 @@ def _load_yaml_defaults(config_path=None):
     return data if isinstance(data, dict) else {}
 
 class Config():
-    
+
     def __init__(self, params: argparse.Namespace):
 
         if torch.cuda.is_available():
             self.device = "cuda"
         else:
             self.device = "cpu"
-        
+
         ### ---------- experiment configs ---------- ###
         self.data_dir = params.data_dir
         self.save_dir = params.save_dir
@@ -72,7 +72,7 @@ class Config():
         self.quantize = params.quantize
         self.quantize_bits = params.quantize_bits
         self.save_bits = params.save_bits
-        # Hash-grid QAT: multiplicative noise schedule (ANA-style cosine anneal)
+        # Feature-grid QAT: multiplicative noise schedule (ANA-style cosine anneal)
         self.qat_noise_schedule = str(getattr(params, "qat_noise_schedule", "cosine")).strip().lower()
         if self.qat_noise_schedule not in ("none", "cosine"):
             raise ValueError(
@@ -125,27 +125,17 @@ class Config():
                 f"Supported values: {sorted(supported_output_activations)}"
             )
 
-        direct_mode = getattr(params, "direct_diffuse_infer_mode", None)
-        if direct_mode is None:
-            legacy_enable = bool(getattr(params, "direct_diffuse_feature_enable", False))
-            legacy_mapping = str(getattr(params, "direct_diffuse_feature_mapping", "rgb")).strip().lower()
-            direct_mode = legacy_mapping if legacy_enable else "disable"
-        self.direct_diffuse_infer_mode = str(direct_mode).strip().lower()
+        self.direct_diffuse_infer_mode = str(params.direct_diffuse_infer_mode).strip().lower()
         if self.direct_diffuse_infer_mode not in {"disable", "rgb", "ycocg"}:
             raise ValueError("direct_diffuse_infer_mode must be one of: disable, rgb, ycocg")
-        self.direct_diffuse_feature_enable = self.direct_diffuse_infer_mode != "disable"
-        self.direct_diffuse_feature_mapping = (
-            "rgb" if self.direct_diffuse_infer_mode == "disable" else self.direct_diffuse_infer_mode
-        )
 
-        # By default, None → use legacy behavior (uniform grids based on n_features_per_level).
-        self.hash_grid_configs: Optional[List[Dict]] = getattr(params, 'hash_grid_configs', None)
-        # Multi-HashGrid configs
-        self.hash_grid_configs = [
-            {"max_resolution": 1024, "quantize_bits":8, "save_bits":32, "learning_rate": 0.005},
-            {"max_resolution": 512, "quantize_bits":8, "save_bits":32, "learning_rate": 0.005},
+        # Learned feature grids.
+        default_feature_grids = [
+            {"max_resolution": 1024, "quantize_bits": 8, "save_bits": 32, "learning_rate": 0.005},
+            {"max_resolution": 512, "quantize_bits": 8, "save_bits": 32, "learning_rate": 0.005},
         ]
-        
+        self.feature_grid_configs: Optional[List[Dict]] = params.feature_grid_configs or default_feature_grids
+
         # Per-texture-type loss weights (optional)
         # If None, weights from dataset.get_texture_config() will be used
         # Keys: texture type names (diffuse, normal, roughness, etc.)
@@ -159,7 +149,7 @@ class Config():
             "specular": 0.1,
             "displacement": 0.1,
         }
-        
+
         # Final per-channel loss weights list (generated from texture_loss_weights and available textures)
         self.output_loss_weights: Optional[List[float]] = None
         self.network_learning_rate = params.learning_rate
@@ -196,9 +186,9 @@ class Config():
         self.sensitive_mask_detach = bool(getattr(params, "sensitive_mask_detach", True))
 
         # Normalize configs to the internal format expected by the model
-        if self.hash_grid_configs is not None:
+        if self.feature_grid_configs is not None:
             processed: List[Dict] = []
-            for cfg in self.hash_grid_configs:
+            for cfg in self.feature_grid_configs:
                 max_res = int(cfg.get("max_resolution", 1024))
                 # check max_res
                 if max_res <= 0:
@@ -227,7 +217,7 @@ class Config():
                     "interpolation": str(cfg.get("interpolation", "Linear")),
                 })
 
-            self.hash_grid_configs = processed
+            self.feature_grid_configs = processed
 
     def make_group_config(self, group_name: str) -> 'Config':
         """Create a shallow copy of this Config with data_dir and save_dir
@@ -295,7 +285,7 @@ def get_args():
         type=str,
         default='cosine',
         choices=['none', 'cosine'],
-        help='QAT additive noise strength schedule over training iterations (hash grid STE branch)',
+        help='QAT additive noise strength schedule over training iterations (feature grid STE branch)',
     )
     parser.add_argument(
         '--qat_noise_mult_start',
@@ -315,7 +305,7 @@ def get_args():
         default=0.1,
         help='fraction of (max_iter-1) iterations holding mult_start before cosine decay',
     )
-        
+
     ### ---------- trainer configs ---------- ###
     parser.add_argument('--max_iter', type=int, default=400000,
                         help='maximum training iteration')
@@ -331,9 +321,9 @@ def get_args():
                         help='scheduler type',
                         choices=['steplr', 'cosine', 'poly'])
     parser.add_argument('--eval_interval', type=int, default=500,
-                        help='the interval of iteration for evalation')
+                        help='iteration interval for evaluation')
     parser.add_argument('--save_interval', type=int, default=5000,
-                        help='the interval of iteration for saving model')
+                        help='iteration interval for saving model')
     parser.add_argument('--eval_inference_tile', type=int, default=512,
                         help='eval/infer: tile edge in pixels (0 = one batch over full plane, may OOM)')
     parser.add_argument('--eval_metrics_max_edge', type=int, default=0,
@@ -405,6 +395,8 @@ def get_args():
     parser.add_argument('--direct_diffuse_infer_mode', type=str, default='disable',
                         choices=['disable', 'rgb', 'ycocg'],
                         help='direct diffuse inference mode: disable, or store diffuse in feature0 RGB as rgb/ycocg')
+    parser.add_argument('--feature_grid_configs', type=yaml.safe_load, default=None,
+                        help='YAML list of learned feature-grid configs')
 
     # ── Two-stage parsing: YAML defaults → CLI overrides ──
     # Stage 1: extract --config path only

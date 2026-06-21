@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 import torchvision.transforms.functional as TF
+from feature_grid import feature_tensor_to_int, int_to_feature_tensor
 
 
 # ---------------------------------------------------------------------------
@@ -203,30 +204,20 @@ def _traditional_baseline_resampled(
 
 
 # ---------------------------------------------------------------------------
-# FNTC hash-grid ASTC (highest level only)
+# FNTC feature-grid ASTC (highest level only)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def apply_astc_to_feature_grids(astc_model, roundtrip_rgba: Callable[[np.ndarray], np.ndarray]) -> None:
-    for grid_idx, hash_grid in enumerate(astc_model.hash_grids):
-        params = astc_model._get_grid_params_tensor(hash_grid)
-        qbits = int(astc_model.hash_grid_quantize_bits[grid_idx])
-        n_k = 2 ** qbits
-        min_q = -(n_k - 1) / 2 * (1.0 / n_k)
-        max_q = 0.5
-        n_levels = int(astc_model.hash_grid_n_levels[grid_idx])
-        base_res = int(astc_model.hash_grid_base_res[grid_idx])
-        n_fpl = int(astc_model.hash_grid_n_features_per_level[grid_idx])
-        max_res = base_res * (2 ** (n_levels - 1))
+    for grid_idx, feature_grid in enumerate(astc_model.feature_grids):
+        params = astc_model._get_grid_params_tensor(feature_grid)
+        spec = astc_model.feature_grid_specs[grid_idx]
+        qbits = int(spec.quantize_bits)
+        n_k = spec.quant_step_count
+        n_fpl = int(spec.n_features_per_level)
+        offset, level_count, max_res = spec.highest_level_slice()
 
-        offset = 0
-        for level in range(n_levels - 1):
-            level_res = base_res * (2 ** level)
-            offset += level_res * level_res * n_fpl
-        level_count = max_res * max_res * n_fpl
-
-        quant_int = torch.round((params - min_q) * n_k)
-        quant_int = torch.clamp(quant_int, min=0.0, max=float(n_k - 1)).to(torch.int64)
+        quant_int = feature_tensor_to_int(params, spec)
         level = quant_int[offset : offset + level_count].reshape(max_res, max_res, n_fpl).detach().cpu().numpy()
         recovered = level.astype(np.float32).copy()
 
@@ -258,9 +249,7 @@ def apply_astc_to_feature_grids(astc_model, roundtrip_rgba: Callable[[np.ndarray
                 _roundtrip_feature_channels(list(range(start, min(start + 4, n_fpl))))
 
         recovered_tensor = torch.from_numpy(recovered.reshape(-1)).to(params.device).float()
-        recovered_quant = recovered_tensor / float(n_k) + min_q
-        recovered_quant = torch.clamp(recovered_quant, min=min_q, max=max_q)
-        params.data[offset : offset + level_count] = recovered_quant
+        params.data[offset : offset + level_count] = int_to_feature_tensor(recovered_tensor, spec)
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +284,7 @@ def _render_model_lod0(model, texture_height: int, texture_width: int, num_lods:
     fc = cc.reshape(-1).to(device=device, dtype=torch.long)
     hwc[fr, fc, :] = y
     if getattr(model, "direct_diffuse_enabled", False) and hasattr(model, "render_direct_diffuse_lod"):
-        direct = model.render_direct_diffuse_lod(lod, H, W, resize_fn=_comparison_resize)
+        direct = model.render_direct_diffuse_lod(lod, H, W)
         hwc[:, :, :3] = direct.squeeze(0).permute(1, 2, 0).to(hwc.dtype)
     hwc = torch.nan_to_num(hwc, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     return hwc.permute(2, 0, 1)[None, ...]

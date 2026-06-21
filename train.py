@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 import datetime
 import argparse
-from typing import Tuple
+from typing import List, Optional, Tuple
 from torchmetrics.image import (
     LearnedPerceptualImagePatchSimilarity,
     StructuralSimilarityIndexMeasure,
@@ -14,7 +14,6 @@ from torchmetrics.image import (
 from tensorboardX import SummaryWriter
 import torchvision.transforms.functional as TF
 
-from torchtyping import TensorType
 import tinycudann as tcnn
 
 from configs import get_args
@@ -29,7 +28,7 @@ class Trainer:
 
     def __init__(self, params: argparse.Namespace, config_override: Config = None) -> None:
 
-        # init required variables, e.g. dataset, configs and models
+        # initialize required runtime fieldsvariables, e.g. dataset, configs and models
         if config_override is not None:
             configs = config_override
         else:
@@ -41,7 +40,7 @@ class Trainer:
         # Network output is fixed to 11 channels (aligned with diffuse->displacement); missing filled by dataset with 0
         configs.num_channels = model.num_channels
 
-        # init required 
+        # initialize required runtime fields
         self.device = configs.device
         self.batch_size = configs.batch_size
         self.max_iter = configs.max_iter
@@ -65,10 +64,10 @@ class Trainer:
         self.writer = SummaryWriter(log_dir=self.log_path)
         os.makedirs(self.log_path, exist_ok=True)
         os.makedirs(self.model_path, exist_ok=True)
-        os.makedirs(self.media_path, exist_ok=True)  
+        os.makedirs(self.media_path, exist_ok=True)
         if configs.load_iter != 0:
             self.infer_path = os.path.join(configs.load_dir, "infer")
-            os.makedirs(self.infer_path, exist_ok=True)  
+            os.makedirs(self.infer_path, exist_ok=True)
 
         # data config
         self.num_lods = dataset.num_lods
@@ -86,11 +85,11 @@ class Trainer:
         # visualization configs for eval/infer (data-driven, not hardcoded)
         self.vis_configs = dataset.get_vis_configs()
 
-        self.sample_probabilities = self.generate_probabilities()      
+        self.sample_probabilities = self.generate_probabilities()
 
         # losses
         self.L2_loss = torch.nn.MSELoss(reduction="none")
-        
+
         # metrics
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
         self.ssim = StructuralSimilarityIndexMeasure(return_full_image=True).to(self.device)
@@ -167,10 +166,10 @@ class Trainer:
             if self.quantize and curr_iter % self.eval_interval == 0:
                 self.writer.add_scalar("QAT/noise_mult", self.model._qat_noise_multiplier(), curr_iter)
 
-            # generate random indexs
+            # generate random sample indices
             ys = torch.randint(0, self.texture_height, [self.batch_size, 1]).to(self.device)
             xs = torch.randint(0, self.texture_width, [self.batch_size, 1]).to(self.device)
-            # care for the sample probabilty
+            # sample LODs with a coarse-to-fine prior
             # lods = torch.randint(0, self.num_lods, [self.batch_size, 1]).to(self.device)
             lods = self.sample_probabilities.multinomial(num_samples=self.batch_size, replacement=True)
             #lods = torch.zeros(lods.shape).to(self.device).to(torch.int32)
@@ -294,13 +293,13 @@ class Trainer:
 
 
                 # print(self.model.optimizer.param_groups[0]['lr'], self.model.optimizer.param_groups[1]['lr'])
-            
+
             if curr_iter > 0 and curr_iter % self.save_interval == 0:
                 self.model.save(curr_iter, self.model_path)
                 if self.enable_astc_compare and not _astc_already_ran:
                     self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path)
                 self._log_checkpoint_interval(curr_iter)
-            
+
             if curr_iter > 0 and curr_iter % 10000 == 0:
                 torch.cuda.empty_cache()
                 tcnn.free_temporary_memory()
@@ -315,11 +314,11 @@ class Trainer:
         tcnn.free_temporary_memory()
         torch.cuda.empty_cache()
 
-    def _backup_hash_grid_state(self):
-        return [{k: v.detach().clone() for k, v in g.state_dict().items()} for g in self.model.hash_grids]
+    def _backup_feature_grid_state(self):
+        return [{k: v.detach().clone() for k, v in g.state_dict().items()} for g in self.model.feature_grids]
 
-    def _restore_hash_grid_state(self, backups) -> None:
-        for g, bak in zip(self.model.hash_grids, backups):
+    def _restore_feature_grid_state(self, backups) -> None:
+        for g, bak in zip(self.model.feature_grids, backups):
             g.load_state_dict(bak)
 
     @staticmethod
@@ -368,88 +367,113 @@ class Trainer:
         scale = max_edge / float(edge)
         nh = max(1, int(round(h * scale)))
         nw = max(1, int(round(w * scale)))
-        pred_ds = F.interpolate(pred, size=(nh, nw), mode="area")
-        gt_ds = F.interpolate(gt, size=(nh, nw), mode="area")
-        return pred_ds, gt_ds
+        return (
+            F.interpolate(pred, size=(nh, nw), mode="area"),
+            F.interpolate(gt, size=(nh, nw), mode="area"),
+        )
+
+    def _lod_size(self, lod: int) -> Tuple[int, int]:
+        return self.texture_height // (2 ** lod), self.texture_width // (2 ** lod)
+
+    def _ensure_visual_dirs(self, root: str) -> None:
+        for vc in self.vis_configs:
+            os.makedirs(os.path.join(root, vc['display_name']), exist_ok=True)
+
+    def _canonical_gt_lod(self, lod: int, lod_height: int, lod_width: int) -> torch.Tensor:
+        gt_slice = self.dataset.lod_cache[lod, :lod_height, :lod_width, :]
+        gt_canonical = self.dataset.expand_to_canonical(
+            gt_slice.reshape(-1, gt_slice.shape[-1])
+        ).reshape(lod_height, lod_width, -1)
+        return gt_canonical.permute(2, 0, 1)[None, ...]
+
+    @torch.no_grad()
+    def _render_lod_pair(self, lod: int) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+        lod_height, lod_width = self._lod_size(lod)
+        pred_hwc = self._fill_predicted_lod(lod, lod_height, lod_width).clamp(0, 1)
+        pred = pred_hwc.permute(2, 0, 1)[None, ...]
+        gt = self._canonical_gt_lod(lod, lod_height, lod_width)
+        return pred, gt, lod_height, lod_width
+
+    def _metric_rgb_pair(self, pred: torch.Tensor, gt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        ms, me = self._get_metrics_slice()
+        pred_rgb = pred[:, ms:me, :, :]
+        pred_rgb = torch.nan_to_num(pred_rgb.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        gt_rgb = gt[:, ms:me, :, :]
+        return self._downsample_for_metrics(pred_rgb, gt_rgb)
+
+    def _compute_lod_metrics(
+        self,
+        pred: torch.Tensor,
+        gt: torch.Tensor,
+        lod_height: int,
+        lod_width: int,
+    ) -> Tuple[float, float, Optional[float]]:
+        pred_rgb, gt_rgb = self._metric_rgb_pair(pred, gt)
+        psnr_value = float(self.psnr(pred_rgb, gt_rgb).item())
+        ssim_value, _ = self.ssim(pred_rgb, gt_rgb)
+        ssim_value = float(ssim_value.item())
+        if lod_height >= 128 and lod_width >= 128:
+            return psnr_value, ssim_value, float(self.lpips(pred_rgb, gt_rgb).item())
+        return psnr_value, ssim_value, None
+
+    def _save_lod_visuals(self, pred: torch.Tensor, gt: torch.Tensor, output_root: str, filename: str) -> None:
+        save_image = torch.cat([pred, gt], dim=3).squeeze()
+        for vc in self.vis_configs:
+            s, e = vc['canonical_channel_slice']
+            tex_image = self._postprocess_for_vis(save_image[s:e, ...], vc['vis_mode'])
+            save_path = os.path.join(output_root, vc['display_name'], filename)
+            TF.to_pil_image(tex_image).save(save_path)
+
+    @staticmethod
+    def _mean_metric(values: List[float]) -> float:
+        return float(torch.tensor(values).mean().item()) if values else 0.0
 
     @torch.no_grad()
     def eval(self, curr_iter) -> float:
-        
-        psnr_list = []
-        ssim_list = []
-        lpips_list = []
-
-        # create output directories for each available texture type
-        for vc in self.vis_configs:
-            os.makedirs(os.path.join(self.media_path, vc['display_name']), exist_ok=True)
-
+        self._ensure_visual_dirs(self.media_path)
         self._cuda_trim_eval_mem(synchronize=True)
 
-        grid_backup = self._backup_hash_grid_state()
+        psnr_list: List[float] = []
+        ssim_list: List[float] = []
+        lpips_list: List[float] = []
+        should_save_visuals = curr_iter % self.save_interval == 0
+
+        feature_grid_backup = self._backup_feature_grid_state()
         was_training = self.model.training
         try:
             self.model.eval()
             self.model.simulate_quantize()
 
-            #for lod in range(self.num_lods - 4):
+            # Training evaluation intentionally checks LOD0 only to keep the loop responsive.
             for lod in [0]:
+                pred, gt, lod_height, lod_width = self._render_lod_pair(lod)
+                psnr_value, ssim_value, lpips_value = self._compute_lod_metrics(pred, gt, lod_height, lod_width)
 
-                lod_height = self.texture_height // (2 ** lod)
-                lod_width = self.texture_width // (2 ** lod)
+                psnr_list.append(psnr_value)
+                ssim_list.append(ssim_value)
+                self.writer.add_scalar(f'PSNR_LOD{lod}/train', psnr_value, curr_iter)
+                self.writer.add_scalar(f'SSIM_LOD{lod}/train', ssim_value, curr_iter)
+                if lpips_value is not None:
+                    lpips_list.append(lpips_value)
+                    self.writer.add_scalar(f'LPIPS_LOD{lod}/train', lpips_value, curr_iter)
 
-                predicted_image = self._fill_predicted_lod(lod, lod_height, lod_width)
-                predicted_image = torch.clamp(predicted_image, min=0, max=1)
-                gt_slice = self.dataset.lod_cache[lod, :lod_height, :lod_width, :]  # [H, W, num_channels]
-                gt_canonical = self.dataset.expand_to_canonical(gt_slice.reshape(-1, gt_slice.shape[-1])).reshape(lod_height, lod_width, -1)
-                gt_image = gt_canonical.permute(2, 0, 1)[None, ...]  # [1, 11, H, W]
-
-                predicted_image = predicted_image.permute(2, 0, 1)[None, ...]  # [1, 11, H, W]
-
-                ms, me = self._get_metrics_slice()
-                predicted_rgb = predicted_image[:, ms:me, :, :]
-                predicted_rgb = torch.nan_to_num(predicted_rgb.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0) # Fix NaN or Inf found in input tensor
-                gt_rgb = gt_image[:, ms:me, :, :]
-
-                predicted_rgb, gt_rgb = self._downsample_for_metrics(predicted_rgb, gt_rgb)
-
-                psnr_value = self.psnr(predicted_rgb, gt_rgb)
-                psnr_list.append(psnr_value.item())
-                self.writer.add_scalar(f'PSNR_LOD{int(lod)}/train', psnr_value.item(), curr_iter)
-
-                ssim_value, ssim_images = self.ssim(predicted_rgb, gt_rgb)
-                ssim_list.append(ssim_value.item())
-                self.writer.add_scalar(f'SSIM_LOD{int(lod)}/train', ssim_value.item(), curr_iter)
-
-                if lod_height >= 128 and lod_width >= 128:
-                    lpips_value = self.lpips(predicted_rgb, gt_rgb)
-                    lpips_list.append(lpips_value.item())
-                    self.writer.add_scalar(f'LPIPS_LOD{int(lod)}/train', lpips_value.item(), curr_iter)
-
-                if curr_iter % (self.save_interval) == 0:
-                    save_image = torch.cat([predicted_image, gt_image], dim=3).squeeze()
-
-                    for vc in self.vis_configs:
-                        s, e = vc['canonical_channel_slice']
-                        tex_image = save_image[s:e, ...]
-                        tex_image = self._postprocess_for_vis(tex_image, vc['vis_mode'])
-                        save_path = os.path.join(self.media_path, vc['display_name'], f"{curr_iter}_{int(lod)}.png")
-                        TF.to_pil_image(tex_image).save(save_path)
+                if should_save_visuals:
+                    self._save_lod_visuals(pred, gt, self.media_path, f"{curr_iter}_{lod}.png")
 
         finally:
-            self._restore_hash_grid_state(grid_backup)
+            self._restore_feature_grid_state(feature_grid_backup)
             self.model.train(was_training)
             self._cuda_trim_eval_mem(synchronize=False)
 
-        psnr_aver = torch.tensor(psnr_list).mean()
-        ssim_aver = torch.tensor(ssim_list).mean()
-        lpips_aver = torch.tensor(lpips_list).mean()
-        self.writer.add_scalar('PSNR/train', psnr_aver.item(), curr_iter)
-        self.writer.add_scalar('SSIM/train', ssim_aver.item(), curr_iter)
-        self.writer.add_scalar('LPIPS/train', lpips_aver.item(), curr_iter)
-    
-        print(f"Iter:{curr_iter}, PSNR:{psnr_aver.item():.4f}, SSIM:{ssim_aver.item():.4f}, LPIPS:{lpips_aver.item():.4f}")
+        psnr_avg = self._mean_metric(psnr_list)
+        ssim_avg = self._mean_metric(ssim_list)
+        lpips_avg = self._mean_metric(lpips_list)
+        self.writer.add_scalar('PSNR/train', psnr_avg, curr_iter)
+        self.writer.add_scalar('SSIM/train', ssim_avg, curr_iter)
+        self.writer.add_scalar('LPIPS/train', lpips_avg, curr_iter)
 
-        return psnr_aver.item()
+        print(f"Iter:{curr_iter}, PSNR:{psnr_avg:.4f}, SSIM:{ssim_avg:.4f}, LPIPS:{lpips_avg:.4f}")
+        return psnr_avg
 
     def _postprocess_for_vis(self, image: torch.Tensor, vis_mode: str) -> torch.Tensor:
         """Apply visualization post-processing based on vis_mode.
@@ -478,71 +502,48 @@ class Trainer:
         first = self.dataset.available_textures[0]
         return canon[first]
 
+    def _infer_lods(self) -> range:
+        # Skip the smallest four mip levels during inference, but always keep
+        # LOD0 so tiny datasets still produce an output and metrics file.
+        return range(max(1, self.num_lods - 4))
+
     @torch.no_grad()
     def infer(self) -> None:
+        self._ensure_visual_dirs(self.infer_path)
 
-        psnr_list = []
-        ssim_list = []
-        lpips_list = []
+        psnr_list: List[float] = []
+        ssim_list: List[float] = []
+        lpips_list: List[float] = []
+        metric_lines = ["LOD PSNR SSIM LPIPS\n"]
 
-        # create output directories for each available texture type
-        for vc in self.vis_configs:
-            os.makedirs(os.path.join(self.infer_path, vc['display_name']), exist_ok=True)
+        was_training = self.model.training
+        try:
+            self.model.eval()
+            for lod in self._infer_lods():
+                pred, gt, lod_height, lod_width = self._render_lod_pair(lod)
+                psnr_value, ssim_value, lpips_value = self._compute_lod_metrics(pred, gt, lod_height, lod_width)
 
-        metrics = f"LOD PSNR SSIM LPIPS\n"
+                psnr_list.append(psnr_value)
+                ssim_list.append(ssim_value)
+                if lpips_value is not None:
+                    lpips_list.append(lpips_value)
+                lpips_for_line = 0.0 if lpips_value is None else lpips_value
 
-        for lod in range(self.num_lods - 4):
+                self._save_lod_visuals(pred, gt, self.infer_path, f"LOD_{lod}.png")
+                metric_lines.append(f"LOD_{lod} {psnr_value:.4f} {ssim_value:.4f} {lpips_for_line:.4f}\n")
+        finally:
+            self.model.train(was_training)
 
-            lod_height = self.texture_height // (2 ** lod)
-            lod_width = self.texture_width // (2 ** lod)
-
-            predicted_image = self._fill_predicted_lod(lod, lod_height, lod_width)
-            predicted_image = torch.clamp(predicted_image, min=0, max=1)
-            gt_slice = self.dataset.lod_cache[lod, :lod_height, :lod_width, :]
-            gt_canonical = self.dataset.expand_to_canonical(gt_slice.reshape(-1, gt_slice.shape[-1])).reshape(lod_height, lod_width, -1)
-            gt_image = gt_canonical.permute(2, 0, 1)[None, ...]  # [1, 11, H, W]
-
-            predicted_image = predicted_image.permute(2, 0, 1)[None, ...]  # [1, 11, H, W]
-
-            ms, me = self._get_metrics_slice()
-            predicted_rgb = predicted_image[:, ms:me, :, :]
-            predicted_rgb = torch.nan_to_num(predicted_rgb.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0) # Fix NaN or Inf found in input tensor
-            gt_rgb = gt_image[:, ms:me, :, :]
-
-            predicted_rgb, gt_rgb = self._downsample_for_metrics(predicted_rgb, gt_rgb)
-                        
-            psnr_value = self.psnr(predicted_rgb, gt_rgb)
-            psnr_list.append(psnr_value.item())
-
-            ssim_value, ssim_images = self.ssim(predicted_rgb, gt_rgb)
-            ssim_list.append(ssim_value.item())
-
-            lpips_value = 0
-            if lod_height >= 128 and lod_width >= 128:
-                lpips_value = self.lpips(predicted_rgb, gt_rgb)
-                lpips_list.append(lpips_value.item())
-
-            save_image = torch.cat([predicted_image, gt_image], dim=3).squeeze()
-
-            for vc in self.vis_configs:
-                s, e = vc['canonical_channel_slice']
-                tex_image = save_image[s:e, ...]
-                tex_image = self._postprocess_for_vis(tex_image, vc['vis_mode'])
-                save_path = os.path.join(self.infer_path, vc['display_name'], f"LOD_{int(lod)}.png")
-                TF.to_pil_image(tex_image).save(save_path)
-
-            metrics += f"LOD_{int(lod)} {psnr_value:.4f} {ssim_value:.4f} {lpips_value:.4f}\n"
-        
-        psnr_aver = torch.tensor(psnr_list).mean()
-        ssim_aver = torch.tensor(ssim_list).mean()
-        lpips_aver = torch.tensor(lpips_list).mean()
-        metrics += f"AVER {psnr_aver} {ssim_aver} {lpips_aver}\n"
-        with open(os.path.join(self.infer_path, "metrics.txt"), "w+") as file:
-            file.writelines(metrics)
+        psnr_avg = self._mean_metric(psnr_list)
+        ssim_avg = self._mean_metric(ssim_list)
+        lpips_avg = self._mean_metric(lpips_list)
+        metric_lines.append(f"AVER {psnr_avg} {ssim_avg} {lpips_avg}\n")
+        with open(os.path.join(self.infer_path, "metrics.txt"), "w+", encoding="utf-8") as file:
+            file.writelines(metric_lines)
 
         if self.enable_astc_compare:
             self.run_astc_comparison(output_root=self.infer_path)
-    
+
     @torch.no_grad()
     def run_astc_comparison(self, curr_iter: int = None, output_root: str = None) -> dict:
         if output_root is None:
@@ -566,15 +567,15 @@ class Trainer:
         )
 
     @torch.no_grad()
-    def generate_probabilities(self) -> TensorType["num_lods"]:
-        
+    def generate_probabilities(self) -> torch.Tensor:
+
         probabilities = []
 
-        # here we need to generate a sample posibility
+        # Generate a coarse-to-fine LOD sampling distribution.
         current_prob = 1.0
         for i in range(0, self.num_lods):
             prob = current_prob / 4.0  # original is current_prob / 2**2
-            probabilities.append(max(prob, 0.05))  # min probability is greater than 5%
+            probabilities.append(max(prob, 0.05))  # keep every LOD sampleable
             current_prob = prob
         probabilities = torch.tensor(probabilities).to(self.device)
         probabilities /= probabilities.sum()

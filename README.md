@@ -6,22 +6,22 @@ This project is used to train Neural Texture (NTC) models. The code is implement
 
 Neural Texture (NTC) is a network-based method for texture representation and compression. Unlike traditional formats such as PNG, JPEG, or ASTC, Neural Texture combines a **feature grid** with a small **MLP (multi-layer perceptron)** to compactly store and reconstruct high-resolution texture information, while still supporting random access to texels. Its advantages include:
 
-- **High compression ratio**: preserves more detail at equal or lower storage cost.  
-- **Scalability**: supports multi-resolution, LODs, and joint representation with material parameters.  
-- **Versatility**: applicable not only to albedo maps but also normal maps, roughness maps, and other material textures.  
+- **High compression ratio**: preserves more detail at equal or lower storage cost.
+- **Scalability**: supports multi-resolution, LODs, and joint representation with material parameters.
+- **Versatility**: applicable not only to albedo maps but also normal maps, roughness maps, and other material textures.
 
 ### Differences from NVIDIA NTC SDK
 
 In February 2025, NVIDIA open-sourced the [RTXNTC SDK](https://github.com/NVIDIA-RTX/Rtxntc), providing official support for Neural Texture. However, this project differs from RTXNTC in several ways:
 
-- **NTC SDK**  
-  - Requires specialized GPU primitives such as **CoopVec** and **CoopMat** to accelerate inference.  
-  - Still faces compatibility issues in game engine integration.  
+- **NTC SDK**
+  - Requires specialized GPU primitives such as **CoopVec** and **CoopMat** to accelerate inference.
+  - Requires engine-side integration work for deployment.
 
-- **This project**  
-  - Does **not** rely on CoopVec or CoopMat. Instead, it is implemented directly with PyTorch and tiny-cuda-nn, making it simpler and easier to understand.  
-  - Provides **[full UE5 plugin integration - branch 5.5.1-FNTC](https://github.com/JackFishxxx/UnrealEngine/tree/5.5.1-FNTC) **: Neural Textures can be imported as custom resources (feature grids as R8G8B8A8 DDS textures and network parameters in `network_data.npz`) and directly sampled in the material system.  
-  - Supports the entire pipeline of training, quantization, and export, suitable for both research and production use.  
+- **This project**
+  - Does **not** rely on CoopVec or CoopMat. Instead, it is implemented directly with PyTorch and tiny-cuda-nn, making it simpler and easier to understand.
+  - Provides **[full UE5 plugin integration - branch 5.5.1-FNTC](https://github.com/JackFishxxx/UnrealEngine/tree/5.5.1-FNTC) **: Neural Textures can be imported as custom resources (feature grids as R8G8B8A8 DDS textures and network parameters in `network_data.npz`) and directly sampled in the material system.
+  - Supports the entire pipeline of training, quantization, and export, suitable for both research and production use.
 
 ---
 
@@ -40,14 +40,14 @@ This project is implemented in Python. Please install Python first (we recommend
 
 Neural Texture training and inference itself does not strictly require special hardware, but tiny-cuda-nn is used for acceleration, which requires an NVIDIA GPU. Recommended requirements:
 
-- An NVIDIA GPU (Tensor Cores improve performance if available).  
-- A C++14-capable compiler. Recommended and tested:  
-  - **Windows**: Visual Studio 2019 or 2022  
-  - **Linux**: GCC/G++ 8 or higher  
-- A recent CUDA version. Recommended and tested:  
-  - **Windows**: CUDA 11.5 or higher  
-  - **Linux**: CUDA 10.2 or higher  
-- CMake v3.21 or higher.  
+- An NVIDIA GPU (Tensor Cores improve performance if available).
+- A C++14-capable compiler. Recommended and tested:
+  - **Windows**: Visual Studio 2019 or 2022
+  - **Linux**: GCC/G++ 8 or higher
+- A recent CUDA version. Recommended and tested:
+  - **Windows**: CUDA 11.5 or higher
+  - **Linux**: CUDA 10.2 or higher
+- CMake v3.21 or higher.
 
 Additionally, this project can theoretically be run on Linux for large-scale offline texture compression. The resulting compressed Neural Texture files can then be imported into UE5 for use.
 
@@ -258,9 +258,9 @@ The feature grid supports a **wrap boundary constraint**: during training, left/
 
 When saving a model, feature grids are exported as **DDS files (R8G8B8A8, non-SRGB)** for direct loading in UE5 and other game engines. Network weights are saved as `.npz` files.
 
-### Heterogeneous Multi-Hash Grid
+### Heterogeneous Multi-Feature Grid
 
-The model supports **heterogeneous multi-hash grids**, where each grid can be independently configured in the `hash_grid_configs` field of `configs.py`:
+The model supports **heterogeneous feature grids** through the `feature_grid_configs` config field:
 
 | Field | Description |
 |-------|-------------|

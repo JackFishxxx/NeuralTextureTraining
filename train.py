@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 import datetime
 import argparse
+import json
 from typing import List, Optional, Tuple
 from torchmetrics.image import (
     LearnedPerceptualImagePatchSimilarity,
@@ -22,7 +23,6 @@ from dataset import TextureDataset
 from normal_encoding import decode_normal, normal_angular_loss, normal_angular_psnr
 from configs import Config
 from Comparison_ASTC import ASTCCodec, ASTCENC_DEFAULT_PATH, run_astc_comparison_pipeline
-from astc_residual_model import ASTCResidualNoiseModel
 
 
 class Trainer:
@@ -67,6 +67,7 @@ class Trainer:
         os.makedirs(self.log_path, exist_ok=True)
         os.makedirs(self.model_path, exist_ok=True)
         os.makedirs(self.media_path, exist_ok=True)
+        self._write_resolved_config(configs)
         if configs.load_iter != 0:
             self.infer_path = os.path.join(configs.load_dir, "infer")
             os.makedirs(self.infer_path, exist_ok=True)
@@ -125,29 +126,6 @@ class Trainer:
         )
         if self.enable_astc_compare:
             self.astc_codec.ensure_executable()
-
-        # ASTC residual-aware robust training (train-only; inference unchanged)
-        self.astc_aware_train = bool(getattr(configs, "astc_aware_train", False))
-        self.astc_curriculum_enable = bool(getattr(configs, "astc_curriculum_enable", False))
-        self.consistency_loss_enable = bool(getattr(configs, "consistency_loss_enable", False))
-        self.consistency_lambda = float(getattr(configs, "consistency_lambda", 0.0))
-        self.consistency_start_ratio = float(getattr(configs, "consistency_start_ratio", 0.45))
-        self.consistency_end_ratio = float(getattr(configs, "consistency_end_ratio", 1.0))
-        self.consistency_loss_type = str(getattr(configs, "consistency_loss_type", "l1")).lower()
-
-        self.sensitive_mask_enable = bool(getattr(configs, "sensitive_mask_enable", False))
-        self.sensitive_mask_percentile = float(getattr(configs, "sensitive_mask_percentile", 0.85))
-        self.sensitive_mask_detach = bool(getattr(configs, "sensitive_mask_detach", True))
-
-        self.astc_noise_model = ASTCResidualNoiseModel(
-            block_size=int(getattr(configs, "astc_block_size", 6)),
-            noise_std=float(getattr(configs, "astc_noise_std", 0.02)),
-            channel_corr=float(getattr(configs, "astc_noise_channel_corr", 0.5)),
-            noise_prob=float(getattr(configs, "astc_noise_prob", 0.0)),
-            warmup_ratio=float(getattr(configs, "astc_curriculum_warmup_ratio", 0.2)),
-            peak_ratio=float(getattr(configs, "astc_curriculum_peak_ratio", 0.7)),
-            max_iter=int(self.max_iter),
-        ).to(self.device)
 
     def _log_checkpoint_interval(self, curr_iter: int) -> None:
         now = datetime.datetime.now()
@@ -273,43 +251,10 @@ class Trainer:
             loss_weights = torch.tensor(self.output_loss_weights, device=self.device, dtype=torch.float32)
             base_loss = self._compute_reconstruction_loss(gt_texture, predict_texture, loss_weights, curr_iter)
 
-            # ASTC-aware robust branch (noise-injected output + consistency)
-            robust_loss = torch.tensor(0.0, device=self.device)
-            consistency_loss = torch.tensor(0.0, device=self.device)
             total_loss = base_loss
-
-            if self.astc_aware_train:
-                noisy_input, applied = self.astc_noise_model.perturb_uvlod_input(batch_input, curr_iter, enable=self.astc_curriculum_enable)
-                if applied:
-                    predict_noisy = self.model(noisy_input)
-                    robust_loss = self._compute_reconstruction_loss(gt_texture, predict_noisy, loss_weights, None)
-                    total_loss = 0.5 * base_loss + 0.5 * robust_loss
-
-                    prog = float(curr_iter) / max(1.0, float(self.max_iter - 1))
-                    in_consistency = self.consistency_start_ratio <= prog <= self.consistency_end_ratio
-                    if self.consistency_loss_enable and in_consistency and self.consistency_lambda > 0.0:
-                        diff = predict_texture - predict_noisy
-                        if self.consistency_loss_type == "mse":
-                            c_map = diff.pow(2)
-                        else:
-                            c_map = diff.abs()
-
-                        if self.sensitive_mask_enable:
-                            sens_mask = self.astc_noise_model.build_sensitive_mask(
-                                gt_texture,
-                                percentile=self.sensitive_mask_percentile,
-                                detach_mask=self.sensitive_mask_detach,
-                            )
-                            c_map = c_map * sens_mask
-
-                        consistency_loss = c_map.mean() * self.consistency_lambda
-                        total_loss = total_loss + consistency_loss
 
             self.writer.add_scalar('Loss/train', total_loss.item(), curr_iter)
             self.writer.add_scalar('Loss/base', base_loss.item(), curr_iter)
-            if self.astc_aware_train:
-                self.writer.add_scalar('Loss/robust', robust_loss.item(), curr_iter)
-                self.writer.add_scalar('Loss/consistency', consistency_loss.item(), curr_iter)
 
             # optimize
             total_loss.backward()
@@ -664,7 +609,25 @@ class Trainer:
             eval_weights=self.eval_weights,
         )
 
-    @torch.no_grad()
+    def _write_resolved_config(self, configs: Config) -> None:
+        """Persist scalar/list/dict config values so log analyzers can recover run settings."""
+        out = {}
+        for key, value in vars(configs).items():
+            if key.startswith("_"):
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                out[key] = value
+            elif isinstance(value, (list, tuple, dict)):
+                try:
+                    json.dumps(value)
+                    out[key] = value
+                except TypeError:
+                    out[key] = str(value)
+        path = os.path.join(self.save_path, "resolved_config.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2, sort_keys=True)
+        print(f"resolved_config: {path}")
+
     def generate_probabilities(self) -> torch.Tensor:
 
         probabilities = []

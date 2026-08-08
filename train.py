@@ -37,6 +37,8 @@ class Trainer:
         dataset = TextureDataset(configs)
         print(f"[NormalEncoding] mode={dataset.normal_encoding}")
         configs.num_lods = dataset.num_lods
+        # Real texture edge so pos_encoding_tile_size (texels) maps correctly to UV space.
+        configs.pos_encoding_reference_edge = max(dataset.texture_height, dataset.texture_width)
         model = TCNNModel(configs)
         model.configure_direct_diffuse_from_dataset(dataset)
         # Network output is fixed to 11 channels (aligned with diffuse->displacement); missing filled by dataset with 0

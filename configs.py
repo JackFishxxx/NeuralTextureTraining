@@ -109,7 +109,9 @@ class Config():
         ### ---------- model configs ---------- ###
         self.num_channels = 0
         self.num_lods = 1
-        self.n_frequencies = 0
+        self.n_frequencies = int(getattr(params, "n_frequencies", 0))
+        self.pos_encoding_tile_size = int(getattr(params, "pos_encoding_tile_size", 32))
+        self.pos_encoding_reference_edge = int(getattr(params, "pos_encoding_reference_edge", 0))
         self.n_neurons = 16
         self.n_hidden_layers = 0
         raw_output_activation = getattr(params, "output_activation", "hard_swish")
@@ -347,6 +349,14 @@ def get_args():
                         help='Traditional ref_astc_* baseline: square edge length (H=W) before astcenc; omit for LOD0 size')
 
     ### ---------- algorithm configs ---------- ###
+    parser.add_argument('--n_frequencies', type=int, default=0,
+                        help='tiled positional encoding frequency count (0 = disabled); N -> 4*N dims')
+    parser.add_argument('--pos_encoding_tile_size', type=int, default=8,
+                        help='tile edge in texels for the tiled positional encoding '
+                             '(fundamental period; the encoding repeats every tile)')
+    parser.add_argument('--pos_encoding_reference_edge', type=int, default=0,
+                        help='reference texture edge in texels used to convert tile_size texels to UV; '
+                             '0 = auto: feature-grid max resolution (train.py sets the real texture edge)')
     parser.add_argument('--normal_encoding', type=str, default='xyz', choices=['xyz', 'xy', 'hemi_oct'],
                         help='normal target encoding: xyz=3 channels, xy/hemi_oct=2 channels')
     parser.add_argument('--direct_diffuse_infer_mode', type=str, default='disable',

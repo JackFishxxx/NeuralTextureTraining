@@ -29,6 +29,44 @@ def canonical_num_channels(normal_encoding: str = "xyz") -> int:
     return sum(canonical_channel_counts(normal_encoding))
 
 
+class TiledPositionalEncoding(torch.nn.Module):
+    """NeRF-style tiled sin/cos positional encoding with a configurable tile size.
+
+    Frequencies are integer harmonics of the fundamental 2*pi / tile_uv, i.e.
+    omega_k = 2*pi * 2^k / tile_uv. Every component therefore completes an integer
+    number of cycles per tile, so the whole encoding is exactly periodic with the
+    tile and tiles seamlessly (C^inf across tile borders).
+
+    Output dims = 2 (u/v) * 2 (sin/cos) * n_frequencies = 4 * n_frequencies.
+    n_frequencies = 0 -> zero output dims (encoding disabled).
+    """
+
+    def __init__(self, n_frequencies: int, tile_uv: float, device: str = "cuda"):
+        super().__init__()
+        self.n_frequencies = int(n_frequencies)
+        self.tile_uv = float(max(tile_uv, 1e-9))
+        n = int(n_frequencies)
+        if n > 0:
+            freqs = (2.0 * math.pi / self.tile_uv) * (
+                2.0 ** torch.arange(n, dtype=torch.float32, device=device)
+            )
+        else:
+            freqs = torch.zeros(0, dtype=torch.float32, device=device)
+        # Non-persistent: deterministic from config, so old checkpoints still load.
+        self.register_buffer("freqs", freqs, persistent=False)
+        self.n_output_dims = 4 * self.n_frequencies
+
+    def forward(self, uv: torch.Tensor) -> torch.Tensor:
+        if self.n_frequencies == 0:
+            return uv.new_zeros(uv.shape[0], 0)
+        f = self.freqs  # [N]
+        su = torch.sin(uv[:, 0:1] * f)  # [B, 1] x [N] -> [B, N]
+        cu = torch.cos(uv[:, 0:1] * f)
+        sv = torch.sin(uv[:, 1:2] * f)
+        cv = torch.cos(uv[:, 1:2] * f)
+        return torch.cat([su, cu, sv, cv], dim=1)  # [B, 4N]
+
+
 class TCNNModel(torch.nn.Module):
 
     def __init__(self, config: Config):
@@ -90,14 +128,19 @@ class TCNNModel(torch.nn.Module):
 
     def init_model(self, config: Config) -> None:
 
-        triangle_wave_config = {
-            "n_dims_to_encode": 2,
-            "otype": "TriangleWave",
-            "n_frequencies": config.n_frequencies
-        }
-        self.triangle_wave = tcnn.Encoding(
-            n_input_dims=2,
-            encoding_config=triangle_wave_config
+        # Tiled positional encoding with configurable tile size (texels).
+        # Reference edge: texture max edge when set by the trainer (train.py),
+        # otherwise the feature-grid max resolution.
+        reference_edge = int(getattr(config, "pos_encoding_reference_edge", 0)) or max(
+            int(g.get("max_resolution", 1024)) for g in config.feature_grid_configs
+        )
+        tile_size = max(1, int(getattr(config, "pos_encoding_tile_size", 8)))
+        tile_uv = float(tile_size) / float(max(1, reference_edge))
+        self.pos_encoding_tile_uv = tile_uv
+        self.positional_encoding = TiledPositionalEncoding(
+            n_frequencies=config.n_frequencies,
+            tile_uv=tile_uv,
+            device=self.device,
         )
 
         # how many lods to sample per query
@@ -162,7 +205,7 @@ class TCNNModel(torch.nn.Module):
         if self.direct_diffuse_enabled:
             if not self.feature_grid_n_features_per_level or self.feature_grid_n_features_per_level[0] < 3:
                 raise ValueError("direct_diffuse_infer_mode requires feature grid 0 to have at least 3 channels")
-        n_input_dims = config.n_frequencies * 2 + total_grid_features + 1
+        n_input_dims = self.positional_encoding.n_output_dims + total_grid_features + 1
         print(f"total_grid_features={total_grid_features}, n_input_dims={n_input_dims}")
         self.network = tcnn.Network(
             n_input_dims=n_input_dims,
@@ -375,8 +418,7 @@ class TCNNModel(torch.nn.Module):
         num_sampled_lods = self.num_sampled_lods
         mips = lod_encodings * (self.num_lods - num_sampled_lods)
 
-        positional_encodings = self.triangle_wave(uvs)
-        # positional_encodings = self.triangle_wave(xys)
+        positional_encodings = self.positional_encoding(uvs)
 
         # get learned feature grid values
         features = []

@@ -14,3 +14,7 @@ qat_noise_warmup_frac: 0.1
 output_activation: "hard_swish"
 direct_diffuse_infer_mode: "rgb"  # disable | rgb | ycocg
 normal_encoding: "xy"  # xyz | xy | hemi_oct
+
+# ---------- tiled positional encoding configs ----------
+n_frequencies: 0
+pos_encoding_tile_size: 32

@@ -52,7 +52,8 @@ def _ref_astc_hw_from_side(side: Optional[int], base_h: int, base_w: int) -> Tup
         return base_h, base_w
     if side <= 0:
         raise ValueError(f"ref_astc_resolution must be a positive int (square edge), got {side}")
-    return side, side
+    scale = float(side) / float(max(base_h, base_w))
+    return max(1, int(round(base_h * scale))), max(1, int(round(base_w * scale)))
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +130,9 @@ def channels_to_rgba_u8(image_chw: torch.Tensor) -> np.ndarray:
     image_np = image_chw.detach().cpu().numpy()
     image_np = np.clip(np.round(image_np * 255.0), 0, 255).astype(np.uint8)
     c, h, w = image_np.shape
-    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    # Use opaque alpha for partially populated RGBA groups. This avoids making
+    # the ASTC endpoint fit depend on an artificial transparent channel.
+    rgba = np.full((h, w, 4), 255, dtype=np.uint8)
     for idx in range(min(4, c)):
         rgba[:, :, idx] = image_np[idx, :, :]
     return rgba
@@ -159,7 +162,7 @@ def build_traditional_astc_prediction(
     packed_types = ("roughness", "occlusion", "metallic", "displacement")
     if any(t in available_set for t in packed_types):
         h, w = gt_image.shape[-2], gt_image.shape[-1]
-        packed = np.zeros((h, w, 4), dtype=np.uint8)
+        packed = np.full((h, w, 4), 255, dtype=np.uint8)
         for channel_idx, tex_type in enumerate(packed_types):
             if tex_type not in available_set:
                 continue
@@ -204,6 +207,28 @@ def _traditional_baseline_resampled(
     return out
 
 
+@torch.no_grad()
+def _astc_roundtrip_superres_base_lod0(dataset, roundtrip_rgba, base_resolution: int) -> torch.Tensor:
+    """Compress the reused low-resolution source mip before upsampling it."""
+    h0, w0 = dataset.texture_height, dataset.texture_width
+    ratio = max(h0, w0) / float(max(1, base_resolution))
+    source_lod_offset = max(0, int(round(math.log2(ratio)))) if ratio > 1.0 else 0
+    source_lod = min(source_lod_offset, dataset.num_lods - 1)
+    h, w = h0 // (2 ** source_lod), w0 // (2 ** source_lod)
+    source = dataset.lod_cache[source_lod, :h, :w, :]
+    source = dataset.expand_to_canonical(source.reshape(-1, source.shape[-1]))
+    source = source.reshape(h, w, -1).permute(2, 0, 1)[None, ...]
+    compressed = build_traditional_astc_prediction(
+        source,
+        dataset.canonical_channel_slices,
+        dataset.available_textures,
+        roundtrip_rgba,
+    )
+    if compressed.shape[-2:] != (h0, w0):
+        compressed = F.interpolate(compressed, size=(h0, w0), mode="bilinear", align_corners=False)
+    return compressed.clamp(0.0, 1.0)
+
+
 # ---------------------------------------------------------------------------
 # FNTC feature-grid ASTC (highest level only)
 # ---------------------------------------------------------------------------
@@ -223,7 +248,7 @@ def apply_astc_to_feature_grids(astc_model, roundtrip_rgba: Callable[[np.ndarray
         recovered = level.astype(np.float32).copy()
 
         def _roundtrip_feature_channels(channel_indices):
-            rgba = np.zeros((max_res, max_res, 4), dtype=np.uint8)
+            rgba = np.full((max_res, max_res, 4), 255, dtype=np.uint8)
             for rgba_c, feature_c in enumerate(channel_indices[:4]):
                 rgba[:, :, rgba_c] = np.clip(
                     np.round(level[:, :, feature_c].astype(np.float32) * (255.0 / float(n_k - 1))),
@@ -269,7 +294,8 @@ def _render_gt_lod0(dataset, texture_height: int, texture_width: int) -> torch.T
 
 
 @torch.no_grad()
-def _render_model_lod0(model, dataset, texture_height: int, texture_width: int, num_lods: int, device: str) -> torch.Tensor:
+def _render_model_lod0(model, dataset, texture_height: int, texture_width: int, num_lods: int, device: str,
+                       superres_base_override: Optional[torch.Tensor] = None) -> torch.Tensor:
     """LOD0 plane; UV / row-col scatter aligned with train.py (tiled path uses the same math)."""
     lod = 0
     H = texture_height >> lod
@@ -281,8 +307,12 @@ def _render_model_lod0(model, dataset, texture_height: int, texture_width: int, 
     ).to(device).reshape(-1, 3)
     base = None
     if getattr(model, "super_resolution_enable", False):
-        base_data = dataset.superres_base_cache[lod, :H, :W, :].reshape(-1, dataset.num_channels)
-        base = dataset.expand_to_canonical(base_data).float()
+        if superres_base_override is None:
+            base_data = dataset.superres_base_cache[lod, :H, :W, :].reshape(-1, dataset.num_channels)
+            base = dataset.expand_to_canonical(base_data).float()
+        else:
+            base_chw = superres_base_override[0] if superres_base_override.ndim == 4 else superres_base_override
+            base = base_chw.permute(1, 2, 0).reshape(-1, base_chw.shape[0]).float()
         y = (base + model(torch.cat([inp, base], dim=1)).float()).clamp(0.0, 1.0)
     else:
         y = model(inp).float()
@@ -344,7 +374,15 @@ def _compute_metrics_from_refs(
         elif c == 3:
             lpips_pred, lpips_gt = pred_ref, gt_ref
         else:
-            lpips_pred, lpips_gt = pred_ref[:, :3, :, :], gt_ref[:, :3, :, :]
+            # LPIPS accepts RGB only. Evaluate each scalar material channel
+            # independently instead of silently dropping displacement from ROMD.
+            values = []
+            for channel_idx in range(c):
+                p = pred_ref[:, channel_idx:channel_idx + 1].repeat(1, 3, 1, 1)
+                g = gt_ref[:, channel_idx:channel_idx + 1].repeat(1, 3, 1, 1)
+                values.append(float(lpips_metric(p.float(), g.float()).item()))
+            lpips_value = float(np.mean(values)) if values else 0.0
+            return psnr_value, ssim_value, lpips_value
         lpips_value = float(lpips_metric(lpips_pred.float(), lpips_gt.float()).item())
         if not math.isfinite(lpips_value):
             lpips_value = 0.0
@@ -719,8 +757,16 @@ def run_astc_comparison_pipeline(
     astc_grid_model = copy.deepcopy(quant_model)
     apply_astc_to_feature_grids(astc_grid_model, astc_codec.roundtrip_rgba)
     astc_grid_model.eval()
+    astc_base = None
+    if getattr(astc_grid_model, "super_resolution_enable", False):
+        astc_base = _astc_roundtrip_superres_base_lod0(
+            dataset,
+            astc_codec.roundtrip_rgba,
+            int(getattr(dataset, "super_resolution_base_resolution", dataset.superres_input_max_edge)),
+        )
     pred_fntc_grid_astc = _render_model_lod0(
-        astc_grid_model, dataset, texture_height, texture_width, num_lods, device
+        astc_grid_model, dataset, texture_height, texture_width, num_lods, device,
+        superres_base_override=astc_base,
     )
 
     pred_traditional_astc = _traditional_baseline_resampled(

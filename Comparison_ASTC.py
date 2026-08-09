@@ -269,7 +269,7 @@ def _render_gt_lod0(dataset, texture_height: int, texture_width: int) -> torch.T
 
 
 @torch.no_grad()
-def _render_model_lod0(model, texture_height: int, texture_width: int, num_lods: int, device: str) -> torch.Tensor:
+def _render_model_lod0(model, dataset, texture_height: int, texture_width: int, num_lods: int, device: str) -> torch.Tensor:
     """LOD0 plane; UV / row-col scatter aligned with train.py (tiled path uses the same math)."""
     lod = 0
     H = texture_height >> lod
@@ -279,7 +279,13 @@ def _render_model_lod0(model, texture_height: int, texture_width: int, num_lods:
     inp = torch.stack(
         ((cc + 0.5) / W, (rr + 0.5) / H, torch.full_like(rr, lod_f)), dim=-1
     ).to(device).reshape(-1, 3)
-    y = model(inp).float()
+    base = None
+    if getattr(model, "super_resolution_enable", False):
+        base_data = dataset.superres_base_cache[lod, :H, :W, :].reshape(-1, dataset.num_channels)
+        base = dataset.expand_to_canonical(base_data).float()
+        y = (base + model(torch.cat([inp, base], dim=1)).float()).clamp(0.0, 1.0)
+    else:
+        y = model(inp).float()
     hwc = torch.empty(H, W, y.shape[-1], device=device, dtype=torch.float32)
     fr = rr.reshape(-1).to(device=device, dtype=torch.long)
     fc = cc.reshape(-1).to(device=device, dtype=torch.long)
@@ -708,12 +714,14 @@ def run_astc_comparison_pipeline(
     quant_model = copy.deepcopy(model)
     quant_model.simulate_quantize()
     quant_model.eval()
-    pred_fntc = _render_model_lod0(quant_model, texture_height, texture_width, num_lods, device)
+    pred_fntc = _render_model_lod0(quant_model, dataset, texture_height, texture_width, num_lods, device)
 
     astc_grid_model = copy.deepcopy(quant_model)
     apply_astc_to_feature_grids(astc_grid_model, astc_codec.roundtrip_rgba)
     astc_grid_model.eval()
-    pred_fntc_grid_astc = _render_model_lod0(astc_grid_model, texture_height, texture_width, num_lods, device)
+    pred_fntc_grid_astc = _render_model_lod0(
+        astc_grid_model, dataset, texture_height, texture_width, num_lods, device
+    )
 
     pred_traditional_astc = _traditional_baseline_resampled(
         gt_lod0=gt_image,
@@ -734,7 +742,6 @@ def run_astc_comparison_pipeline(
             pred_traditional_astc, gt_image, dataset, psnr_metric, ssim_metric, lpips_metric, eval_weights=eval_weights
         ),
     }
-
     metrics_path = os.path.join(compare_root, f"metrics_astc_{astc_codec.astc_block}.txt")
     with open(metrics_path, "w", encoding="utf-8") as f:
         group_order = ("diffuse", "normal", "romd", "average")

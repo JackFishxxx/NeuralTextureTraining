@@ -135,14 +135,22 @@ class Config():
         if self.normal_encoding not in {"xyz", "xy", "hemi_oct"}:
             raise ValueError("normal_encoding must be one of: xyz, xy, hemi_oct")
 
+        self.super_resolution_enable = bool(getattr(params, "super_resolution_enable", False))
+        self.super_resolution_base_resolution = int(getattr(params, "super_resolution_base_resolution", 512))
+        if self.super_resolution_base_resolution <= 0:
+            raise ValueError("super_resolution_base_resolution must be positive")
+
         self.direct_diffuse_infer_mode = str(params.direct_diffuse_infer_mode).strip().lower()
         if self.direct_diffuse_infer_mode not in {"disable", "rgb", "ycocg"}:
             raise ValueError("direct_diffuse_infer_mode must be one of: disable, rgb, ycocg")
+        if self.super_resolution_enable and self.direct_diffuse_infer_mode != "disable":
+            print("[SuperResolution] Disabling direct_diffuse_infer_mode for residual prediction")
+            self.direct_diffuse_infer_mode = "disable"
 
         # Learned feature grids.
         default_feature_grids = [
             {"max_resolution": 1024, "quantize_bits": 8, "save_bits": 32, "learning_rate": 0.005},
-            {"max_resolution": 512, "quantize_bits": 8, "save_bits": 32, "learning_rate": 0.005},
+            #{"max_resolution": 512, "quantize_bits": 8, "save_bits": 32, "learning_rate": 0.005},
         ]
         self.feature_grid_configs: Optional[List[Dict]] = params.feature_grid_configs or default_feature_grids
 
@@ -362,6 +370,10 @@ def get_args():
     parser.add_argument('--direct_diffuse_infer_mode', type=str, default='disable',
                         choices=['disable', 'rgb', 'ycocg'],
                         help='direct diffuse inference mode: disable, or store diffuse in feature0 RGB as rgb/ycocg')
+    parser.add_argument('--super_resolution_enable', action=argparse.BooleanOptionalAction, default=False,
+                        help='enable residual super-resolution from a lower-resolution texture mip')
+    parser.add_argument('--super_resolution_base_resolution', type=int, default=512,
+                        help='base texture edge used for super-resolution residual input')
     parser.add_argument('--n_neurons', type=int, default=16,
                         help='MLP hidden-layer width (keep a multiple of 16 for CutlassMLP)')
     parser.add_argument('--n_hidden_layers', type=int, default=0,

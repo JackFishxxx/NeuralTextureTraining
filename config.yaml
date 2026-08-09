@@ -12,7 +12,7 @@ qat_noise_warmup_frac: 0.1
 
 # ---------- model configs ----------
 output_activation: "hard_swish"
-direct_diffuse_infer_mode: "rgb"  # disable | rgb | ycocg
+direct_diffuse_infer_mode: "disable"  # disable | rgb | ycocg
 normal_encoding: "xy"  # xyz | xy | hemi_oct
 
 # ---------- feature grid configs ----------
@@ -25,6 +25,10 @@ feature_grid_configs:
  #   quantize_bits: 8
  #   save_bits: 32
  #   learning_rate: 0.001
+
+# ---------- super resolution configs ----------
+super_resolution_enable: true
+super_resolution_base_resolution: 512
 
 # ---------- tiled positional encoding configs ----------
 n_frequencies: 0

@@ -10,6 +10,15 @@ Neural Texture (NTC) is a network-based method for texture representation and co
 - **Scalability**: supports multi-resolution, LODs, and joint representation with material parameters.
 - **Versatility**: applicable not only to albedo maps but also normal maps, roughness maps, and other material textures.
 
+### Motivation and Tiered Deployment
+
+As real-time content increasingly adopts 2K, 4K, and higher-resolution textures, material maps become a major contributor to game package size, patch bandwidth, and runtime memory usage.
+Simply increasing the compression ratio of conventional texture formats can introduce detail loss, block artifacts, or platform-specific compatibility constraints. This motivates a tiered representation strategy that balances visual quality, hardware coverage, and deployment cost.
+
+This project keeps 1K-and-below textures in established block-compressed formats such as ASTC for compatibility with existing assets, mobile platforms, and performance-constrained devices.
+On higher-end PCs, 2K/4K textures can instead be reconstructed at runtime through neural texture inference rather than stored as complete high-resolution bitmaps. FNTC combines shared texture group features in a feature grid with a low-resolution source mip that is already required by the asset pipeline. 
+The mip provides the low-frequency base after bilinear upsampling, while a small MLP predicts the high-frequency residual that bilinear interpolation cannot recover. Because this low-resolution mip is reused from the existing asset chain, the additional FNTC representation cost is concentrated in the feature texture and network parameters, while the traditional ASTC path remains available as a compatibility fallback.
+
 ### Differences from NVIDIA NTC SDK
 
 In February 2025, NVIDIA open-sourced the [RTXNTC SDK](https://github.com/NVIDIA-RTX/Rtxntc), providing official support for Neural Texture. However, this project differs from RTXNTC in several ways:
@@ -220,15 +229,16 @@ The following metrics are logged automatically during training:
 
 ## Key Features
 
-### Multi-Texture Joint Representation (11-Channel Canonical Layout)
+### Multi-Texture Joint Representation (Configurable Canonical Layout)
 
-The model uses a fixed **11-channel canonical layout** that supports joint representation of multiple material textures. The channel order is:
+The model constructs a canonical layout according to the selected normal encoding. The channel order is:
 
 ```
-diffuse(3) | normal(3) | roughness(1) | occlusion(1) | metallic(1) | specular(1) | displacement(1)
+diffuse(3) | normal(3 or 2) | roughness(1) | occlusion(1) | metallic(1) | specular(1) | displacement(1)
 ```
 
-If only a subset of texture types is provided (e.g., only albedo + normal), the missing channels are automatically zero-filled without affecting training or inference.
+With the default `normal_encoding: xy`, the canonical layout has 10 channels; datasets that omit
+specular contain 9 active channels. Missing texture types are zero-filled automatically.
 
 ### PSNR-Based Early Stopping
 
@@ -236,7 +246,7 @@ Training supports **automatic PSNR-based early stopping** to avoid wasting time 
 
 | Argument | Default | Description |
 |----------|:-------:|-------------|
-| `--early_stop` | `True` | Enable early stopping |
+| `--early_stop` | `False` | Enable early stopping |
 | `--early_stop_interval` | `5000` | Iterations per PSNR evaluation segment |
 | `--early_stop_psnr_threshold` | `0.01` | Minimum PSNR improvement threshold (dB) |
 
@@ -244,9 +254,10 @@ Training supports **automatic PSNR-based early stopping** to avoid wasting time 
 
 Training simulates quantization error in the forward pass so the model adapts to inference-time precision loss:
 
-- **Noise Annealing**: Uniform noise is added to feature values at the start of training and linearly decayed to zero, improving robustness to quantization error.
-  - `--noise_std`: Noise strength (default `1.0`)
-  - `--noise_anneal_fraction`: Fraction of training over which noise decays (default `0.8`, i.e., noise is fully annealed by 80% of training)
+- **Noise Annealing**: Uniform noise is added to feature-grid values and follows a cosine schedule.
+  - `--qat_noise_schedule`: `cosine` or `none` (default `cosine`)
+  - `--qat_noise_mult_start` / `--qat_noise_mult_end`: `1.0` / `0.25`
+  - `--qat_noise_warmup_frac`: `0.1` (the first 10% keeps the starting multiplier)
 
 - **Straight-Through Estimator (STE) Quantization**: The forward pass uses quantized values while gradients pass through unchanged, accurately simulating inference-time rounding and reducing color bias compared to additive noise.
 
@@ -273,3 +284,23 @@ The model supports **heterogeneous feature grids** through the `feature_grid_con
 ### Configurable Per-Texture Loss Weights
 
 Independent loss weights can be assigned to each texture type via the `texture_loss_weights` field in `configs.py`, balancing the contribution of different channels during training (e.g., diffuse typically weighted higher than displacement).
+
+### Configurable Network Architecture
+
+```yaml
+n_neurons: 32
+n_hidden_layers: 0
+output_activation: hard_swish
+```
+
+`n_hidden_layers: 0` selects a direct mapping without hidden layers. These values can also be
+overridden with `--n_neurons`, `--n_hidden_layers`, and `--output_activation`.
+
+### Neural Texture Super-Resolution
+
+Set `super_resolution_enable: true` and configure `super_resolution_base_resolution` to train
+residual super-resolution. The source mip at that resolution is bilinearly upsampled and provided
+alongside the feature-grid samples; the network predicts `GT - bilinear_base`. Training, inference,
+and ASTC comparison reconstruct `clamp(bilinear_base + predicted_residual, 0, 1)`. The same mip-level
+offset is used for lower LODs. Enabling this mode automatically disables direct-diffuse inference,
+whose direct-output semantics conflict with residual prediction.

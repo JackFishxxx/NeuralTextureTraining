@@ -100,6 +100,7 @@ class TCNNModel(torch.nn.Module):
         # Network output matches the selected canonical texture layout.
         self.normal_encoding = str(getattr(config, "normal_encoding", "xyz")).lower()
         self.num_channels = canonical_num_channels(self.normal_encoding)
+        self.super_resolution_enable = bool(getattr(config, "super_resolution_enable", False))
         self.direct_diffuse_infer_mode = str(getattr(config, "direct_diffuse_infer_mode", "disable")).lower()
         if self.direct_diffuse_infer_mode not in {"disable", "rgb", "ycocg"}:
             raise ValueError("direct_diffuse_infer_mode must be one of: disable, rgb, ycocg")
@@ -205,7 +206,8 @@ class TCNNModel(torch.nn.Module):
         if self.direct_diffuse_enabled:
             if not self.feature_grid_n_features_per_level or self.feature_grid_n_features_per_level[0] < 3:
                 raise ValueError("direct_diffuse_infer_mode requires feature grid 0 to have at least 3 channels")
-        n_input_dims = self.positional_encoding.n_output_dims + total_grid_features + 1
+        superres_input_dims = self.num_channels if self.super_resolution_enable else 0
+        n_input_dims = self.positional_encoding.n_output_dims + total_grid_features + superres_input_dims + 1
         print(f"total_grid_features={total_grid_features}, n_input_dims={n_input_dims}")
         self.network = tcnn.Network(
             n_input_dims=n_input_dims,
@@ -408,7 +410,11 @@ class TCNNModel(torch.nn.Module):
         texel = torch.minimum(texel, torch.clamp(res - 1.0, min=0.0))
         return torch.clamp(texel / torch.clamp(res - 1.0, min=1.0), 0.0, 1.0)
 
-    def forward(self, x: TensorType["batch_size", 3]) -> TensorType["batch_size", "num_channels"]:
+    def forward(self, x: torch.Tensor) -> TensorType["batch_size", "num_channels"]:
+
+        expected_dims = 3 + (self.num_channels if self.super_resolution_enable else 0)
+        if x.shape[1] != expected_dims:
+            raise ValueError(f"Expected model input with {expected_dims} columns, got {x.shape[1]}")
 
         # Explicit wrap to [0,1), so train/eval behavior matches repeat sampling at inference.
         uvs = torch.remainder(x[:, 0:2], 1.0)
@@ -459,10 +465,14 @@ class TCNNModel(torch.nn.Module):
             features.append(sampled_features)
         features = torch.cat(features, dim=1)
 
-        inputs = torch.cat([positional_encodings, features, lod_encodings], dim=1)
+        input_parts = [positional_encodings, features, lod_encodings]
+        if self.super_resolution_enable:
+            input_parts.append(x[:, 3:])
+        inputs = torch.cat(input_parts, dim=1)
 
         outputs = self.network(inputs)
-        outputs = self._apply_output_activation(outputs)
+        if not self.super_resolution_enable:
+            outputs = self._apply_output_activation(outputs)
         if direct_diffuse is not None:
             outputs = outputs.clone()
             outputs[:, :3] = direct_diffuse

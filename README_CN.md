@@ -10,6 +10,15 @@
 - **可扩展性**：支持多分辨率、LOD，以及与材质参数的联合表示。
 - **强适用性**：不仅适用于颜色贴图，还可以用于法线、粗糙度等材质纹理的表示。
 
+### 研究背景与分层部署动机
+
+随着实时渲染内容向 2K、4K 及更高分辨率发展，材质纹理已成为游戏安装包体积、补丁下载规模以及运行时显存占用的重要来源。
+单纯提高传统纹理压缩比通常会带来细节损失、块状伪影或平台兼容性问题，因此需要在资产兼容性、设备覆盖范围和视觉质量之间进行分层设计。
+
+本项目采用面向部署的混合策略：1K 及以下纹理继续使用成熟的 ASTC 等传统块压缩格式，以兼容既有资产、移动平台和性能受限设备；
+对于具备更强 GPU 推理能力的中高端 PC，2K/4K 纹理可不作为完整高分辨率位图存储，而是在运行时通过神经纹理推理重建。
+FNTC不仅使用 feature grid 表示纹理组的共享特征，还复用资产中本来就需要保留的低分辨率原始纹理 mip 作为基础图像，再由小型 MLP 预测双线性上采样无法恢复的高频残差。该低分辨率 mip 属于已有资产链路中的复用数据（freelunch），因此 FNTC 的新增表示成本主要集中在 feature texture 与网络参数，同时保留了传统路径作为兼容性回退方案。
+
 ### 与 NVIDIA NTC SDK 的区别
 
 NVIDIA在2025年2月开源了 [RTXNTC SDK](https://github.com/NVIDIA-RTX/Rtxntc)，提供了NVIDIA官方对于神经纹理的支持。但本项目与RTXNTC仍有一定差别：
@@ -102,14 +111,14 @@ data
 | 纹理类型 | 通道数 | 识别关键词 |
 |---------|:------:|-----------|
 | diffuse（漫反射/颜色） | 3 | `diffuse`、`albedo`、`color`、`diff` |
-| normal（法线） | 3 | `normal`、`nor_gl` |
+| normal（法线） | 2（`xy`）或 3（`xyz`） | `normal`、`nor_gl` |
 | roughness（粗糙度） | 1 | `roughness`、`rough` |
 | occlusion（环境光遮蔽） | 1 | `occlusion`、`ao`、`ambient` |
 | metallic（金属度） | 1 | `metallic`、`metalness` |
 | specular（高光） | 1 | `specular` |
 | displacement（位移） | 1 | `displacement`、`disp` |
 
-> **提示**：模型输出固定为 **11 通道**（diffuse×3 + normal×3 + roughness×1 + occlusion×1 + metallic×1 + specular×1 + displacement×1），缺失的纹理通道将自动填零，无需提供全部类型。不同分辨率的纹理会被自动缩放至与第一张纹理相同的分辨率。
+> **提示**：规范布局总通道数取决于法线编码：`normal_encoding: xyz` 时为 11 通道，`xy` 或 `hemi_oct` 时为 10 通道。缺失的纹理通道将自动填零，无需提供全部类型。不同分辨率的纹理会被自动缩放至与第一张纹理相同的分辨率。
 
 具体命名、识别和通道数量可参考 `dataset.py` 中的 `get_texture_config()` 函数。
 
@@ -221,15 +230,17 @@ tensorboard --logdir ./outputs/tensorboard
 
 ## 主要特性
 
-### 多纹理联合表示（11 通道规范布局）
+### 多纹理联合表示（可配置规范布局）
 
-模型采用固定的 **11 通道规范布局**，支持同时表示多种材质纹理，通道顺序如下：
+模型按法线编码方式构造规范布局，通道顺序如下：
 
 ```
-diffuse(3) | normal(3) | roughness(1) | occlusion(1) | metallic(1) | specular(1) | displacement(1)
+diffuse(3) | normal(3 或 2) | roughness(1) | occlusion(1) | metallic(1) | specular(1) | displacement(1)
 ```
 
-如果只提供部分纹理类型（例如仅提供 albedo + normal），对应的缺失通道将自动填零，不影响训练和推理。
+默认 `normal_encoding: xy`，因此法线占 2 个网络通道，总规范布局为 10 通道（包含 specular）；
+实际仅加载 diffuse、normal、roughness、occlusion、metallic、displacement 时为 9 通道。
+如果只提供部分纹理类型，对应的缺失通道将自动填零，不影响训练和推理。
 
 ### 基于 PSNR 的自动早停
 
@@ -237,7 +248,7 @@ diffuse(3) | normal(3) | roughness(1) | occlusion(1) | metallic(1) | specular(1)
 
 | 参数 | 默认值 | 说明 |
 |------|:------:|------|
-| `--early_stop` | `True` | 是否启用早停 |
+| `--early_stop` | `False` | 是否启用早停 |
 | `--early_stop_interval` | `5000` | 计算 PSNR 提升的迭代间隔 |
 | `--early_stop_psnr_threshold` | `0.01` | 最小 PSNR 提升阈值（dB） |
 
@@ -245,9 +256,10 @@ diffuse(3) | normal(3) | roughness(1) | occlusion(1) | metallic(1) | specular(1)
 
 训练时使用**量化感知训练**，在前向传播中模拟量化误差，使模型适应推理时的精度损失：
 
-- **噪声退火（Noise Annealing）**：训练初期向特征值加入均匀噪声，随训练进度线性衰减至零，增强模型对量化误差的鲁棒性。
-  - `--noise_std`：噪声强度（默认 `1.0`）
-  - `--noise_anneal_fraction`：噪声衰减的训练比例（默认 `0.8`，即在前 80% 的训练迭代中完成退火）
+- **噪声退火（Noise Annealing）**：训练初期向 feature grid 特征加入均匀噪声，按 cosine 计划衰减。
+  - `--qat_noise_schedule`：`cosine` 或 `none`，默认 `cosine`
+  - `--qat_noise_mult_start` / `--qat_noise_mult_end`：默认 `1.0` / `0.25`
+  - `--qat_noise_warmup_frac`：默认 `0.1`，前 10% 迭代保持起始强度
 
 - **直通估计器（STE）量化**：前向传播使用量化值，反向传播梯度直接通过，准确模拟推理时的舍入行为，降低颜色偏差。
 
@@ -261,7 +273,7 @@ diffuse(3) | normal(3) | roughness(1) | occlusion(1) | metallic(1) | specular(1)
 
 ### 异构多特征网格
 
-???? `feature_grid_configs` ????**??????**?
+通过 `feature_grid_configs` 可以配置多个分辨率或不同精度的 feature grid：
 
 | 字段 | 说明 |
 |------|------|
@@ -274,3 +286,22 @@ diffuse(3) | normal(3) | roughness(1) | occlusion(1) | metallic(1) | specular(1)
 ### 可配置的纹理损失权重
 
 可在 `configs.py` 的 `texture_loss_weights` 字段中为每种纹理类型设置独立的损失权重，以平衡不同纹理通道对训练的贡献（如颜色贴图通常比粗糙度更重要）。
+
+### 可配置网络结构
+
+```yaml
+n_neurons: 32
+n_hidden_layers: 0
+output_activation: hard_swish
+```
+
+`n_hidden_layers: 0` 表示无隐藏层的直接映射；可通过 CLI 覆盖 `--n_neurons`、
+`--n_hidden_layers` 和 `--output_activation`。
+
+### 神经纹理超分
+
+在 `config.yaml` 中设置 `super_resolution_enable: true` 并指定
+`super_resolution_base_resolution` 可启用超分残差训练。该分辨率的原始纹理 mip 作为 base，
+经双线性上采样后与 feature grid 特征拼接，网络拟合 `GT - bilinear_base`。评测、推理和 ASTC
+对比均使用 `clamp(bilinear_base + predicted_residual, 0, 1)` 与 GT 计算指标。更低 LOD 使用
+相同的纹理层级偏移。启用后会自动关闭与残差输出语义冲突的 direct diffuse 模式。

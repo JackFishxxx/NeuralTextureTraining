@@ -80,6 +80,9 @@ class TextureDataset(torch.nn.Module):
         
         self.data_dir = config.data_dir
         self.normal_encoding = str(getattr(config, "normal_encoding", "xyz")).lower()
+        self.super_resolution_enable = bool(getattr(config, "super_resolution_enable", False))
+        self.super_resolution_base_resolution = int(getattr(config, "super_resolution_base_resolution", 512))
+        self.superres_input_max_edge = self.super_resolution_base_resolution
 
         self.keyword_order, self.texture_keywords, self.texture_configs = get_texture_config(self.normal_encoding)
         # mapping from texture type to channel slice [start, end) in current loaded data
@@ -96,6 +99,7 @@ class TextureDataset(torch.nn.Module):
         self.num_lods = int(min(math.log2(self.texture_height), math.log2(self.texture_width))) + 1
 
         self.lod_cache = self.generate_lod()
+        self.superres_base_cache = self.generate_superres_base() if self.super_resolution_enable else None
     
     @torch.no_grad()
     def forward(
@@ -119,6 +123,18 @@ class TextureDataset(torch.nn.Module):
         batch_data = self.lod_cache[lods, scaled_ys, scaled_xs, :]
 
         return batch_data
+
+    @torch.no_grad()
+    def get_superres_base(
+            self,
+            batch_index: TensorType["batch_size", 3]
+        ) -> TensorType["batch_size", "num_channels"]:
+        """Sample the feature-grid-relative low-resolution texture at training positions."""
+        if self.superres_base_cache is None:
+            raise RuntimeError("Super-resolution is not enabled for this dataset")
+        ys, xs, lods = batch_index[:, 0], batch_index[:, 1], batch_index[:, 2]
+        lod_scale = 2 ** lods
+        return self.superres_base_cache[lods, ys // lod_scale, xs // lod_scale, :]
         
 
     @staticmethod
@@ -293,6 +309,33 @@ class TextureDataset(torch.nn.Module):
         lod_cache = lod_cache.to(self.device)
 
         return lod_cache
+
+    def generate_superres_base(self) -> TensorType["num_lods", "H", "W", "num_channels"]:
+        """Build baselines from a texture half the maximum feature-grid resolution."""
+        base_cache = torch.zeros_like(self.lod_cache)
+        texture_max_edge = max(self.texture_height, self.texture_width)
+        ratio = texture_max_edge / float(self.superres_input_max_edge)
+        source_lod_offset = max(0, int(round(math.log2(ratio)))) if ratio > 1.0 else 0
+        actual_source_edge = texture_max_edge // (2 ** source_lod_offset)
+        print(
+            f"[SuperResolution] feature_grid_max={self.superres_input_max_edge * 2}, "
+            f"input_texture_max={actual_source_edge}, source_lod_offset={source_lod_offset}"
+        )
+        for lod in range(self.num_lods):
+            out_h = self.texture_height // (2 ** lod)
+            out_w = self.texture_width // (2 ** lod)
+            source_lod = min(lod + source_lod_offset, self.num_lods - 1)
+            if source_lod == lod:
+                base_cache[lod, :out_h, :out_w, :] = self.lod_cache[lod, :out_h, :out_w, :]
+                continue
+            low_h = self.texture_height // (2 ** source_lod)
+            low_w = self.texture_width // (2 ** source_lod)
+            low = self.lod_cache[source_lod, :low_h, :low_w, :].permute(2, 0, 1)[None].float()
+            upsampled = torch.nn.functional.interpolate(
+                low, size=(out_h, out_w), mode="bilinear", align_corners=False
+            )
+            base_cache[lod, :out_h, :out_w, :] = upsampled.squeeze(0).permute(1, 2, 0)
+        return base_cache
     
     def get_output_loss_weights(self, config_weights: Optional[Dict[str, float]] = None) -> List[float]:
         """Generate per-channel loss weights based on the actually loaded textures.

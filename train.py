@@ -121,6 +121,7 @@ class Trainer:
         self.astc_block = str(getattr(configs, "astc_block", "6x6"))
         self.ref_astc_resolution = getattr(configs, "ref_astc_resolution", None)
         self.normal_encoding = str(getattr(configs, "normal_encoding", "xyz")).lower()
+        self.super_resolution_enable = bool(getattr(configs, "super_resolution_enable", False))
         self.astc_codec = ASTCCodec(
             astcenc_path=self.astcenc_path,
             astcenc_quality=self.astcenc_quality,
@@ -201,6 +202,9 @@ class Trainer:
         return total_loss
 
     def _loss_stats_str(self) -> str:
+        residual_stat = self._last_loss_stats.get("superres_residual")
+        if residual_stat is not None:
+            return f"Weighted super-resolution residual loss:{residual_stat['loss']:.6f}"
         labels = {
             "diffuse": "Weighted diffuse loss",
             "normal": "Weighted normal angular loss",
@@ -212,6 +216,18 @@ class Trainer:
             value = "-" if stat is None else f"{stat['loss']:.6f}"
             parts.append(f"{labels[group]}:{value}")
         return ", ".join(parts)
+
+    def _compute_superres_residual_loss(
+        self, target_residual: torch.Tensor, predicted_residual: torch.Tensor, loss_weights: torch.Tensor,
+        curr_iter: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Weighted channel MSE for signed residuals, including encoded normal channels."""
+        mse = (target_residual.float() - predicted_residual.float()).pow(2).mean(dim=0)
+        loss = (mse * loss_weights.float()).sum()
+        if curr_iter is not None:
+            self.writer.add_scalar('Loss/superres_residual', loss.item(), curr_iter)
+            self._last_loss_stats = {"superres_residual": {"loss": float(loss.detach().item())}}
+        return loss
 
     def train(self) -> None:
 
@@ -238,6 +254,11 @@ class Trainer:
             # Get data; expand to canonical 11 channels, missing texture positions filled with 0
             gt_texture = self.dataset(batch_index)  # [batch_size, num_channels]
             gt_texture = self.dataset.expand_to_canonical(gt_texture).to(torch.float16)
+            superres_base = None
+            if self.super_resolution_enable:
+                superres_base = self.dataset.expand_to_canonical(
+                    self.dataset.get_superres_base(batch_index)
+                ).to(torch.float16)
 
             # xys -> uvs
             # shift the sample position from [0, 1, ..., 1023] -> [0.5, 1.5, ..., 1023.5]
@@ -246,12 +267,20 @@ class Trainer:
             vs = (ys + 0.5) / self.texture_height
             lods = lods.float() / (self.num_lods - 1) if self.num_lods > 0 else torch.zeros_like(lods, dtype=torch.float32)
             batch_input = torch.cat([us, vs, lods], dim=1)
+            if superres_base is not None:
+                batch_input = torch.cat([batch_input, superres_base], dim=1)
             # predict (clean branch)
             predict_texture = self.model(batch_input)  # [batch_size, num_channels]
 
             # base reconstruction loss; normal uses angular loss, others use channel MSE
             loss_weights = torch.tensor(self.output_loss_weights, device=self.device, dtype=torch.float32)
-            base_loss = self._compute_reconstruction_loss(gt_texture, predict_texture, loss_weights, curr_iter)
+            if superres_base is not None:
+                target_residual = gt_texture - superres_base
+                base_loss = self._compute_superres_residual_loss(
+                    target_residual, predict_texture, loss_weights, curr_iter
+                )
+            else:
+                base_loss = self._compute_reconstruction_loss(gt_texture, predict_texture, loss_weights, curr_iter)
 
             total_loss = base_loss
 
@@ -371,7 +400,13 @@ class Trainer:
             for w0 in range(0, lod_width, step):
                 w1 = min(w0 + step, lod_width)
                 inp, fr, fc = self._lod_plane_tile(h0, h1, w0, w1, lod_height, lod_width, lod_f, device)
-                out[fr, fc, :] = self.model(inp).float()
+                if self.super_resolution_enable:
+                    base = self.dataset.superres_base_cache[lod, fr, fc, :]
+                    base = self.dataset.expand_to_canonical(base).float()
+                    residual = self.model(torch.cat([inp, base], dim=1)).float()
+                    out[fr, fc, :] = (base + residual).clamp(0.0, 1.0)
+                else:
+                    out[fr, fc, :] = self.model(inp).float()
         if getattr(self.model, "direct_diffuse_enabled", False) and "diffuse" in self.dataset.available_textures:
             s, e = self.dataset.canonical_channel_slices["diffuse"]
             direct = self.model.render_direct_diffuse_lod(lod, lod_height, lod_width)

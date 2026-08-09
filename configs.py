@@ -112,8 +112,8 @@ class Config():
         self.n_frequencies = int(getattr(params, "n_frequencies", 0))
         self.pos_encoding_tile_size = int(getattr(params, "pos_encoding_tile_size", 32))
         self.pos_encoding_reference_edge = int(getattr(params, "pos_encoding_reference_edge", 0))
-        self.n_neurons = 16
-        self.n_hidden_layers = 0
+        self.n_neurons = int(getattr(params, "n_neurons", 16))
+        self.n_hidden_layers = int(getattr(params, "n_hidden_layers", 0))
         raw_output_activation = getattr(params, "output_activation", "hard_swish")
         self.output_activation = str(raw_output_activation).strip().lower().replace("-", "_")
         supported_output_activations = {"hard_swish", "hard_gelu", "leaky_relu"}
@@ -362,6 +362,13 @@ def get_args():
     parser.add_argument('--direct_diffuse_infer_mode', type=str, default='disable',
                         choices=['disable', 'rgb', 'ycocg'],
                         help='direct diffuse inference mode: disable, or store diffuse in feature0 RGB as rgb/ycocg')
+    parser.add_argument('--n_neurons', type=int, default=16,
+                        help='MLP hidden-layer width (keep a multiple of 16 for CutlassMLP)')
+    parser.add_argument('--n_hidden_layers', type=int, default=0,
+                        help='MLP hidden-layer count (0 = single-layer direct mapping)')
+    parser.add_argument('--output_activation', type=str, default='hard_swish',
+                        choices=['hard_swish', 'hard_gelu', 'leaky_relu'],
+                        help='output activation applied after the MLP')
 
     # ── Two-stage parsing: YAML defaults → CLI overrides ──
     # Stage 1: extract --config path only

@@ -15,6 +15,21 @@ output_activation: "hard_swish"
 direct_diffuse_infer_mode: "rgb"  # disable | rgb | ycocg
 normal_encoding: "xy"  # xyz | xy | hemi_oct
 
+# ---------- feature grid configs ----------
+feature_grid_configs:
+  - max_resolution: 1024
+    quantize_bits: 8
+    save_bits: 32
+    learning_rate: 0.0005
+ # - max_resolution: 512
+ #   quantize_bits: 8
+ #   save_bits: 32
+ #   learning_rate: 0.001
+
 # ---------- tiled positional encoding configs ----------
 n_frequencies: 0
 pos_encoding_tile_size: 32
+
+# ---------- network configs ----------
+n_neurons: 16
+n_hidden_layers: 0

@@ -1,7 +1,13 @@
 outputs/
 __pycache__/
-data/
-save/
-data_batch/
-save_batch/
+data/*
+data_batch/*
+!data/test/
+!data/test/*
+!data/test_2k
+!data/test_2k/*
+
+save/*
+save_batch/*
+
 tools/

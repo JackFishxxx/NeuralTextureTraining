@@ -17,7 +17,7 @@ import torchvision.transforms.functional as TF
 
 import tinycudann as tcnn
 
-from configs import get_args
+from configs import get_args, inference_mips, mip_sampling_probabilities
 from model import TCNNModel
 from dataset import TextureDataset
 from normal_encoding import decode_normal, normal_angular_loss, normal_angular_psnr
@@ -36,7 +36,7 @@ class Trainer:
             configs = Config(params)
         dataset = TextureDataset(configs)
         print(f"[NormalEncoding] mode={dataset.normal_encoding}")
-        configs.num_lods = dataset.num_lods
+        configs.num_mips = dataset.num_mips
         # Real texture edge so pos_encoding_tile_size (texels) maps correctly to UV space.
         configs.pos_encoding_reference_edge = max(dataset.texture_height, dataset.texture_width)
         model = TCNNModel(configs)
@@ -75,9 +75,10 @@ class Trainer:
             os.makedirs(self.infer_path, exist_ok=True)
 
         # data config
-        self.num_lods = dataset.num_lods
+        self.num_mips = dataset.num_mips
         self.texture_height = dataset.texture_height
         self.texture_width = dataset.texture_width
+        self.mip0_only = bool(getattr(configs, "mip0_only", False))
 
         # Canonical per-channel weights; eval keeps diffuse weight, training loss may zero direct diffuse.
         self.eval_weights = dataset.get_canonical_loss_weights(
@@ -243,13 +244,13 @@ class Trainer:
             # generate random sample indices
             ys = torch.randint(0, self.texture_height, [self.batch_size, 1]).to(self.device)
             xs = torch.randint(0, self.texture_width, [self.batch_size, 1]).to(self.device)
-            # sample LODs with a coarse-to-fine prior
-            # lods = torch.randint(0, self.num_lods, [self.batch_size, 1]).to(self.device)
-            lods = self.sample_probabilities.multinomial(num_samples=self.batch_size, replacement=True)
-            #lods = torch.zeros(lods.shape).to(self.device).to(torch.int32)
-            lods = lods.unsqueeze(1)
-            # lods = torch.randint(0, 1, size=(self.batch_size, 1)).to(self.device)
-            batch_index = torch.cat([ys, xs, lods], dim=1)
+            # sample Mips with a coarse-to-fine prior
+            # mips = torch.randint(0, self.num_mips, [self.batch_size, 1]).to(self.device)
+            mips = self.sample_probabilities.multinomial(num_samples=self.batch_size, replacement=True)
+            #mips = torch.zeros(mips.shape).to(self.device).to(torch.int32)
+            mips = mips.unsqueeze(1)
+            # mips = torch.randint(0, 1, size=(self.batch_size, 1)).to(self.device)
+            batch_index = torch.cat([ys, xs, mips], dim=1)
 
             # Get data; expand to canonical 11 channels, missing texture positions filled with 0
             gt_texture = self.dataset(batch_index)  # [batch_size, num_channels]
@@ -262,11 +263,11 @@ class Trainer:
 
             # xys -> uvs
             # shift the sample position from [0, 1, ..., 1023] -> [0.5, 1.5, ..., 1023.5]
-            # uvs = ((xys + 0.5) / lod_scale) / (texture_weight / lod_scale)
+            # uvs = ((xys + 0.5) / mip_scale) / (texture_weight / mip_scale)
             us = (xs + 0.5) / self.texture_width
             vs = (ys + 0.5) / self.texture_height
-            lods = lods.float() / (self.num_lods - 1) if self.num_lods > 0 else torch.zeros_like(lods, dtype=torch.float32)
-            batch_input = torch.cat([us, vs, lods], dim=1)
+            mips = mips.float() / (self.num_mips - 1) if self.num_mips > 1 else torch.zeros_like(mips, dtype=torch.float32)
+            batch_input = torch.cat([us, vs, mips], dim=1)
             if superres_base is not None:
                 batch_input = torch.cat([batch_input, superres_base], dim=1)
             # predict (clean branch)
@@ -374,8 +375,8 @@ class Trainer:
             g.load_state_dict(bak)
 
     @staticmethod
-    def _lod_plane_tile(
-        h0: int, h1: int, w0: int, w1: int, plane_h: int, plane_w: int, lod_f: float, device: str
+    def _mip_plane_tile(
+        h0: int, h1: int, w0: int, w1: int, plane_h: int, plane_w: int, mip_f: float, device: str
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """[N,3] batch and (row,col) indices; UV=(col+0.5)/W, (row+0.5)/H."""
         rr, cc = torch.meshgrid(
@@ -383,25 +384,25 @@ class Trainer:
             torch.arange(w0, w1, device=device),
             indexing="ij",
         )
-        z = torch.full_like(rr, lod_f)
+        z = torch.full_like(rr, mip_f)
         inp = torch.stack(((cc + 0.5) / plane_w, (rr + 0.5) / plane_h, z), dim=-1).reshape(-1, 3)
         return inp, rr.reshape(-1).long(), cc.reshape(-1).long()
 
     @torch.no_grad()
-    def _fill_predicted_lod(self, lod: int, lod_height: int, lod_width: int) -> torch.Tensor:
+    def _fill_predicted_mip(self, mip: int, mip_height: int, mip_width: int) -> torch.Tensor:
         """Tiled full-plane forward (caps tcnn batch size; scatter by row/col to avoid layout bugs)."""
         device = self.device
         c = self.model.num_channels
-        out = torch.empty(lod_height, lod_width, c, device=device, dtype=torch.float32)
-        step = max(1, self.eval_inference_tile or max(lod_height, lod_width))
-        lod_f = 0.0 if self.num_lods <= 1 else float(lod) / float(self.num_lods - 1)
-        for h0 in range(0, lod_height, step):
-            h1 = min(h0 + step, lod_height)
-            for w0 in range(0, lod_width, step):
-                w1 = min(w0 + step, lod_width)
-                inp, fr, fc = self._lod_plane_tile(h0, h1, w0, w1, lod_height, lod_width, lod_f, device)
+        out = torch.empty(mip_height, mip_width, c, device=device, dtype=torch.float32)
+        step = max(1, self.eval_inference_tile or max(mip_height, mip_width))
+        mip_f = 0.0 if self.num_mips <= 1 else float(mip) / float(self.num_mips - 1)
+        for h0 in range(0, mip_height, step):
+            h1 = min(h0 + step, mip_height)
+            for w0 in range(0, mip_width, step):
+                w1 = min(w0 + step, mip_width)
+                inp, fr, fc = self._mip_plane_tile(h0, h1, w0, w1, mip_height, mip_width, mip_f, device)
                 if self.super_resolution_enable:
-                    base = self.dataset.superres_base_cache[lod, fr, fc, :]
+                    base = self.dataset.superres_base_cache[mip, fr, fc, :]
                     base = self.dataset.expand_to_canonical(base).float()
                     residual = self.model(torch.cat([inp, base], dim=1)).float()
                     out[fr, fc, :] = (base + residual).clamp(0.0, 1.0)
@@ -409,7 +410,7 @@ class Trainer:
                     out[fr, fc, :] = self.model(inp).float()
         if getattr(self.model, "direct_diffuse_enabled", False) and "diffuse" in self.dataset.available_textures:
             s, e = self.dataset.canonical_channel_slices["diffuse"]
-            direct = self.model.render_direct_diffuse_lod(lod, lod_height, lod_width)
+            direct = self.model.render_direct_diffuse_mip(mip, mip_height, mip_width)
             out[:, :, s:e] = direct.squeeze(0).permute(1, 2, 0).to(out.dtype)
         return out
 
@@ -430,27 +431,27 @@ class Trainer:
             F.interpolate(gt, size=(nh, nw), mode="area"),
         )
 
-    def _lod_size(self, lod: int) -> Tuple[int, int]:
-        return self.texture_height // (2 ** lod), self.texture_width // (2 ** lod)
+    def _mip_size(self, mip: int) -> Tuple[int, int]:
+        return self.texture_height // (2 ** mip), self.texture_width // (2 ** mip)
 
     def _ensure_visual_dirs(self, root: str) -> None:
         for vc in self.vis_configs:
             os.makedirs(os.path.join(root, vc['display_name']), exist_ok=True)
 
-    def _canonical_gt_lod(self, lod: int, lod_height: int, lod_width: int) -> torch.Tensor:
-        gt_slice = self.dataset.lod_cache[lod, :lod_height, :lod_width, :]
+    def _canonical_gt_mip(self, mip: int, mip_height: int, mip_width: int) -> torch.Tensor:
+        gt_slice = self.dataset.mip_cache[mip, :mip_height, :mip_width, :]
         gt_canonical = self.dataset.expand_to_canonical(
             gt_slice.reshape(-1, gt_slice.shape[-1])
-        ).reshape(lod_height, lod_width, -1)
+        ).reshape(mip_height, mip_width, -1)
         return gt_canonical.permute(2, 0, 1)[None, ...]
 
     @torch.no_grad()
-    def _render_lod_pair(self, lod: int) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
-        lod_height, lod_width = self._lod_size(lod)
-        pred_hwc = self._fill_predicted_lod(lod, lod_height, lod_width).clamp(0, 1)
+    def _render_mip_pair(self, mip: int) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+        mip_height, mip_width = self._mip_size(mip)
+        pred_hwc = self._fill_predicted_mip(mip, mip_height, mip_width).clamp(0, 1)
         pred = pred_hwc.permute(2, 0, 1)[None, ...]
-        gt = self._canonical_gt_lod(lod, lod_height, lod_width)
-        return pred, gt, lod_height, lod_width
+        gt = self._canonical_gt_mip(mip, mip_height, mip_width)
+        return pred, gt, mip_height, mip_width
 
     def _metric_rgb_pair(self, pred: torch.Tensor, gt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         ms, me = self._get_metrics_slice()
@@ -468,12 +469,12 @@ class Trainer:
             gt_ref = decode_normal(gt_ref, self.normal_encoding)
         return pred_ref, gt_ref
 
-    def _compute_lod_metrics(
+    def _compute_mip_metrics(
         self,
         pred: torch.Tensor,
         gt: torch.Tensor,
-        lod_height: int,
-        lod_width: int,
+        mip_height: int,
+        mip_width: int,
     ) -> Tuple[float, float, Optional[float]]:
         pred_ref, gt_ref = self._metric_rgb_pair(pred, gt)
         if self._metric_texture_name() == "normal":
@@ -483,11 +484,11 @@ class Trainer:
         visual_pred, visual_gt = self._metric_visual_pair(pred_ref, gt_ref)
         ssim_value, _ = self.ssim(visual_pred, visual_gt)
         ssim_value = float(ssim_value.item())
-        if lod_height >= 128 and lod_width >= 128:
+        if mip_height >= 128 and mip_width >= 128:
             return psnr_value, ssim_value, float(self.lpips(visual_pred, visual_gt).item())
         return psnr_value, ssim_value, None
 
-    def _save_lod_visuals(self, pred: torch.Tensor, gt: torch.Tensor, output_root: str, filename: str) -> None:
+    def _save_mip_visuals(self, pred: torch.Tensor, gt: torch.Tensor, output_root: str, filename: str) -> None:
         save_image = torch.cat([pred, gt], dim=3).squeeze()
         for vc in self.vis_configs:
             s, e = vc['canonical_channel_slice']
@@ -515,22 +516,22 @@ class Trainer:
             self.model.eval()
             self.model.simulate_quantize()
 
-            # Training evaluation intentionally checks LOD0 only to keep the loop responsive.
-            for lod in [0]:
-                pred, gt, lod_height, lod_width = self._render_lod_pair(lod)
-                psnr_value, ssim_value, lpips_value = self._compute_lod_metrics(pred, gt, lod_height, lod_width)
+            # Training evaluation intentionally checks Mip0 only to keep the loop responsive.
+            for mip in [0]:
+                pred, gt, mip_height, mip_width = self._render_mip_pair(mip)
+                psnr_value, ssim_value, lpips_value = self._compute_mip_metrics(pred, gt, mip_height, mip_width)
 
                 psnr_list.append(psnr_value)
                 ssim_list.append(ssim_value)
                 metric_prefix = "NormalAngular" if self._metric_texture_name() == "normal" else ""
-                self.writer.add_scalar(f'{metric_prefix}PSNR_LOD{lod}/train', psnr_value, curr_iter)
-                self.writer.add_scalar(f'{metric_prefix}SSIM_LOD{lod}/train', ssim_value, curr_iter)
+                self.writer.add_scalar(f'{metric_prefix}PSNR_Mip{mip}/train', psnr_value, curr_iter)
+                self.writer.add_scalar(f'{metric_prefix}SSIM_Mip{mip}/train', ssim_value, curr_iter)
                 if lpips_value is not None:
                     lpips_list.append(lpips_value)
-                    self.writer.add_scalar(f'{metric_prefix}LPIPS_LOD{lod}/train', lpips_value, curr_iter)
+                    self.writer.add_scalar(f'{metric_prefix}LPIPS_Mip{mip}/train', lpips_value, curr_iter)
 
                 if should_save_visuals:
-                    self._save_lod_visuals(pred, gt, self.media_path, f"{curr_iter}_{lod}.png")
+                    self._save_mip_visuals(pred, gt, self.media_path, f"{curr_iter}_{mip}.png")
 
         finally:
             self._restore_feature_grid_state(feature_grid_backup)
@@ -578,10 +579,10 @@ class Trainer:
         first = self.dataset.available_textures[0]
         return canon[first]
 
-    def _infer_lods(self) -> range:
+    def _infer_mips(self) -> range:
         # Skip the smallest four mip levels during inference, but always keep
-        # LOD0 so tiny datasets still produce an output and metrics file.
-        return range(max(1, self.num_lods - 4))
+        # Mip0 so tiny datasets still produce an output and metrics file.
+        return inference_mips(self.num_mips, self.mip0_only)
 
     @torch.no_grad()
     def infer(self) -> None:
@@ -591,16 +592,16 @@ class Trainer:
         ssim_list: List[float] = []
         lpips_list: List[float] = []
         if self._metric_texture_name() == "normal":
-            metric_lines = ["LOD NormalAngularPSNR NormalAngularSSIM NormalAngularLPIPS\n"]
+            metric_lines = ["Mip NormalAngularPSNR NormalAngularSSIM NormalAngularLPIPS\n"]
         else:
-            metric_lines = ["LOD PSNR SSIM LPIPS\n"]
+            metric_lines = ["Mip PSNR SSIM LPIPS\n"]
 
         was_training = self.model.training
         try:
             self.model.eval()
-            for lod in self._infer_lods():
-                pred, gt, lod_height, lod_width = self._render_lod_pair(lod)
-                psnr_value, ssim_value, lpips_value = self._compute_lod_metrics(pred, gt, lod_height, lod_width)
+            for mip in self._infer_mips():
+                pred, gt, mip_height, mip_width = self._render_mip_pair(mip)
+                psnr_value, ssim_value, lpips_value = self._compute_mip_metrics(pred, gt, mip_height, mip_width)
 
                 psnr_list.append(psnr_value)
                 ssim_list.append(ssim_value)
@@ -608,8 +609,8 @@ class Trainer:
                     lpips_list.append(lpips_value)
                 lpips_for_line = 0.0 if lpips_value is None else lpips_value
 
-                self._save_lod_visuals(pred, gt, self.infer_path, f"LOD_{lod}.png")
-                metric_lines.append(f"LOD_{lod} {psnr_value:.4f} {ssim_value:.4f} {lpips_for_line:.4f}\n")
+                self._save_mip_visuals(pred, gt, self.infer_path, f"Mip_{mip}.png")
+                metric_lines.append(f"Mip_{mip} {psnr_value:.4f} {ssim_value:.4f} {lpips_for_line:.4f}\n")
         finally:
             self.model.train(was_training)
 
@@ -639,7 +640,7 @@ class Trainer:
             output_root=output_root,
             texture_height=self.texture_height,
             texture_width=self.texture_width,
-            num_lods=self.num_lods,
+            num_mips=self.num_mips,
             device=self.device,
             curr_iter=curr_iter,
             ref_astc_resolution=self.ref_astc_resolution,
@@ -666,20 +667,8 @@ class Trainer:
         print(f"resolved_config: {path}")
 
     def generate_probabilities(self) -> torch.Tensor:
-
-        probabilities = []
-
-        # Generate a coarse-to-fine LOD sampling distribution.
-        current_prob = 1.0
-        for i in range(0, self.num_lods):
-            prob = current_prob / 4.0  # original is current_prob / 2**2
-            probabilities.append(max(prob, 0.05))  # keep every LOD sampleable
-            current_prob = prob
-        probabilities = torch.tensor(probabilities).to(self.device)
-        probabilities /= probabilities.sum()
-        # print(probabilities)
-
-        return probabilities
+        # Generate a coarse-to-fine Mip sampling distribution, or isolate Mip0.
+        return mip_sampling_probabilities(self.num_mips, self.mip0_only, self.device)
 
 
 if __name__ == "__main__":

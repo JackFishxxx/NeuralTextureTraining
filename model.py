@@ -92,7 +92,7 @@ class TCNNModel(torch.nn.Module):
 
         self.current_iter = 0
 
-        self.num_lods = config.num_lods
+        self.num_mips = config.num_mips
         self.n_frequencies = config.n_frequencies
         self.n_neurons = config.n_neurons
         self.n_hidden_layers = config.n_hidden_layers
@@ -144,8 +144,8 @@ class TCNNModel(torch.nn.Module):
             device=self.device,
         )
 
-        # how many lods to sample per query
-        self.num_sampled_lods = 1
+        # how many mips to sample per query
+        self.num_sampled_mips = 1
 
         # Support heterogeneous feature grid configs from configs.py.
         self.feature_grids = torch.nn.ModuleList()
@@ -202,7 +202,7 @@ class TCNNModel(torch.nn.Module):
             "n_neurons": config.n_neurons,
             "n_hidden_layers": config.n_hidden_layers
         }
-        total_grid_features = sum(self.feature_grid_n_features_per_level) * self.num_sampled_lods
+        total_grid_features = sum(self.feature_grid_n_features_per_level) * self.num_sampled_mips
         if self.direct_diffuse_enabled:
             if not self.feature_grid_n_features_per_level or self.feature_grid_n_features_per_level[0] < 3:
                 raise ValueError("direct_diffuse_infer_mode requires feature grid 0 to have at least 3 channels")
@@ -353,18 +353,18 @@ class TCNNModel(torch.nn.Module):
         return self._ycocg_to_rgb(payload) if self.direct_diffuse_infer_mode == "ycocg" else payload
 
     @torch.no_grad()
-    def render_direct_diffuse_lod(self, lod: int, out_h: int, out_w: int, resize_fn=None) -> torch.Tensor:
+    def render_direct_diffuse_mip(self, mip: int, out_h: int, out_w: int, resize_fn=None) -> torch.Tensor:
         """Render direct diffuse from feature-grid RGB, then bilinear upsample to output size."""
         if not self.direct_diffuse_enabled:
-            raise RuntimeError("render_direct_diffuse_lod requires direct_diffuse_infer_mode != disable")
+            raise RuntimeError("render_direct_diffuse_mip requires direct_diffuse_infer_mode != disable")
 
         grid_levels = self.feature_grid_n_levels[0]
         grid_fpl = self.feature_grid_n_features_per_level[0]
         base_res = self.feature_grid_base_res[0]
-        lod_f = 0.0 if self.num_lods <= 1 else float(lod) / float(self.num_lods - 1)
-        selected_level = int(round(grid_levels - self.num_sampled_lods - min(
-            lod_f * (self.num_lods - self.num_sampled_lods),
-            grid_levels - self.num_sampled_lods,
+        mip_f = 0.0 if self.num_mips <= 1 else float(mip) / float(self.num_mips - 1)
+        selected_level = int(round(grid_levels - self.num_sampled_mips - min(
+            mip_f * (self.num_mips - self.num_sampled_mips),
+            grid_levels - self.num_sampled_mips,
         )))
         selected_level = max(0, min(grid_levels - 1, selected_level))
         res = base_res * (2 ** selected_level)
@@ -418,11 +418,11 @@ class TCNNModel(torch.nn.Module):
 
         # Explicit wrap to [0,1), so train/eval behavior matches repeat sampling at inference.
         uvs = torch.remainder(x[:, 0:2], 1.0)
-        lod_encodings = x[:, [2]]
+        mip_encodings = x[:, [2]]
 
-        # Select the feature-grid level corresponding to the normalized LOD.
-        num_sampled_lods = self.num_sampled_lods
-        mips = lod_encodings * (self.num_lods - num_sampled_lods)
+        # Select the feature-grid level corresponding to the normalized Mip.
+        num_sampled_mips = self.num_sampled_mips
+        mips = mip_encodings * (self.num_mips - num_sampled_mips)
 
         positional_encodings = self.positional_encoding(uvs)
 
@@ -434,11 +434,11 @@ class TCNNModel(torch.nn.Module):
             grid_fpl = self.feature_grid_n_features_per_level[idx]
             qbits = self.feature_grid_quantize_bits[idx]
 
-            clipped_mips = torch.clamp(mips, max=grid_levels - num_sampled_lods)
-            selected_level_f = grid_levels - num_sampled_lods - clipped_mips
+            clipped_mips = torch.clamp(mips, max=grid_levels - num_sampled_mips)
+            selected_level_f = grid_levels - num_sampled_mips - clipped_mips
             grid_uvs = self._texel_aligned_grid_uv(uvs, selected_level_f, self.feature_grid_base_res[idx])
             all_features = feature_grid(grid_uvs)  # [B, grid_levels * grid_fpl]
-            cols = (grid_levels - num_sampled_lods - clipped_mips) * grid_fpl + torch.arange(grid_fpl * num_sampled_lods).to(self.device)
+            cols = (grid_levels - num_sampled_mips - clipped_mips) * grid_fpl + torch.arange(grid_fpl * num_sampled_mips).to(self.device)
             sampled_features = torch.gather(all_features, 1, cols.to(torch.int64))
 
             if self.quantize and self.training:
@@ -465,7 +465,7 @@ class TCNNModel(torch.nn.Module):
             features.append(sampled_features)
         features = torch.cat(features, dim=1)
 
-        input_parts = [positional_encodings, features, lod_encodings]
+        input_parts = [positional_encodings, features, mip_encodings]
         if self.super_resolution_enable:
             input_parts.append(x[:, 3:])
         inputs = torch.cat(input_parts, dim=1)

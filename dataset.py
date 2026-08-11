@@ -96,9 +96,9 @@ class TextureDataset(torch.nn.Module):
         self.textures = self.load_data()
         self.texture_height, self.texture_width, self.num_channels = self.textures.shape
         
-        self.num_lods = int(min(math.log2(self.texture_height), math.log2(self.texture_width))) + 1
+        self.num_mips = int(min(math.log2(self.texture_height), math.log2(self.texture_width))) + 1
 
-        self.lod_cache = self.generate_lod()
+        self.mip_cache = self.generate_mip()
         self.superres_base_cache = self.generate_superres_base() if self.super_resolution_enable else None
     
     @torch.no_grad()
@@ -107,20 +107,20 @@ class TextureDataset(torch.nn.Module):
             batch_index: TensorType["batch_size", 3]
         ) -> List[TensorType["batch_size", "num_channels"]]:
 
-        # lod_cache: [self.num_lods, self.texture_height, self.texture_width, self.num_channels]
+        # mip_cache: [self.num_mips, self.texture_height, self.texture_width, self.num_channels]
         # batch_index: [batch_size, 3]
 
         batch_size = batch_index.shape[0]
         ys = batch_index[:, 0]
         xs = batch_index[:, 1]
-        lods = batch_index[:, 2]
+        mips = batch_index[:, 2]
 
-        # use lods to scale the pixel position
-        lod_scale = 2 ** lods
-        scaled_xs = xs // lod_scale
-        scaled_ys = ys // lod_scale
+        # use mips to scale the pixel position
+        mip_scale = 2 ** mips
+        scaled_xs = xs // mip_scale
+        scaled_ys = ys // mip_scale
 
-        batch_data = self.lod_cache[lods, scaled_ys, scaled_xs, :]
+        batch_data = self.mip_cache[mips, scaled_ys, scaled_xs, :]
 
         return batch_data
 
@@ -132,9 +132,9 @@ class TextureDataset(torch.nn.Module):
         """Sample the feature-grid-relative low-resolution texture at training positions."""
         if self.superres_base_cache is None:
             raise RuntimeError("Super-resolution is not enabled for this dataset")
-        ys, xs, lods = batch_index[:, 0], batch_index[:, 1], batch_index[:, 2]
-        lod_scale = 2 ** lods
-        return self.superres_base_cache[lods, ys // lod_scale, xs // lod_scale, :]
+        ys, xs, mips = batch_index[:, 0], batch_index[:, 1], batch_index[:, 2]
+        mip_scale = 2 ** mips
+        return self.superres_base_cache[mips, ys // mip_scale, xs // mip_scale, :]
         
 
     @staticmethod
@@ -266,27 +266,27 @@ class TextureDataset(torch.nn.Module):
 
         return textures_ordered
     
-    def _resize_texture_for_lod(self, texture_type: str, tex_chw: torch.Tensor, lod_height: int, lod_width: int) -> torch.Tensor:
+    def _resize_texture_for_mip(self, texture_type: str, tex_chw: torch.Tensor, mip_height: int, mip_width: int) -> torch.Tensor:
         if texture_type == "normal":
             normal_vec = normalize_normal_rgb(decode_normal(tex_chw, self.normal_encoding))
-            lod_vec = TF.resize(
-                normal_vec, [lod_height, lod_width],
+            mip_vec = TF.resize(
+                normal_vec, [mip_height, mip_width],
                 interpolation=TF.InterpolationMode.BICUBIC,
                 antialias=True,
             )
-            return encode_normal(normal_to_rgb(lod_vec), self.normal_encoding)
+            return encode_normal(normal_to_rgb(mip_vec), self.normal_encoding)
 
-        lod_texture = TF.resize(
-            tex_chw, [lod_height, lod_width],
+        mip_texture = TF.resize(
+            tex_chw, [mip_height, mip_width],
             interpolation=TF.InterpolationMode.BICUBIC,
             antialias=True,
         )
-        return torch.clamp(lod_texture, min=0., max=1.)
+        return torch.clamp(mip_texture, min=0., max=1.)
 
-    def generate_lod(self) -> TensorType["num_lods", "lod_height", "lod_width", "num_channels"]:
+    def generate_mip(self) -> TensorType["num_mips", "mip_height", "mip_width", "num_channels"]:
 
-        lod_cache = torch.zeros(
-            [self.num_lods, self.texture_height, self.texture_width, self.num_channels]
+        mip_cache = torch.zeros(
+            [self.num_mips, self.texture_height, self.texture_width, self.num_channels]
         )
         # here is a bug in pytorch while using a tensor on cuda to interpolate
         # from a large size to a small size, e.g. [1024, 1024] -> [8, 8]
@@ -294,47 +294,47 @@ class TextureDataset(torch.nn.Module):
         # work on cpu seems not to have this problem
         textures = self.textures.cpu()
 
-        for lod in range(self.num_lods):
-            lod_height = self.texture_height // (2 ** lod)
-            lod_width = self.texture_width // (2 ** lod)
-            lod_parts = []
+        for mip in range(self.num_mips):
+            mip_height = self.texture_height // (2 ** mip)
+            mip_width = self.texture_width // (2 ** mip)
+            mip_parts = []
             for texture_type in self.available_textures:
                 ds_start, ds_end = self.channel_slices[texture_type]
                 tex_chw = textures[:, :, ds_start:ds_end].permute(2, 0, 1)
-                lod_parts.append(self._resize_texture_for_lod(texture_type, tex_chw, lod_height, lod_width))
-            lod_texture = torch.cat(lod_parts, dim=0).permute(1, 2, 0)
-            # [lod, H, W, C] <- [lod_H, lod_W, C]
-            lod_cache[lod, :lod_height, :lod_width, :] = lod_texture
+                mip_parts.append(self._resize_texture_for_mip(texture_type, tex_chw, mip_height, mip_width))
+            mip_texture = torch.cat(mip_parts, dim=0).permute(1, 2, 0)
+            # [mip, H, W, C] <- [mip_H, mip_W, C]
+            mip_cache[mip, :mip_height, :mip_width, :] = mip_texture
 
-        lod_cache = lod_cache.to(self.device)
+        mip_cache = mip_cache.to(self.device)
 
-        return lod_cache
+        return mip_cache
 
-    def generate_superres_base(self) -> TensorType["num_lods", "H", "W", "num_channels"]:
+    def generate_superres_base(self) -> TensorType["num_mips", "H", "W", "num_channels"]:
         """Build baselines from a texture half the maximum feature-grid resolution."""
-        base_cache = torch.zeros_like(self.lod_cache)
+        base_cache = torch.zeros_like(self.mip_cache)
         texture_max_edge = max(self.texture_height, self.texture_width)
         ratio = texture_max_edge / float(self.superres_input_max_edge)
-        source_lod_offset = max(0, int(round(math.log2(ratio)))) if ratio > 1.0 else 0
-        actual_source_edge = texture_max_edge // (2 ** source_lod_offset)
+        source_mip_offset = max(0, int(round(math.log2(ratio)))) if ratio > 1.0 else 0
+        actual_source_edge = texture_max_edge // (2 ** source_mip_offset)
         print(
             f"[SuperResolution] feature_grid_max={self.superres_input_max_edge * 2}, "
-            f"input_texture_max={actual_source_edge}, source_lod_offset={source_lod_offset}"
+            f"input_texture_max={actual_source_edge}, source_mip_offset={source_mip_offset}"
         )
-        for lod in range(self.num_lods):
-            out_h = self.texture_height // (2 ** lod)
-            out_w = self.texture_width // (2 ** lod)
-            source_lod = min(lod + source_lod_offset, self.num_lods - 1)
-            if source_lod == lod:
-                base_cache[lod, :out_h, :out_w, :] = self.lod_cache[lod, :out_h, :out_w, :]
+        for mip in range(self.num_mips):
+            out_h = self.texture_height // (2 ** mip)
+            out_w = self.texture_width // (2 ** mip)
+            source_mip = min(mip + source_mip_offset, self.num_mips - 1)
+            if source_mip == mip:
+                base_cache[mip, :out_h, :out_w, :] = self.mip_cache[mip, :out_h, :out_w, :]
                 continue
-            low_h = self.texture_height // (2 ** source_lod)
-            low_w = self.texture_width // (2 ** source_lod)
-            low = self.lod_cache[source_lod, :low_h, :low_w, :].permute(2, 0, 1)[None].float()
+            low_h = self.texture_height // (2 ** source_mip)
+            low_w = self.texture_width // (2 ** source_mip)
+            low = self.mip_cache[source_mip, :low_h, :low_w, :].permute(2, 0, 1)[None].float()
             upsampled = torch.nn.functional.interpolate(
                 low, size=(out_h, out_w), mode="bilinear", align_corners=False
             )
-            base_cache[lod, :out_h, :out_w, :] = upsampled.squeeze(0).permute(1, 2, 0)
+            base_cache[mip, :out_h, :out_w, :] = upsampled.squeeze(0).permute(1, 2, 0)
         return base_cache
     
     def get_output_loss_weights(self, config_weights: Optional[Dict[str, float]] = None) -> List[float]:
@@ -368,16 +368,16 @@ class TextureDataset(torch.nn.Module):
             out[:, canon_start:canon_end] = x[:, ds_start:ds_end]
         return out
 
-    def expand_lod_to_canonical(self, lod_tensor: TensorType["num_lods", "H", "W", "num_channels"]) -> TensorType["num_lods", "H", "W", 11]:
-        """Expand lod_cache [num_lods, H, W, num_channels] to [num_lods, H, W, canonical_channels]; fill missing with 0."""
-        num_lods, h, w, c = lod_tensor.shape
-        device = lod_tensor.device
-        dtype = lod_tensor.dtype
-        out = torch.zeros((num_lods, h, w, self.canonical_num_channels), device=device, dtype=dtype)
+    def expand_mip_to_canonical(self, mip_tensor: TensorType["num_mips", "H", "W", "num_channels"]) -> TensorType["num_mips", "H", "W", 11]:
+        """Expand mip_cache [num_mips, H, W, num_channels] to [num_mips, H, W, canonical_channels]; fill missing with 0."""
+        num_mips, h, w, c = mip_tensor.shape
+        device = mip_tensor.device
+        dtype = mip_tensor.dtype
+        out = torch.zeros((num_mips, h, w, self.canonical_num_channels), device=device, dtype=dtype)
         for tex_type in self.available_textures:
             ds_start, ds_end = self.channel_slices[tex_type]
             canon_start, canon_end = self.canonical_channel_slices[tex_type]
-            out[:, :, :, canon_start:canon_end] = lod_tensor[:, :, :, ds_start:ds_end]
+            out[:, :, :, canon_start:canon_end] = mip_tensor[:, :, :, ds_start:ds_end]
         return out
 
     def get_canonical_loss_weights(self, config_weights: Optional[Dict[str, float]] = None) -> List[float]:

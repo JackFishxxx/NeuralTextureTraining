@@ -1,7 +1,7 @@
 """
 ASTC comparison pipeline: FNTC (quantized / grid-ASTC) vs traditional RGBA ASTC round-trip.
 
-Uses official astcenc for encode+decode baselines. Visualization and metrics align on LOD0
+Uses official astcenc for encode+decode baselines. Visualization and metrics align on Mip0
 full texture resolution; optional ref_astc_resolution (int square side) resamples only the traditional baseline path.
 """
 from __future__ import annotations
@@ -47,7 +47,7 @@ def normalize_astc_block(block: str) -> str:
 
 
 def _ref_astc_hw_from_side(side: Optional[int], base_h: int, base_w: int) -> Tuple[int, int]:
-    """Traditional ASTC baseline: square side×side, or None → LOD0 (base_h, base_w)."""
+    """Traditional ASTC baseline: square side×side, or None → Mip0 (base_h, base_w)."""
     if side is None:
         return base_h, base_w
     if side <= 0:
@@ -185,17 +185,17 @@ def build_traditional_astc_prediction(
 
 @torch.no_grad()
 def _traditional_baseline_resampled(
-    gt_lod0: torch.Tensor,
+    gt_mip0: torch.Tensor,
     dataset,
     roundtrip_rgba: Callable[[np.ndarray], np.ndarray],
     ref_h: int,
     ref_w: int,
 ) -> torch.Tensor:
-    """Run traditional ASTC at (ref_h, ref_w), then resize to gt_lod0 spatial size for comparison."""
-    h0, w0 = gt_lod0.shape[-2], gt_lod0.shape[-1]
-    src = gt_lod0
+    """Run traditional ASTC at (ref_h, ref_w), then resize to gt_mip0 spatial size for comparison."""
+    h0, w0 = gt_mip0.shape[-2], gt_mip0.shape[-1]
+    src = gt_mip0
     if (ref_h, ref_w) != (h0, w0):
-        src = F.interpolate(gt_lod0, size=(ref_h, ref_w), mode="bilinear", align_corners=False)
+        src = F.interpolate(gt_mip0, size=(ref_h, ref_w), mode="bilinear", align_corners=False)
     out = build_traditional_astc_prediction(
         gt_image=src,
         canonical_slices=dataset.canonical_channel_slices,
@@ -208,14 +208,14 @@ def _traditional_baseline_resampled(
 
 
 @torch.no_grad()
-def _astc_roundtrip_superres_base_lod0(dataset, roundtrip_rgba, base_resolution: int) -> torch.Tensor:
+def _astc_roundtrip_superres_base_mip0(dataset, roundtrip_rgba, base_resolution: int) -> torch.Tensor:
     """Compress the reused low-resolution source mip before upsampling it."""
     h0, w0 = dataset.texture_height, dataset.texture_width
     ratio = max(h0, w0) / float(max(1, base_resolution))
-    source_lod_offset = max(0, int(round(math.log2(ratio)))) if ratio > 1.0 else 0
-    source_lod = min(source_lod_offset, dataset.num_lods - 1)
-    h, w = h0 // (2 ** source_lod), w0 // (2 ** source_lod)
-    source = dataset.lod_cache[source_lod, :h, :w, :]
+    source_mip_offset = max(0, int(round(math.log2(ratio)))) if ratio > 1.0 else 0
+    source_mip = min(source_mip_offset, dataset.num_mips - 1)
+    h, w = h0 // (2 ** source_mip), w0 // (2 ** source_mip)
+    source = dataset.mip_cache[source_mip, :h, :w, :]
     source = dataset.expand_to_canonical(source.reshape(-1, source.shape[-1]))
     source = source.reshape(h, w, -1).permute(2, 0, 1)[None, ...]
     compressed = build_traditional_astc_prediction(
@@ -279,36 +279,36 @@ def apply_astc_to_feature_grids(astc_model, roundtrip_rgba: Callable[[np.ndarray
 
 
 # ---------------------------------------------------------------------------
-# LOD0 rendering
+# Mip0 rendering
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def _render_gt_lod0(dataset, texture_height: int, texture_width: int) -> torch.Tensor:
-    lod = 0
-    lod_height = texture_height // (2 ** lod)
-    lod_width = texture_width // (2 ** lod)
-    gt_slice = dataset.lod_cache[lod, :lod_height, :lod_width, :]
+def _render_gt_mip0(dataset, texture_height: int, texture_width: int) -> torch.Tensor:
+    mip = 0
+    mip_height = texture_height // (2 ** mip)
+    mip_width = texture_width // (2 ** mip)
+    gt_slice = dataset.mip_cache[mip, :mip_height, :mip_width, :]
     gt_canonical = dataset.expand_to_canonical(gt_slice.reshape(-1, gt_slice.shape[-1]))
-    gt_canonical = gt_canonical.reshape(lod_height, lod_width, -1)
+    gt_canonical = gt_canonical.reshape(mip_height, mip_width, -1)
     return gt_canonical.permute(2, 0, 1)[None, ...]
 
 
 @torch.no_grad()
-def _render_model_lod0(model, dataset, texture_height: int, texture_width: int, num_lods: int, device: str,
+def _render_model_mip0(model, dataset, texture_height: int, texture_width: int, num_mips: int, device: str,
                        superres_base_override: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """LOD0 plane; UV / row-col scatter aligned with train.py (tiled path uses the same math)."""
-    lod = 0
-    H = texture_height >> lod
-    W = texture_width >> lod
+    """Mip0 plane; UV / row-col scatter aligned with train.py (tiled path uses the same math)."""
+    mip = 0
+    H = texture_height >> mip
+    W = texture_width >> mip
     rr, cc = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
-    lod_f = float(lod) / max(1, num_lods - 1)
+    mip_f = float(mip) / max(1, num_mips - 1)
     inp = torch.stack(
-        ((cc + 0.5) / W, (rr + 0.5) / H, torch.full_like(rr, lod_f)), dim=-1
+        ((cc + 0.5) / W, (rr + 0.5) / H, torch.full_like(rr, mip_f)), dim=-1
     ).to(device).reshape(-1, 3)
     base = None
     if getattr(model, "super_resolution_enable", False):
         if superres_base_override is None:
-            base_data = dataset.superres_base_cache[lod, :H, :W, :].reshape(-1, dataset.num_channels)
+            base_data = dataset.superres_base_cache[mip, :H, :W, :].reshape(-1, dataset.num_channels)
             base = dataset.expand_to_canonical(base_data).float()
         else:
             base_chw = superres_base_override[0] if superres_base_override.ndim == 4 else superres_base_override
@@ -320,8 +320,8 @@ def _render_model_lod0(model, dataset, texture_height: int, texture_width: int, 
     fr = rr.reshape(-1).to(device=device, dtype=torch.long)
     fc = cc.reshape(-1).to(device=device, dtype=torch.long)
     hwc[fr, fc, :] = y
-    if getattr(model, "direct_diffuse_enabled", False) and hasattr(model, "render_direct_diffuse_lod"):
-        direct = model.render_direct_diffuse_lod(lod, H, W)
+    if getattr(model, "direct_diffuse_enabled", False) and hasattr(model, "render_direct_diffuse_mip"):
+        direct = model.render_direct_diffuse_mip(mip, H, W)
         hwc[:, :, :3] = direct.squeeze(0).permute(1, 2, 0).to(hwc.dtype)
     hwc = torch.nan_to_num(hwc, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     return hwc.permute(2, 0, 1)[None, ...]
@@ -728,7 +728,7 @@ def run_astc_comparison_pipeline(
     output_root: str,
     texture_height: int,
     texture_width: int,
-    num_lods: int,
+    num_mips: int,
     device: str,
     curr_iter: Optional[int] = None,
     ref_astc_resolution: Optional[int] = None,
@@ -743,34 +743,34 @@ def run_astc_comparison_pipeline(
         compare_root = os.path.join(compare_root, f"iter_{curr_iter:08d}")
     os.makedirs(compare_root, exist_ok=True)
 
-    gt_image = _render_gt_lod0(dataset, texture_height, texture_width)
+    gt_image = _render_gt_mip0(dataset, texture_height, texture_width)
     h0, w0 = gt_image.shape[-2], gt_image.shape[-1]
     ref_h, ref_w = _ref_astc_hw_from_side(ref_astc_resolution, h0, w0)
     if (ref_h, ref_w) != (h0, w0):
-        print(f"[ASTC Test] {ref_astc_name} encode/decode at {ref_h}x{ref_w}, aligned to LOD0 {h0}x{w0} for metrics")
+        print(f"[ASTC Test] {ref_astc_name} encode/decode at {ref_h}x{ref_w}, aligned to Mip0 {h0}x{w0} for metrics")
 
     quant_model = copy.deepcopy(model)
     quant_model.simulate_quantize()
     quant_model.eval()
-    pred_fntc = _render_model_lod0(quant_model, dataset, texture_height, texture_width, num_lods, device)
+    pred_fntc = _render_model_mip0(quant_model, dataset, texture_height, texture_width, num_mips, device)
 
     astc_grid_model = copy.deepcopy(quant_model)
     apply_astc_to_feature_grids(astc_grid_model, astc_codec.roundtrip_rgba)
     astc_grid_model.eval()
     astc_base = None
     if getattr(astc_grid_model, "super_resolution_enable", False):
-        astc_base = _astc_roundtrip_superres_base_lod0(
+        astc_base = _astc_roundtrip_superres_base_mip0(
             dataset,
             astc_codec.roundtrip_rgba,
             int(getattr(dataset, "super_resolution_base_resolution", dataset.superres_input_max_edge)),
         )
-    pred_fntc_grid_astc = _render_model_lod0(
-        astc_grid_model, dataset, texture_height, texture_width, num_lods, device,
+    pred_fntc_grid_astc = _render_model_mip0(
+        astc_grid_model, dataset, texture_height, texture_width, num_mips, device,
         superres_base_override=astc_base,
     )
 
     pred_traditional_astc = _traditional_baseline_resampled(
-        gt_lod0=gt_image,
+        gt_mip0=gt_image,
         dataset=dataset,
         roundtrip_rgba=astc_codec.roundtrip_rgba,
         ref_h=ref_h,

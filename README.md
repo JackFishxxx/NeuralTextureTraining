@@ -7,7 +7,7 @@ This project is used to train Neural Texture (NTC) models. The code is implement
 Neural Texture (NTC) is a network-based method for texture representation and compression. Unlike traditional formats such as PNG, JPEG, or ASTC, Neural Texture combines a **feature grid** with a small **MLP (multi-layer perceptron)** to compactly store and reconstruct high-resolution texture information, while still supporting random access to texels. Its advantages include:
 
 - **High compression ratio**: preserves more detail at equal or lower storage cost.
-- **Scalability**: supports multi-resolution, LODs, and joint representation with material parameters.
+- **Scalability**: supports multi-resolution, Mips, and joint representation with material parameters.
 - **Versatility**: applicable not only to albedo maps but also normal maps, roughness maps, and other material textures.
 
 ### Motivation and Tiered Deployment
@@ -223,7 +223,11 @@ tensorboard --logdir ./outputs/tensorboard
 The following metrics are logged automatically during training:
 
 - **Loss/train**: Training loss
-- **PSNR / SSIM / LPIPS**: Image quality metrics per LOD level
+- **PSNR / SSIM / LPIPS**: Image quality metrics per Mip level
+
+Set `mip0_only: true` in `config.yaml` (or pass `--mip0_only`) to restrict training samples and
+loss, inference metrics and visualizations, and comparison inputs to the full-resolution Mip0.
+The default is `false`, which preserves multi-Mip training and inference.
 
 ---
 
@@ -261,6 +265,31 @@ Training simulates quantization error in the forward pass so the model adapts to
 
 - **Straight-Through Estimator (STE) Quantization**: The forward pass uses quantized values while gradients pass through unchanged, accurately simulating inference-time rounding and reducing color bias compared to additive noise.
 
+### ASTC-Aware Latent Training
+
+FNTC can train against the real `astcenc` round-trip instead of using only a noise approximation.
+When enabled, the trainer periodically quantizes the highest-resolution feature level, runs ASTC
+6x6, caches the decoded latent texture, and evaluates an ASTC branch with the same super-resolution
+base used at deployment. A clean QAT branch remains active to prevent the latent representation from
+drifting toward a codec-only solution.
+
+Recommended settings in `config.yaml`:
+
+```yaml
+astc_aware_enable: true
+astc_codec_in_loop_enable: true
+astc_codec_in_loop_interval: 1000
+astc_codec_start_frac: 0.3
+astc_codec_lod0_prob: 1.0
+astc_codec_loss_weight: 0.7
+astc_clean_loss_weight: 0.3
+astc_consistency_weight: 0.0
+```
+
+`astc_codec_start_frac` reserves an initial clean-QAT phase. After calibration, `astc_codec_lod0_prob`
+increases full-resolution samples so the codec branch receives sufficient training signal. The ASTC
+comparison requires an `astcenc` executable; it is downloaded or resolved through `astcenc_path`.
+
 ### Seamless Tiling (Wrap Boundary Constraint)
 
 The feature grid supports a **wrap boundary constraint**: during training, left/right and top/bottom border features (as well as corners) are softly tied together, preventing visible seams when the feature texture is sampled in Wrap/Repeat mode at runtime.
@@ -276,7 +305,7 @@ The model supports **heterogeneous feature grids** through the `feature_grid_con
 | Field | Description |
 |-------|-------------|
 | `max_resolution` | Maximum resolution of the grid |
-| `n_levels` | Number of LOD levels |
+| `n_levels` | Number of Mip levels |
 | `quantize_bits` | Quantization precision (2 / 4 / 8 / 16 bits) |
 | `save_bits` | Save precision (8 / 16 / 32 / 64 bits) |
 | `learning_rate` | Per-grid learning rate |
@@ -302,5 +331,5 @@ Set `super_resolution_enable: true` and configure `super_resolution_base_resolut
 residual super-resolution. The source mip at that resolution is bilinearly upsampled and provided
 alongside the feature-grid samples; the network predicts `GT - bilinear_base`. Training, inference,
 and ASTC comparison reconstruct `clamp(bilinear_base + predicted_residual, 0, 1)`. The same mip-level
-offset is used for lower LODs. Enabling this mode automatically disables direct-diffuse inference,
+offset is used for lower Mips. Enabling this mode automatically disables direct-diffuse inference,
 whose direct-output semantics conflict with residual prediction.

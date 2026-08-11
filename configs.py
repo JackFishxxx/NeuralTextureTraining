@@ -8,6 +8,29 @@ import torch
 import yaml
 
 
+def mip_sampling_probabilities(num_mips: int, mip0_only: bool, device: str = "cpu") -> torch.Tensor:
+    if num_mips < 1:
+        raise ValueError("num_mips must be at least 1")
+    if mip0_only:
+        probabilities = torch.zeros(num_mips, device=device)
+        probabilities[0] = 1.0
+        return probabilities
+
+    probabilities = []
+    current_prob = 1.0
+    for _ in range(num_mips):
+        current_prob /= 4.0
+        probabilities.append(max(current_prob, 0.05))
+    result = torch.tensor(probabilities, device=device)
+    return result / result.sum()
+
+
+def inference_mips(num_mips: int, mip0_only: bool) -> range:
+    if num_mips < 1:
+        raise ValueError("num_mips must be at least 1")
+    return range(1) if mip0_only else range(max(1, num_mips - 4))
+
+
 def _load_yaml_defaults(config_path=None):
     """Load YAML config file as a dict of default values.
 
@@ -94,6 +117,7 @@ class Config():
         self.save_interval = params.save_interval
         self.eval_inference_tile = params.eval_inference_tile
         self.eval_metrics_max_edge = params.eval_metrics_max_edge
+        self.mip0_only = bool(getattr(params, "mip0_only", False))
 
         ### ---------- early stopping configs ---------- ###
         self.early_stop = params.early_stop
@@ -108,7 +132,7 @@ class Config():
 
         ### ---------- model configs ---------- ###
         self.num_channels = 0
-        self.num_lods = 1
+        self.num_mips = 1
         self.n_frequencies = int(getattr(params, "n_frequencies", 0))
         self.pos_encoding_tile_size = int(getattr(params, "pos_encoding_tile_size", 32))
         self.pos_encoding_reference_edge = int(getattr(params, "pos_encoding_reference_edge", 0))
@@ -160,7 +184,7 @@ class Config():
         # Values: per-channel weight
         default_texture_weights = {
             "diffuse": 1.0,
-            "normal": 0.3,
+            "normal": 0.2,
             "roughness": 0.2,
             "occlusion": 0.2,
             "metallic": 0.2,
@@ -237,7 +261,7 @@ class Config():
         cfg.save_dir = os.path.join(self.groups_save_dir, group_name)
         # Reset per-dataset fields so they get re-populated by the dataset
         cfg.num_channels = 0
-        cfg.num_lods = 1
+        cfg.num_mips = 1
         cfg.output_loss_weights = None
         return cfg
 
@@ -330,6 +354,8 @@ def get_args():
                         help='eval/infer: tile edge in pixels (0 = one batch over full plane, may OOM)')
     parser.add_argument('--eval_metrics_max_edge', type=int, default=0,
                         help='area-downsample to this max(H,W) before PSNR/SSIM/LPIPS (0 = full res)')
+    parser.add_argument('--mip0_only', action=argparse.BooleanOptionalAction, default=False,
+                        help='restrict training samples, loss, inference metrics, and comparisons to Mip0')
     parser.add_argument('--feature_grid_configs', type=yaml.safe_load, default=None,
                         help='YAML list of learned feature-grid configs')
     parser.add_argument('--texture_loss_weights', type=yaml.safe_load, default=None,
@@ -354,7 +380,7 @@ def get_args():
     parser.add_argument('--astc_block', type=str, default='6x6',
                         help='ASTC block size, e.g. 4x4 / 6x6 / 8x8')
     parser.add_argument('--ref_astc_resolution', type=int, default=1024,
-                        help='Traditional ref_astc_* baseline: square edge length (H=W) before astcenc; omit for LOD0 size')
+                        help='Traditional ref_astc_* baseline: square edge length (H=W) before astcenc; omit for Mip0 size')
 
     ### ---------- algorithm configs ---------- ###
     parser.add_argument('--n_frequencies', type=int, default=0,

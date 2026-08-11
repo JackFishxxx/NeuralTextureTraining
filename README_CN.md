@@ -7,7 +7,7 @@
 神经纹理（Neural Texture, NTC）是一种基于神经网络的纹理表示与压缩方法。与传统的 PNG、JPEG、ASTC 等压缩方式不同，神经纹理使用**特征网格（Feature Grid）** 与**小型神经网络（MLP）** 相结合，将高分辨率的纹理信息以更紧凑的形式存储和还原，同时支持纹理对于图像随机读取的要求。其优势包括：
 
 - **高压缩率**：在相同或更低的存储开销下保留更多细节。
-- **可扩展性**：支持多分辨率、LOD，以及与材质参数的联合表示。
+- **可扩展性**：支持多分辨率、Mip，以及与材质参数的联合表示。
 - **强适用性**：不仅适用于颜色贴图，还可以用于法线、粗糙度等材质纹理的表示。
 
 ### 研究背景与分层部署动机
@@ -226,7 +226,11 @@ tensorboard --logdir ./outputs/tensorboard
 训练过程中会自动记录以下指标：
 
 - **Loss/train**：训练损失
-- **PSNR / SSIM / LPIPS**：各 LOD 级别的图像质量评估指标
+- **PSNR / SSIM / LPIPS**：各 Mip 级别的图像质量评估指标
+
+在 `config.yaml` 中设置 `mip0_only: true`（或传入 `--mip0_only`），可将训练采样与 loss、
+推理指标与可视化以及 comparison 输入统一限制为全分辨率 Mip0。默认值为 `false`，保持多 Mip
+训练和推理行为。
 
 ## 主要特性
 
@@ -263,6 +267,30 @@ diffuse(3) | normal(3 或 2) | roughness(1) | occlusion(1) | metallic(1) | specu
 
 - **直通估计器（STE）量化**：前向传播使用量化值，反向传播梯度直接通过，准确模拟推理时的舍入行为，降低颜色偏差。
 
+### ASTC 感知 Latent 训练
+
+FNTC 支持直接使用真实 `astcenc` 往返结果进行训练，而不只依赖噪声近似。启用后，训练器会
+定期对最高分辨率 feature level 执行量化和 ASTC 6x6 编解码，将解码后的 latent 缓存下来，
+并使用部署时相同的超分 base 训练 ASTC 分支。同时保留 clean QAT 分支，避免 latent 退化为只适应
+codec 的表示。
+
+推荐在 `config.yaml` 中使用：
+
+```yaml
+astc_aware_enable: true
+astc_codec_in_loop_enable: true
+astc_codec_in_loop_interval: 1000
+astc_codec_start_frac: 0.3
+astc_codec_lod0_prob: 1.0
+astc_codec_loss_weight: 0.7
+astc_clean_loss_weight: 0.3
+astc_consistency_weight: 0.0
+```
+
+`astc_codec_start_frac` 用于保留初始 clean-QAT 预训练阶段。完成校准后，
+`astc_codec_lod0_prob` 提高全分辨率样本比例，保证 codec 分支获得足够训练信号。
+ASTC 对比需要可用的 `astcenc` 可执行文件，程序会通过 `astcenc_path` 自动定位或下载。
+
 ### 无缝平铺（Wrap Boundary Constraint）
 
 特征网格支持**无缝平铺约束**：训练过程中自动同步网格左右、上下及四角的边界特征，使得特征纹理在 Wrap/Repeat 采样模式下不产生接缝，适合需要平铺的材质。
@@ -278,7 +306,7 @@ diffuse(3) | normal(3 或 2) | roughness(1) | occlusion(1) | metallic(1) | specu
 | 字段 | 说明 |
 |------|------|
 | `max_resolution` | 最大分辨率 |
-| `n_levels` | LOD 层级数 |
+| `n_levels` | Mip 层级数 |
 | `quantize_bits` | 量化精度（2/4/8/16 位） |
 | `save_bits` | 保存精度（8/16/32/64 位） |
 | `learning_rate` | 独立学习率 |
@@ -303,5 +331,5 @@ output_activation: hard_swish
 在 `config.yaml` 中设置 `super_resolution_enable: true` 并指定
 `super_resolution_base_resolution` 可启用超分残差训练。该分辨率的原始纹理 mip 作为 base，
 经双线性上采样后与 feature grid 特征拼接，网络拟合 `GT - bilinear_base`。评测、推理和 ASTC
-对比均使用 `clamp(bilinear_base + predicted_residual, 0, 1)` 与 GT 计算指标。更低 LOD 使用
+对比均使用 `clamp(bilinear_base + predicted_residual, 0, 1)` 与 GT 计算指标。更低 Mip 使用
 相同的纹理层级偏移。启用后会自动关闭与残差输出语义冲突的 direct diffuse 模式。

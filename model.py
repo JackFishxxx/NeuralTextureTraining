@@ -97,6 +97,13 @@ class TCNNModel(torch.nn.Module):
         self.n_neurons = config.n_neurons
         self.n_hidden_layers = config.n_hidden_layers
         self.output_activation = getattr(config, "output_activation", "hard_swish")
+        self.astc_aware_enable = bool(getattr(config, "astc_aware_enable", False))
+        self.astc_aware_block = int(getattr(config, "astc_aware_block", 6))
+        self.astc_aware_noise_scale = float(getattr(config, "astc_aware_noise_scale", 1.0))
+        self.astc_aware_start_frac = float(getattr(config, "astc_aware_start_frac", 0.1))
+        self.astc_codec_update_latent = bool(getattr(config, "astc_codec_update_latent", False))
+        self.astc_codec_calibrated = False
+        self.astc_codec_branch_enabled = False
         # Network output matches the selected canonical texture layout.
         self.normal_encoding = str(getattr(config, "normal_encoding", "xyz")).lower()
         self.num_channels = canonical_num_channels(self.normal_encoding)
@@ -124,6 +131,9 @@ class TCNNModel(torch.nn.Module):
             self.feature_grid_learning_rates.append(grid_cfg.get('learning_rate', config.learning_rate))
 
         self.init_model(config)
+        for idx in range(len(self.feature_grids)):
+            self.register_buffer(f"_astc_decoded_texture_{idx}", torch.empty(0), persistent=False)
+            self.register_buffer(f"_astc_error_texture_{idx}", torch.empty(0), persistent=False)
         if config.load_dir is not None:
             self.load_ckpt(config)
 
@@ -270,6 +280,55 @@ class TCNNModel(torch.nn.Module):
         p = (t - w) / max(1, T - w)
         c = 0.5 * (1.0 + math.cos(math.pi * p))
         return self._qat_noise_mult_end + (self._qat_noise_mult_start - self._qat_noise_mult_end) * c
+
+    def _astc_aware_latent_noise(self, uvs, selected_level, res, channels):
+        """Deterministic block-correlated perturbation approximating ASTC endpoint error."""
+        if not self.astc_aware_enable or self.current_iter < int(self.max_iter * self.astc_aware_start_frac):
+            return torch.zeros((uvs.shape[0], channels), device=uvs.device, dtype=uvs.dtype)
+        block = torch.floor(uvs * res / float(self.astc_aware_block))
+        channel = torch.arange(channels, device=uvs.device, dtype=uvs.dtype)[None, :]
+        seed = (block[:, 0:1] * 12.9898 + block[:, 1:2] * 78.233
+                + channel * 37.719 + float(self.current_iter) * 0.0137)
+        hashed = torch.frac(torch.sin(seed) * 43758.5453) - 0.5
+        return hashed * (self.astc_aware_noise_scale / 255.0)
+
+    def set_astc_codec_noise_scale(self, scale: float) -> None:
+        """Update proxy amplitude from a measured real ASTC latent RMS error."""
+        self.astc_aware_noise_scale = float(max(0.0, scale))
+        self.astc_codec_calibrated = True
+
+    def set_astc_codec_decoded_texture(
+        self, grid_idx: int, decoded: torch.Tensor, source: torch.Tensor = None
+    ) -> None:
+        """Cache an ASTC decode and, when available, its error from the encoded source."""
+        name = f"_astc_decoded_texture_{int(grid_idx)}"
+        if not hasattr(self, name):
+            raise IndexError(f"invalid feature grid index {grid_idx}")
+        decoded = decoded.detach().to(device=self.device, dtype=torch.float32).contiguous()
+        setattr(self, name, decoded)
+        error_name = f"_astc_error_texture_{int(grid_idx)}"
+        if source is not None:
+            source = source.detach().to(device=self.device, dtype=torch.float32)
+            setattr(self, error_name, (decoded - source).contiguous())
+        self.astc_codec_calibrated = True
+
+    def _sample_astc_codec_texture(self, grid_idx: int, uvs: torch.Tensor) -> torch.Tensor:
+        decoded = getattr(self, f"_astc_decoded_texture_{int(grid_idx)}")
+        if decoded.numel() == 0:
+            return torch.empty(0, device=uvs.device, dtype=uvs.dtype)
+        texture = decoded.permute(2, 0, 1).unsqueeze(0)
+        grid = (torch.remainder(uvs, 1.0) * 2.0 - 1.0).view(1, -1, 1, 2)
+        sampled = F.grid_sample(texture, grid, mode="bilinear", padding_mode="border", align_corners=False)
+        return sampled.squeeze(0).squeeze(-1).transpose(0, 1).to(dtype=uvs.dtype)
+
+    def _sample_astc_codec_error(self, grid_idx: int, uvs: torch.Tensor) -> torch.Tensor:
+        error = getattr(self, f"_astc_error_texture_{int(grid_idx)}")
+        if error.numel() == 0:
+            return torch.empty(0, device=uvs.device, dtype=uvs.dtype)
+        texture = error.permute(2, 0, 1).unsqueeze(0)
+        grid = (torch.remainder(uvs, 1.0) * 2.0 - 1.0).view(1, -1, 1, 2)
+        sampled = F.grid_sample(texture, grid, mode="bilinear", padding_mode="border", align_corners=False)
+        return sampled.squeeze(0).squeeze(-1).transpose(0, 1).to(dtype=uvs.dtype)
 
     def load_ckpt(self, config: Config) -> None:
 
@@ -451,11 +510,35 @@ class TCNNModel(torch.nn.Module):
                 noise_range = 0.5 * Q_k
                 mult = self._qat_noise_multiplier()
                 noise = (torch.rand_like(sampled_features) * 2 - 1) * noise_range * mult
+                if self.astc_codec_branch_enabled:
+                    noise = torch.zeros_like(noise)
                 sampled_features_noisy = sampled_features + noise
                 # Quantize (round to grid) then use STE
                 quantized = torch.round(sampled_features_noisy / Q_k) * Q_k
                 # Straight-through: forward uses quantized, backward uses sampled_features
                 sampled_features = sampled_features + (quantized - sampled_features).detach()
+
+            if self.training and self.num_sampled_mips == 1 and self.astc_codec_branch_enabled:
+                selected_res = self.feature_grid_base_res[idx] * torch.pow(
+                    2.0, selected_level_f
+                )
+                highest_level = self.feature_grid_n_levels[idx] - 1
+                highest_mask = (selected_level_f == float(highest_level)).to(sampled_features.dtype)
+                codec_error = self._sample_astc_codec_error(idx, uvs)
+                if codec_error.numel() > 0:
+                    # Apply the last measured ASTC error to the current quantized
+                    # latent. This stays useful as the feature grid evolves and
+                    # keeps an identity-gradient surrogate for latent updates.
+                    codec_approx = sampled_features + codec_error.detach()
+                    sampled_features = sampled_features * (1.0 - highest_mask) + codec_approx * highest_mask
+                else:
+                    perturbation = self._astc_aware_latent_noise(
+                        uvs, selected_level_f, selected_res, sampled_features.shape[1]
+                    )
+                    sampled_features = sampled_features + perturbation * highest_mask
+
+                if not self.astc_codec_update_latent:
+                    sampled_features = sampled_features.detach()
 
             if self.direct_diffuse_enabled and idx == 0:
                 nearest_uvs = self._nearest_grid_uv(uvs, selected_level_f, self.feature_grid_base_res[idx])

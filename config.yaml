@@ -35,6 +35,23 @@ super_resolution_base_resolution: 512
 n_frequencies: 0
 pos_encoding_tile_size: 32
 
+# ---------- astc aware configs ----------
+astc_aware_enable: true
+astc_aware_block: 6
+astc_aware_noise_scale: 1.0
+astc_aware_start_frac: 0.0
+astc_codec_in_loop_enable: true
+astc_codec_update_latent: false
+astc_codec_in_loop_interval: 1000
+astc_codec_loss_weight: 0.3
+astc_clean_loss_weight: 0.7
+# Let the quantized latent settle before adapting the decoder to real ASTC.
+astc_codec_start_frac: 0.3
+astc_codec_mip0_prob: 1.0
+# Clean and ASTC branches use different bases; residual consistency is optional.
+astc_consistency_weight: 0.0
+
 # ---------- network configs ----------
 n_neurons: 16
-n_hidden_layers: 0
+n_hidden_layers: 1
+learning_rate: 0.002

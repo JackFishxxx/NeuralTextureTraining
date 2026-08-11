@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import datetime
 import argparse
 import json
+import copy
 from typing import List, Optional, Tuple
 from torchmetrics.image import (
     LearnedPerceptualImagePatchSimilarity,
@@ -22,7 +23,13 @@ from model import TCNNModel
 from dataset import TextureDataset
 from normal_encoding import decode_normal, normal_angular_loss, normal_angular_psnr
 from configs import Config
-from Comparison_ASTC import ASTCCodec, ASTCENC_DEFAULT_PATH, run_astc_comparison_pipeline
+from Comparison_ASTC import (
+    ASTCCodec,
+    ASTCENC_DEFAULT_PATH,
+    _astc_roundtrip_superres_base_mip0,
+    apply_astc_to_feature_grids,
+    run_astc_comparison_pipeline,
+)
 
 
 class Trainer:
@@ -123,13 +130,25 @@ class Trainer:
         self.ref_astc_resolution = getattr(configs, "ref_astc_resolution", None)
         self.normal_encoding = str(getattr(configs, "normal_encoding", "xyz")).lower()
         self.super_resolution_enable = bool(getattr(configs, "super_resolution_enable", False))
+        self.astc_codec_loss_weight = float(getattr(configs, "astc_codec_loss_weight", 0.7))
+        self.astc_clean_loss_weight = float(getattr(configs, "astc_clean_loss_weight", 0.3))
+        self.astc_consistency_weight = float(getattr(configs, "astc_consistency_weight", 0.1))
+        self.astc_codec_mip0_prob = float(getattr(configs, "astc_codec_mip0_prob", 0.5))
+        self.astc_codec_start_frac = float(getattr(configs, "astc_codec_start_frac", 0.0))
+        self.astc_codec_cache_iter = None
         self.astc_codec = ASTCCodec(
             astcenc_path=self.astcenc_path,
             astcenc_quality=self.astcenc_quality,
             astc_block=self.astc_block,
         )
-        if self.enable_astc_compare:
+        if self.enable_astc_compare or getattr(configs, "astc_codec_in_loop_enable", False):
             self.astc_codec.ensure_executable()
+        self.astc_superres_base_mip0 = None
+        if getattr(configs, "astc_codec_in_loop_enable", False) and self.super_resolution_enable:
+            astc_base = _astc_roundtrip_superres_base_mip0(
+                dataset, self.astc_codec.roundtrip_rgba, int(configs.super_resolution_base_resolution)
+            )
+            self.astc_superres_base_mip0 = astc_base[0].permute(1, 2, 0).contiguous()
 
     def _log_checkpoint_interval(self, curr_iter: int) -> None:
         now = datetime.datetime.now()
@@ -234,6 +253,24 @@ class Trainer:
 
         for curr_iter in range(self.trained_iter, self.max_iter):
 
+            # Enable the ASTC codec branch only after its configured warm-up fraction.
+            codec_phase_active = (
+                bool(getattr(self.configs, "astc_codec_in_loop_enable", False))
+                and curr_iter >= int(self.max_iter * self.astc_codec_start_frac)
+            )
+            codec_start_iter = int(self.max_iter * self.astc_codec_start_frac)
+            codec_interval = int(self.configs.astc_codec_in_loop_interval)
+            calibration_due = (
+                codec_phase_active
+                and curr_iter > 0
+                and (
+                    self.astc_codec_cache_iter is None
+                    or (curr_iter - codec_start_iter) % codec_interval == 0
+                )
+            )
+            if calibration_due:
+                self._calibrate_astc_aware_latent(curr_iter)
+
             self.model.optimizer.zero_grad()
 
             # update model's current iteration for noise annealing
@@ -270,7 +307,8 @@ class Trainer:
             batch_input = torch.cat([us, vs, mips], dim=1)
             if superres_base is not None:
                 batch_input = torch.cat([batch_input, superres_base], dim=1)
-            # predict (clean branch)
+            # Clean QAT branch remains active to preserve the uncompressed latent solution.
+            self.model.astc_codec_branch_enabled = False
             predict_texture = self.model(batch_input)  # [batch_size, num_channels]
 
             # base reconstruction loss; normal uses angular loss, others use channel MSE
@@ -284,9 +322,52 @@ class Trainer:
                 base_loss = self._compute_reconstruction_loss(gt_texture, predict_texture, loss_weights, curr_iter)
 
             total_loss = base_loss
+            codec_loss = None
+            consistency_loss = None
+            mip0 = batch_index[:, 2] == 0
+            codec_select = mip0
+            if codec_phase_active and self.astc_codec_mip0_prob < 1.0:
+                codec_select = codec_select & (
+                    torch.rand(batch_index.shape[0], device=self.device) < self.astc_codec_mip0_prob
+                )
+            if codec_phase_active and bool(codec_select.any()):
+                codec_base = superres_base[codec_select] if superres_base is not None else None
+                codec_input = batch_input[codec_select]
+                codec_gt = gt_texture[codec_select]
+                if codec_base is not None and self.astc_superres_base_mip0 is not None:
+                    codec_base = self.astc_superres_base_mip0[ys[codec_select, 0], xs[codec_select, 0]].to(superres_base.dtype)
+                    codec_input = torch.cat([batch_input[codec_select, :3], codec_base], dim=1)
+                self.model.astc_codec_branch_enabled = True
+                try:
+                    codec_predict = self.model(codec_input)
+                finally:
+                    self.model.astc_codec_branch_enabled = False
+                if codec_base is not None:
+                    codec_target = codec_gt - codec_base
+                    codec_loss = self._compute_superres_residual_loss(
+                        codec_target, codec_predict, loss_weights, curr_iter=None
+                    )
+                else:
+                    codec_loss = self._compute_reconstruction_loss(
+                        codec_gt, codec_predict, loss_weights, curr_iter=None
+                    )
+                # The two branches intentionally use different bases.  Comparing
+                # final colors therefore penalizes unavoidable ASTC base error.
+                # Compare predicted residuals instead, which isolates decoder
+                # consistency and does not fight the codec reconstruction loss.
+                consistency_loss = (codec_predict.float() - predict_texture[codec_select].float().detach()).pow(2).mean()
+                total_loss = (self.astc_clean_loss_weight * base_loss
+                              + self.astc_codec_loss_weight * codec_loss
+                              + self.astc_consistency_weight * consistency_loss)
 
             self.writer.add_scalar('Loss/train', total_loss.item(), curr_iter)
             self.writer.add_scalar('Loss/base', base_loss.item(), curr_iter)
+            if codec_loss is not None:
+                self.writer.add_scalar('Loss/astc_codec', codec_loss.item(), curr_iter)
+                self.writer.add_scalar('Loss/astc_consistency', consistency_loss.item(), curr_iter)
+                self.writer.add_scalar('ASTCInLoop/mip0_fraction', codec_select.float().mean().item(), curr_iter)
+                if self.astc_codec_cache_iter is not None:
+                    self.writer.add_scalar('ASTCInLoop/cache_age', float(curr_iter - self.astc_codec_cache_iter), curr_iter)
 
             # optimize
             total_loss.backward()
@@ -358,6 +439,49 @@ class Trainer:
                 tcnn.free_temporary_memory()
 
         self._log_total_training_time()
+
+    @torch.no_grad()
+    def _calibrate_astc_aware_latent(self, curr_iter: int) -> None:
+        """Measure real astcenc latent error and update the training proxy amplitude.
+
+        The codec call is outside autograd. Subsequent training iterations use the
+        measured RMS code error in the differentiable block-correlated proxy.
+        """
+        probe = copy.deepcopy(self.model).eval()
+        probe.simulate_quantize()
+        before = []
+        for grid in probe.feature_grids:
+            before.append(grid.state_dict()["params"].detach().clone())
+        apply_astc_to_feature_grids(probe, self.astc_codec.roundtrip_rgba)
+        sq_sum = 0.0
+        count = 0
+        for grid_idx, (old, grid, spec) in enumerate(zip(
+                before, probe.feature_grids, probe.feature_grid_specs)):
+            new = grid.state_dict()["params"].detach()
+            offset, level_count, resolution = spec.highest_level_slice()
+            delta = new[offset:offset + level_count] - old[offset:offset + level_count]
+            decoded_texture = new[offset:offset + level_count].reshape(
+                resolution, resolution, spec.n_features_per_level
+            )
+            source_texture = old[offset:offset + level_count].reshape(
+                resolution, resolution, spec.n_features_per_level
+            )
+            self.model.set_astc_codec_decoded_texture(grid_idx, decoded_texture, source_texture)
+            delta_codes = delta * float(spec.quant_step_count)
+            sq_sum += float(delta_codes.float().pow(2).sum().item())
+            count += delta_codes.numel()
+            channel_rms = delta_codes.reshape(-1, spec.n_features_per_level).float().pow(2).mean(0).sqrt()
+            for channel, value in enumerate(channel_rms.tolist()):
+                self.writer.add_scalar(
+                    f"ASTCInLoop/grid{grid_idx}_channel{channel}_rms_codes", value, curr_iter
+                )
+        rms_codes = (sq_sum / max(1, count)) ** 0.5
+        proxy_scale = min(8.0, rms_codes * (12.0 ** 0.5))
+        self.model.set_astc_codec_noise_scale(proxy_scale)
+        self.astc_codec_cache_iter = curr_iter
+        self.writer.add_scalar("ASTCInLoop/latent_rms_codes", rms_codes, curr_iter)
+        self.writer.add_scalar("ASTCInLoop/proxy_noise_scale", proxy_scale, curr_iter)
+        print(f"[ASTCInLoop] Iter {curr_iter}: latent RMS={rms_codes:.4f} codes, proxy scale={proxy_scale:.4f}")
 
     def _cuda_trim_eval_mem(self, synchronize: bool = False) -> None:
         if self.device != "cuda":

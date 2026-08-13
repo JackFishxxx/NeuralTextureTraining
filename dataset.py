@@ -125,6 +125,31 @@ class TextureDataset(torch.nn.Module):
         return batch_data
 
     @torch.no_grad()
+    def sample_continuous(self, sample_xy: torch.Tensor, mips: torch.Tensor,
+                          cache: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Bilinear sample mip_cache at fractional full-resolution coordinates (repeat wrap)."""
+        source = self.mip_cache if cache is None else cache
+        mip_i = mips.to(torch.long).reshape(-1)
+        scale = torch.pow(torch.tensor(2.0, device=sample_xy.device), mip_i).float()
+        x, y = sample_xy[:, 1].float() / scale, sample_xy[:, 0].float() / scale
+        h = (self.texture_height // scale.to(torch.long)).clamp_min(1)
+        w = (self.texture_width // scale.to(torch.long)).clamp_min(1)
+        fx, fy = torch.floor(x), torch.floor(y)
+        x0, y0 = torch.remainder(fx.to(torch.long), w), torch.remainder(fy.to(torch.long), h)
+        x1, y1 = torch.remainder(x0 + 1, w), torch.remainder(y0 + 1, h)
+        tx, ty = (x - fx).to(source.dtype), (y - fy).to(source.dtype)
+        c00 = source[mip_i, y0, x0]; c10 = source[mip_i, y0, x1]
+        c01 = source[mip_i, y1, x0]; c11 = source[mip_i, y1, x1]
+        return ((1-tx[:,None])*(1-ty[:,None])*c00 + tx[:,None]*(1-ty[:,None])*c10
+                + (1-tx[:,None])*ty[:,None]*c01 + tx[:,None]*ty[:,None]*c11)
+
+    @torch.no_grad()
+    def get_superres_base_continuous(self, sample_xy, mips):
+        if self.superres_base_cache is None:
+            raise RuntimeError("Super-resolution is not enabled")
+        return self.sample_continuous(sample_xy, mips, cache=self.superres_base_cache)
+
+    @torch.no_grad()
     def get_superres_base(
             self,
             batch_index: TensorType["batch_size", 3]
@@ -242,7 +267,7 @@ class TextureDataset(torch.nn.Module):
                           f"to match other textures.")
                     textures[texture_type] = TF.resize(
                         textures[texture_type], [target_h, target_w],
-                        interpolation=TF.InterpolationMode.BICUBIC,
+                        interpolation=TF.InterpolationMode.BILINEAR,
                         antialias=True,
                     )
                     textures[texture_type] = torch.clamp(textures[texture_type], 0.0, 1.0)
@@ -271,14 +296,14 @@ class TextureDataset(torch.nn.Module):
             normal_vec = normalize_normal_rgb(decode_normal(tex_chw, self.normal_encoding))
             mip_vec = TF.resize(
                 normal_vec, [mip_height, mip_width],
-                interpolation=TF.InterpolationMode.BICUBIC,
+                interpolation=TF.InterpolationMode.BILINEAR,
                 antialias=True,
             )
             return encode_normal(normal_to_rgb(mip_vec), self.normal_encoding)
 
         mip_texture = TF.resize(
             tex_chw, [mip_height, mip_width],
-            interpolation=TF.InterpolationMode.BICUBIC,
+            interpolation=TF.InterpolationMode.BILINEAR,
             antialias=True,
         )
         return torch.clamp(mip_texture, min=0., max=1.)
@@ -294,14 +319,21 @@ class TextureDataset(torch.nn.Module):
         # work on cpu seems not to have this problem
         textures = self.textures.cpu()
 
+        # Build a conventional mip chain: each level is filtered from the
+        # immediately preceding level, rather than repeatedly from Mip0.
+        previous_parts = {}
         for mip in range(self.num_mips):
             mip_height = self.texture_height // (2 ** mip)
             mip_width = self.texture_width // (2 ** mip)
             mip_parts = []
             for texture_type in self.available_textures:
                 ds_start, ds_end = self.channel_slices[texture_type]
-                tex_chw = textures[:, :, ds_start:ds_end].permute(2, 0, 1)
+                if mip == 0:
+                    tex_chw = textures[:, :, ds_start:ds_end].permute(2, 0, 1)
+                else:
+                    tex_chw = previous_parts[texture_type]
                 mip_parts.append(self._resize_texture_for_mip(texture_type, tex_chw, mip_height, mip_width))
+                previous_parts[texture_type] = mip_parts[-1]
             mip_texture = torch.cat(mip_parts, dim=0).permute(1, 2, 0)
             # [mip, H, W, C] <- [mip_H, mip_W, C]
             mip_cache[mip, :mip_height, :mip_width, :] = mip_texture

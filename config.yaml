@@ -32,8 +32,8 @@ super_resolution_enable: true
 super_resolution_base_resolution: 512
 
 # ---------- tiled positional encoding configs ----------
-n_frequencies: 0
-pos_encoding_tile_size: 32
+n_frequencies: 2
+pos_encoding_tile_size: 16
 
 # ---------- astc aware configs ----------
 astc_aware_enable: true
@@ -42,7 +42,7 @@ astc_aware_noise_scale: 1.0
 astc_aware_start_frac: 0.0
 astc_codec_in_loop_enable: true
 astc_codec_update_latent: false
-astc_codec_in_loop_interval: 1000
+astc_codec_in_loop_interval: 100
 astc_codec_loss_weight: 0.3
 astc_clean_loss_weight: 0.7
 # Let the quantized latent settle before adapting the decoder to real ASTC.

@@ -71,7 +71,7 @@ def normal_angular_loss(pred_encoded: torch.Tensor, gt_encoded: torch.Tensor, no
     pred_n = normal_vectors(pred_encoded, normal_encoding)
     gt_n = normal_vectors(gt_encoded, normal_encoding)
     dot = (pred_n * gt_n).sum(dim=_channel_dim(pred_n)).clamp(-1.0, 1.0)
-    return (1.0 - dot).mean()
+    return ((1.0 - dot) * 0.5).mean()
 
 
 def normal_angular_error_degrees(pred_encoded: torch.Tensor, gt_encoded: torch.Tensor, normal_encoding: str = 'xyz') -> torch.Tensor:

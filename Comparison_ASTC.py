@@ -194,7 +194,18 @@ def _traditional_baseline_resampled(
     """Run traditional ASTC at (ref_h, ref_w), then resize to gt_mip0 spatial size for comparison."""
     h0, w0 = gt_mip0.shape[-2], gt_mip0.shape[-1]
     src = gt_mip0
-    if (ref_h, ref_w) != (h0, w0):
+    # Reuse the dataset's prefiltered mip when the requested ASTC source
+    # resolution corresponds to an actual mip level.
+    if hasattr(dataset, "mip_cache"):
+        for mip in range(int(getattr(dataset, "num_mips", 0))):
+            mh = dataset.texture_height // (2 ** mip)
+            mw = dataset.texture_width // (2 ** mip)
+            if (mh, mw) == (ref_h, ref_w):
+                cached = dataset.mip_cache[mip, :mh, :mw, :]
+                cached = dataset.expand_to_canonical(cached.reshape(-1, cached.shape[-1]))
+                src = cached.reshape(mh, mw, -1).permute(2, 0, 1)[None, ...]
+                break
+    if src is gt_mip0 and (ref_h, ref_w) != (h0, w0):
         src = F.interpolate(gt_mip0, size=(ref_h, ref_w), mode="bilinear", align_corners=False)
     out = build_traditional_astc_prediction(
         gt_image=src,
@@ -745,7 +756,14 @@ def run_astc_comparison_pipeline(
 
     gt_image = _render_gt_mip0(dataset, texture_height, texture_width)
     h0, w0 = gt_image.shape[-2], gt_image.shape[-1]
-    ref_h, ref_w = _ref_astc_hw_from_side(ref_astc_resolution, h0, w0)
+    feature_resolutions = []
+    for spec in getattr(model, "feature_grid_specs", []):
+        try:
+            feature_resolutions.append(int(spec.highest_level_slice()[2]))
+        except (AttributeError, TypeError, ValueError):
+            pass
+    effective_ref_resolution = ref_astc_resolution or (max(feature_resolutions) if feature_resolutions else None)
+    ref_h, ref_w = _ref_astc_hw_from_side(effective_ref_resolution, h0, w0)
     if (ref_h, ref_w) != (h0, w0):
         print(f"[ASTC Test] {ref_astc_name} encode/decode at {ref_h}x{ref_w}, aligned to Mip0 {h0}x{w0} for metrics")
 
@@ -805,10 +823,23 @@ def run_astc_comparison_pipeline(
         diff = method_metrics.get("diffuse")
         norm = method_metrics.get("normal")
         romd = method_metrics.get("romd")
+        if method_name == "fntc_quantized":
+            display_name = "FNTC_uncompressed"
+        elif method_name == fntc_astc_name:
+            display_name = f"FNTC_{astc_codec.astc_block}_compressed"
+        elif method_name == ref_astc_name:
+            display_name = f"ASTC_{astc_codec.astc_block}_compressed"
+            source_text = f"{ref_w}x{ref_h}x3"
+        else:
+            display_name = method_name
+            source_text = "unknown"
+        if method_name != ref_astc_name:
+            source_text = f"{max(feature_resolutions)}x{max(feature_resolutions)}" if feature_resolutions else "unknown"
+        display_label = f"{display_name}[{source_text}]"
         print(
-            f"[ASTC Test] {method_name} \t Weighted {_format_metric_triplet(avg)} "
+            f"[ASTC Test] {display_label:<42} Weighted {_format_metric_triplet(avg)} "
             f"(Diffuse {_format_metric_triplet(diff)}, "
-            f"NormalAngular {_format_metric_triplet(norm, 'normal')}, "
+            f"NormalAngular {_format_metric_triplet(norm)}, "
             f"ROMD {_format_metric_triplet(romd)})"
         )
 

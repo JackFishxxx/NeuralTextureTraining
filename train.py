@@ -224,7 +224,13 @@ class Trainer:
     def _loss_stats_str(self) -> str:
         residual_stat = self._last_loss_stats.get("superres_residual")
         if residual_stat is not None:
-            return f"Weighted super-resolution residual loss:{residual_stat['loss']:.6f}"
+            terms = []
+            for group, label in (("diffuse", "diffuse"), ("normal", "normal"), ("romd", "ROMD")):
+                stat = residual_stat.get(group)
+                if stat is not None:
+                    terms.append(f"{label} loss:{stat['loss']:.6f}")
+            decomposition = " + ".join(terms)
+            return f"Weighted super-resolution residual loss:{residual_stat['loss']:.6f} = {decomposition}"
         labels = {
             "diffuse": "Weighted diffuse loss",
             "normal": "Weighted normal angular loss",
@@ -246,7 +252,19 @@ class Trainer:
         loss = (mse * loss_weights.float()).sum()
         if curr_iter is not None:
             self.writer.add_scalar('Loss/superres_residual', loss.item(), curr_iter)
-            self._last_loss_stats = {"superres_residual": {"loss": float(loss.detach().item())}}
+            stats = {"loss": float(loss.detach().item())}
+            for group, textures in {
+                "diffuse": ["diffuse"],
+                "normal": ["normal"],
+                "romd": ["roughness", "occlusion", "metallic", "displacement"],
+            }.items():
+                idx = self._group_indices(textures, target_residual.device)
+                if idx.numel() == 0:
+                    continue
+                group_loss = (mse.index_select(0, idx) * loss_weights.index_select(0, idx).float()).sum()
+                stats[group] = {"loss": float(group_loss.detach().item())}
+                self.writer.add_scalar(f'Loss/superres_residual_{group}', stats[group]["loss"], curr_iter)
+            self._last_loss_stats = {"superres_residual": stats}
         return loss
 
     def train(self) -> None:

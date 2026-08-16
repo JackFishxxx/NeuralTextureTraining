@@ -54,6 +54,26 @@ astc_codec_mip0_prob: 1.0
 # Clean and ASTC branches use different bases; residual consistency is optional.
 astc_consistency_weight: 0.0
 
+# ---------- PBR scene comparison configs ----------
+enable_pbr_compare: true
+pbr_compare_interval: 5000
+pbr_render_resolution: 1024  # final cropped Cornell-box height per panel
+pbr_mip_lod_bias: -3.0  # use one sharper mip level
+pbr_loss_enable: true
+pbr_loss_weight: 0.2
+pbr_directional_light_enable: true
+# Direction points from the shaded surface toward the light.
+pbr_directional_light_direction: [-0.45, 0.62, -0.72]
+pbr_directional_light_intensity: 13.4
+pbr_directional_light_color: [1.0, 1.0, 1.0]
+pbr_point_lights:
+  - position: [0.0, 0.82, 0.7]
+    intensity: 6.5
+    color: [1.0, 1.0, 1.0]
+  - position: [-0.8, 0.45, -0.15]
+    intensity: 1.2
+    color: [1.0, 1.0, 1.0]
+
 # ---------- network configs ----------
 n_neurons: 16
 n_hidden_layers: 1

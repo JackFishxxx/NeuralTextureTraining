@@ -745,11 +745,11 @@ def run_astc_comparison_pipeline(
     ref_astc_resolution: Optional[int] = None,
     eval_weights=None,
 ) -> Dict[str, Dict[str, Tuple[float, float, float]]]:
-    block_tag = astc_codec.astc_block.replace("x", "_")
+    block_tag = astc_codec.astc_block.lower()
     fntc_astc_name = f"fntc_astc_{astc_codec.astc_block}"
     ref_astc_name = f"ref_astc_{astc_codec.astc_block}"
 
-    compare_root = os.path.join(output_root, f"astc_{block_tag}_compare")
+    compare_root = os.path.join(output_root, f"Compare_ASTC{block_tag}")
     if curr_iter is not None:
         compare_root = os.path.join(compare_root, f"iter_{curr_iter:08d}")
     os.makedirs(compare_root, exist_ok=True)

@@ -27,9 +27,14 @@ from Comparison_ASTC import (
     ASTCCodec,
     ASTCENC_DEFAULT_PATH,
     _astc_roundtrip_superres_base_mip0,
+    _render_gt_mip0,
+    _render_model_mip0,
+    _ref_astc_hw_from_side,
+    _traditional_baseline_resampled,
     apply_astc_to_feature_grids,
     run_astc_comparison_pipeline,
 )
+from Comparison_PBRScene import save_pbr_comparison
 
 
 class Trainer:
@@ -131,6 +136,19 @@ class Trainer:
         self.astcenc_quality = str(getattr(configs, "astcenc_quality", "medium"))
         self.astc_block = str(getattr(configs, "astc_block", "6x6"))
         self.ref_astc_resolution = getattr(configs, "ref_astc_resolution", None)
+        self.enable_pbr_compare = bool(getattr(configs, "enable_pbr_compare", False))
+        self.pbr_compare_interval = int(getattr(configs, "pbr_compare_interval", 5000))
+        self.pbr_render_resolution = int(getattr(configs, "pbr_render_resolution", 512))
+        self.pbr_mip_lod_bias = float(getattr(configs, "pbr_mip_lod_bias", -1.0))
+        self.pbr_loss_enable = bool(getattr(configs, "pbr_loss_enable", False))
+        self.pbr_loss_weight = float(getattr(configs, "pbr_loss_weight", 0.1))
+        self.pbr_lighting = {
+            "directional_enable": configs.pbr_directional_light_enable,
+            "directional_direction": configs.pbr_directional_light_direction,
+            "directional_intensity": configs.pbr_directional_light_intensity,
+            "directional_color": configs.pbr_directional_light_color,
+            "point_lights": configs.pbr_point_lights,
+        }
         self.normal_encoding = str(getattr(configs, "normal_encoding", "xyz")).lower()
         self.super_resolution_enable = bool(getattr(configs, "super_resolution_enable", False))
         self.astc_codec_loss_weight = float(getattr(configs, "astc_codec_loss_weight", 0.7))
@@ -144,7 +162,8 @@ class Trainer:
             astcenc_quality=self.astcenc_quality,
             astc_block=self.astc_block,
         )
-        if self.enable_astc_compare or getattr(configs, "astc_codec_in_loop_enable", False):
+        if (self.enable_astc_compare or self.enable_pbr_compare
+                or getattr(configs, "astc_codec_in_loop_enable", False)):
             self.astc_codec.ensure_executable()
         self.astc_superres_base_mip0 = None
         if getattr(configs, "astc_codec_in_loop_enable", False) and self.super_resolution_enable:
@@ -172,6 +191,75 @@ class Trainer:
             s, e = self.dataset.canonical_channel_slices[tex]
             idx.extend(range(s, e))
         return torch.tensor(idx, device=device, dtype=torch.long)
+
+    def _compute_pbr_render_loss(self, gt: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
+        """Differentiable shaded-RGB loss for PBR-sensitive material channels."""
+        slices = self.dataset.canonical_channel_slices
+        def safe_decode_normal(encoded: torch.Tensor) -> torch.Tensor:
+            """Decode tangent normals without sqrt-at-zero NaN gradients."""
+            enc = self.normal_encoding.lower().replace('-', '_')
+            if enc in {'xy', 'hemi_oct', 'hemi_octa'}:
+                xy = encoded[:, :2] * 2.0 - 1.0
+                radius = torch.sqrt(torch.clamp((xy * xy).sum(1, keepdim=True), min=1e-12))
+                # Keep the square-root argument strictly positive. This is
+                # essential because d(sqrt(x))/dx is infinite at x=0.
+                xy = xy * torch.clamp(0.999 / radius, max=1.0)
+                if enc == 'xy':
+                    z = torch.sqrt(torch.clamp(1.0 - (xy * xy).sum(1, keepdim=True), min=1e-4))
+                    return torch.cat([xy, z], dim=1)
+                px = (xy[:, :1] + xy[:, 1:2]) * 0.5
+                py = (xy[:, :1] - xy[:, 1:2]) * 0.5
+                pz = 1.0 - px.abs() - py.abs()
+                oct_n = torch.cat([px, py, pz], dim=1)
+                return oct_n / torch.sqrt(torch.clamp((oct_n * oct_n).sum(1, keepdim=True), min=1e-4))
+            # XYZ encoding has no square-root boundary; normalize with epsilon.
+            xyz = encoded[:, :3] * 2.0 - 1.0
+            return xyz / torch.sqrt(torch.clamp((xyz * xyz).sum(1, keepdim=True), min=1e-4))
+        def get_pair(name, channels=1, default=0.0):
+            if name not in self.dataset.available_textures:
+                shape = (gt.shape[0], channels)
+                value = torch.full(shape, default, device=gt.device, dtype=gt.dtype)
+                return value, value
+            s, e = slices[name]
+            return (torch.nan_to_num(gt[:, s:e].float(), nan=default, posinf=default, neginf=default).clamp(0, 1),
+                    torch.nan_to_num(pred[:, s:e].float(), nan=default, posinf=default, neginf=default).clamp(0, 1))
+
+        gt_diff, pr_diff = get_pair("diffuse", 3, 0.5)
+        gt_norm, pr_norm = get_pair("normal", getattr(self.dataset, "normal_encoding", "xyz") == "xyz" and 3 or 2, 0.5)
+        gt_rough, pr_rough = get_pair("roughness", 1, 0.5)
+        gt_metal, pr_metal = get_pair("metallic", 1, 0.0)
+        gt_spec, pr_spec = get_pair("specular", 1, 0.5)
+
+        gt_n = safe_decode_normal(gt_norm)
+        pr_n = safe_decode_normal(pr_norm)
+        # Use a fixed tangent-space light with positive Z so a flat normal map
+        # receives direct light and all PBR channels get useful gradients.
+        light = torch.tensor([-0.35, 0.45, 0.82], device=pred.device, dtype=pred.dtype)
+        light = light / torch.clamp(torch.linalg.vector_norm(light), min=1e-6)
+        view = torch.tensor([0.0, 0.0, 1.0], device=pred.device, dtype=pred.dtype)
+        half = (light + view) / torch.clamp(torch.linalg.vector_norm(light + view), min=1e-6)
+        def shade(diff, normal, rough, metal, spec):
+            diff = torch.clamp(diff, 0, 1) ** 2.2
+            nvec = normal * 2.0 - 1.0
+            normal = nvec / torch.sqrt(torch.clamp((nvec * nvec).sum(1, keepdim=True), min=1e-4))
+            ndotl = torch.clamp((normal * light[None]).sum(1, keepdim=True), 0, 1)
+            ndoth = torch.clamp((normal * half[None]).sum(1, keepdim=True), 0, 1)
+            vdoth = torch.clamp((view[None] * half[None]).sum(1, keepdim=True), 0, 1)
+            # Avoid the singular GGX lobe at roughness=0.045 during training.
+            rough = torch.clamp(rough, 0.12, 1.0)
+            alpha = rough * rough
+            d_den = (ndoth * ndoth * (alpha * alpha - 1) + 1) ** 2
+            d = alpha * alpha / (torch.pi * torch.clamp(d_den, min=0.04))
+            d = torch.clamp(d, max=8.0)
+            f0 = (0.02 + 0.14 * spec) * (1 - metal) + diff * metal
+            fresnel = torch.clamp(f0 + (1 - f0) * (1 - vdoth) ** 5, 0.0, 1.0)
+            shaded = torch.clamp(diff * (1 - metal) * (1 - fresnel) * ndotl / torch.pi
+                                 + d * fresnel * ndotl * 0.25 + diff * 0.03, 0, 1)
+            return torch.nan_to_num(shaded, nan=0.0, posinf=1.0, neginf=0.0)
+        pred_shaded = shade(pr_diff, pr_n, pr_rough, pr_metal, pr_spec)
+        gt_shaded = shade(gt_diff, gt_n, gt_rough, gt_metal, gt_spec).detach()
+        return torch.nan_to_num(torch.nn.functional.smooth_l1_loss(pred_shaded, gt_shaded),
+                                nan=0.0, posinf=1.0, neginf=0.0)
 
     def _compute_reconstruction_loss(
         self,
@@ -343,6 +431,12 @@ class Trainer:
                 base_loss = self._compute_reconstruction_loss(gt_texture, predict_texture, loss_weights, curr_iter)
 
             total_loss = base_loss
+            pbr_clean_loss = None
+            pbr_codec_loss = None
+            if self.pbr_loss_enable and self.pbr_loss_weight > 0.0:
+                pbr_predict = ((superres_base + predict_texture).clamp(0.0, 1.0)
+                               if superres_base is not None else predict_texture.clamp(0.0, 1.0))
+                pbr_clean_loss = self._compute_pbr_render_loss(gt_texture.float(), pbr_predict.float())
             if self.subpixel_sampling_enable and self.subpixel_sampling_ratio > 0.0:
                 n_sub = max(1, int(round(self.batch_size * self.subpixel_sampling_ratio)))
                 sub_mips = self.sample_probabilities.multinomial(n_sub, replacement=True)
@@ -402,6 +496,22 @@ class Trainer:
                 total_loss = (self.astc_clean_loss_weight * base_loss
                               + self.astc_codec_loss_weight * codec_loss
                               + self.astc_consistency_weight * consistency_loss)
+                if self.pbr_loss_enable and self.pbr_loss_weight > 0.0:
+                    codec_final = (codec_base + codec_predict).clamp(0.0, 1.0) if codec_base is not None else codec_predict
+                    pbr_codec_loss = self._compute_pbr_render_loss(codec_gt.float(), codec_final.float())
+
+            if pbr_clean_loss is not None:
+                effective_pbr_loss = pbr_clean_loss
+                if pbr_codec_loss is not None:
+                    effective_pbr_loss = (self.astc_clean_loss_weight * pbr_clean_loss
+                                          + self.astc_codec_loss_weight * pbr_codec_loss)
+                total_loss = total_loss + self.pbr_loss_weight * effective_pbr_loss
+                self.writer.add_scalar('Loss/pbr_render', effective_pbr_loss.item(), curr_iter)
+                self.writer.add_scalar('Loss/pbr_render_clean', pbr_clean_loss.item(), curr_iter)
+                if pbr_codec_loss is not None:
+                    self.writer.add_scalar('Loss/pbr_render_astc', pbr_codec_loss.item(), curr_iter)
+                self.writer.add_scalar('LossWeighted/pbr_render',
+                                       self.pbr_loss_weight * effective_pbr_loss.item(), curr_iter)
 
             self.writer.add_scalar('Loss/train', total_loss.item(), curr_iter)
             self.writer.add_scalar('Loss/base', base_loss.item(), curr_iter)
@@ -414,6 +524,10 @@ class Trainer:
 
             # optimize
             total_loss.backward()
+            if self.pbr_loss_enable:
+                # The PBR proxy contains a specular reciprocal term; cap its
+                # occasional large batch gradient before the optimizer step.
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.model.optimizer.step()
             self.model.scheduler.step(metrics=total_loss.item())
 
@@ -476,6 +590,10 @@ class Trainer:
                 if self.enable_astc_compare and not _astc_already_ran:
                     self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path)
                 self._log_checkpoint_interval(curr_iter)
+
+            if (self.enable_pbr_compare and curr_iter > 0
+                    and curr_iter % self.pbr_compare_interval == 0):
+                self.run_pbr_comparison(curr_iter=curr_iter, output_root=self.media_path)
 
             if curr_iter > 0 and curr_iter % 10000 == 0:
                 torch.cuda.empty_cache()
@@ -790,6 +908,8 @@ class Trainer:
 
         if self.enable_astc_compare:
             self.run_astc_comparison(output_root=self.infer_path)
+        if self.enable_pbr_compare:
+            self.run_pbr_comparison(output_root=self.infer_path)
 
     @torch.no_grad()
     def run_astc_comparison(self, curr_iter: int = None, output_root: str = None) -> dict:
@@ -813,6 +933,83 @@ class Trainer:
             ref_astc_resolution=self.ref_astc_resolution,
             eval_weights=self.eval_weights,
         )
+
+    @torch.no_grad()
+    def run_pbr_comparison(self, curr_iter: int = None, output_root: str = None) -> str:
+        """Render the inferred and source Mip0 texture sets in one fixed PBR scene."""
+        if output_root is None:
+            output_root = self.infer_path if hasattr(self, "infer_path") else self.media_path
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            gt = _render_gt_mip0(self.dataset, self.texture_height, self.texture_width)
+            quant_model = copy.deepcopy(self.model)
+            quant_model.simulate_quantize()
+            quant_model.eval()
+            fntc_astc_model = copy.deepcopy(quant_model)
+            apply_astc_to_feature_grids(fntc_astc_model, self.astc_codec.roundtrip_rgba)
+            fntc_astc_model.eval()
+            astc_base = None
+            if self.super_resolution_enable:
+                astc_base = _astc_roundtrip_superres_base_mip0(
+                    self.dataset,
+                    self.astc_codec.roundtrip_rgba,
+                    int(self.configs.super_resolution_base_resolution),
+                )
+            fntc_astc = _render_model_mip0(
+                fntc_astc_model,
+                self.dataset,
+                self.texture_height,
+                self.texture_width,
+                self.num_mips,
+                self.device,
+                superres_base_override=astc_base,
+            )
+            ref_h, ref_w = _ref_astc_hw_from_side(
+                self.ref_astc_resolution,
+                self.texture_height,
+                self.texture_width,
+            )
+            traditional_astc = _traditional_baseline_resampled(
+                gt_mip0=gt,
+                dataset=self.dataset,
+                roundtrip_rgba=self.astc_codec.roundtrip_rgba,
+                ref_h=ref_h,
+                ref_w=ref_w,
+            )
+            path, metrics = save_pbr_comparison(
+                fntc_astc_texture=fntc_astc,
+                traditional_astc_texture=traditional_astc,
+                gt_texture=gt,
+                dataset=self.dataset,
+                output_root=output_root,
+                curr_iter=curr_iter,
+                resolution=self.pbr_render_resolution,
+                astc_block=self.astc_block,
+                ssim_metric=self.ssim,
+                lpips_metric=self.lpips,
+                mip_lod_bias=self.pbr_mip_lod_bias,
+                lighting=self.pbr_lighting,
+            )
+            if curr_iter is not None:
+                for method, (psnr, ssim, lpips) in metrics.items():
+                    self.writer.add_scalar(f"PBRCompare/{method}_PSNR", psnr, curr_iter)
+                    self.writer.add_scalar(f"PBRCompare/{method}_SSIM", ssim, curr_iter)
+                    self.writer.add_scalar(f"PBRCompare/{method}_LPIPS", lpips, curr_iter)
+            block_tag = self.astc_block.replace("x", "_").lower()
+            fntc_metrics = metrics.get("fntc", (0.0, 0.0, 0.0))
+            astc_metrics = metrics.get("astc", (0.0, 0.0, 0.0))
+            print(
+                f"[PBR Test] Iter {curr_iter}: "
+                f"FNTC_{block_tag}_compressed "
+                f"PSNR={fntc_metrics[0]:.4f}, SSIM={fntc_metrics[1]:.4f}, LPIPS={fntc_metrics[2]:.4f}; "
+                f"ASTC_{block_tag}_compressed "
+                f"PSNR={astc_metrics[0]:.4f}, SSIM={astc_metrics[1]:.4f}, LPIPS={astc_metrics[2]:.4f}; "
+                f"output={path}"
+            )
+            return path
+        finally:
+            self.model.train(was_training)
 
     def _write_resolved_config(self, configs: Config) -> None:
         """Persist scalar/list/dict config values so log analyzers can recover run settings."""

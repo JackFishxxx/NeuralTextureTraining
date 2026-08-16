@@ -242,6 +242,41 @@ class Config():
         self.astc_block = params.astc_block
         self.ref_astc_resolution = getattr(params, "ref_astc_resolution", None)
 
+        ### ---------- PBR scene comparison ---------- ###
+        self.enable_pbr_compare = bool(getattr(params, "enable_pbr_compare", False))
+        self.pbr_compare_interval = int(getattr(params, "pbr_compare_interval", 5000))
+        self.pbr_render_resolution = int(getattr(params, "pbr_render_resolution", 512))
+        self.pbr_mip_lod_bias = float(getattr(params, "pbr_mip_lod_bias", -1.0))
+        self.pbr_loss_enable = bool(getattr(params, "pbr_loss_enable", False))
+        self.pbr_loss_weight = float(getattr(params, "pbr_loss_weight", 0.1))
+        self.pbr_directional_light_enable = bool(getattr(params, "pbr_directional_light_enable", True))
+        self.pbr_directional_light_direction = list(getattr(params, "pbr_directional_light_direction", [-0.45, 0.62, -0.72]))
+        self.pbr_directional_light_intensity = float(getattr(params, "pbr_directional_light_intensity", 2.4))
+        self.pbr_directional_light_color = list(getattr(params, "pbr_directional_light_color", [1.0, 1.0, 1.0]))
+        self.pbr_point_lights = list(getattr(params, "pbr_point_lights", [
+            {"position": [0.0, 0.82, 0.7], "intensity": 6.5, "color": [1.0, 1.0, 1.0]},
+            {"position": [-0.8, 0.45, -0.15], "intensity": 1.2, "color": [1.0, 1.0, 1.0]},
+        ]))
+        if self.pbr_compare_interval <= 0:
+            raise ValueError("pbr_compare_interval must be positive")
+        if self.pbr_render_resolution < 64:
+            raise ValueError("pbr_render_resolution must be at least 64")
+        if not -8.0 <= self.pbr_mip_lod_bias <= 8.0:
+            raise ValueError("pbr_mip_lod_bias must be in [-8, 8]")
+        if self.pbr_loss_weight < 0.0:
+            raise ValueError("pbr_loss_weight must be non-negative")
+        if len(self.pbr_directional_light_direction) != 3 or len(self.pbr_directional_light_color) != 3:
+            raise ValueError("PBR directional light direction and color must contain 3 values")
+        if self.pbr_directional_light_intensity < 0.0:
+            raise ValueError("pbr_directional_light_intensity must be non-negative")
+        for index, light in enumerate(self.pbr_point_lights):
+            if not isinstance(light, dict) or len(light.get("position", [])) != 3:
+                raise ValueError(f"pbr_point_lights[{index}] must contain a 3-value position")
+            if len(light.get("color", [1.0, 1.0, 1.0])) != 3:
+                raise ValueError(f"pbr_point_lights[{index}] color must contain 3 values")
+            if float(light.get("intensity", 0.0)) < 0.0:
+                raise ValueError(f"pbr_point_lights[{index}] intensity must be non-negative")
+
         # Normalize configs to the internal format expected by the model
         if self.feature_grid_configs is not None:
             processed: List[Dict] = []
@@ -439,6 +474,28 @@ def get_args():
                         help='ASTC block size, e.g. 4x4 / 6x6 / 8x8')
     parser.add_argument('--ref_astc_resolution', type=int, default=1024,
                         help='Traditional ref_astc_* baseline: square edge length (H=W) before astcenc; omit for Mip0 size')
+
+    ### ---------- PBR scene comparison configs ---------- ###
+    parser.add_argument('--enable_pbr_compare', action=argparse.BooleanOptionalAction, default=False,
+                        help='render inferred and ground-truth texture sets in a Cornell-box PBR scene')
+    parser.add_argument('--pbr_compare_interval', type=int, default=5000,
+                        help='training iteration interval for PBR scene comparison images')
+    parser.add_argument('--pbr_render_resolution', type=int, default=512,
+                        help='final cropped scene height of each PBR comparison panel')
+    parser.add_argument('--pbr_mip_lod_bias', type=float, default=-1.0,
+                        help='PBR texture mip LOD bias; negative values select sharper mips')
+    parser.add_argument('--pbr_loss_enable', action=argparse.BooleanOptionalAction, default=False,
+                        help='add differentiable material-to-PBR shaded RGB loss during training')
+    parser.add_argument('--pbr_loss_weight', type=float, default=0.1,
+                        help='weight of the differentiable PBR shaded RGB loss')
+    parser.add_argument('--pbr_directional_light_enable', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--pbr_directional_light_direction', type=yaml.safe_load, default=[-0.45, 0.62, -0.72])
+    parser.add_argument('--pbr_directional_light_intensity', type=float, default=2.4)
+    parser.add_argument('--pbr_directional_light_color', type=yaml.safe_load, default=[1.0, 1.0, 1.0])
+    parser.add_argument('--pbr_point_lights', type=yaml.safe_load, default=[
+        {"position": [0.0, 0.82, 0.7], "intensity": 6.5, "color": [1.0, 1.0, 1.0]},
+        {"position": [-0.8, 0.45, -0.15], "intensity": 1.2, "color": [1.0, 1.0, 1.0]},
+    ])
 
     ### ---------- algorithm configs ---------- ###
     parser.add_argument('--n_frequencies', type=int, default=0,

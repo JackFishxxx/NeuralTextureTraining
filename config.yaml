@@ -15,6 +15,9 @@ output_activation: "hard_swish"
 direct_diffuse_infer_mode: "disable"  # disable | rgb | ycocg
 normal_encoding: "xy"  # xyz | xy | hemi_oct
 mip0_only: true  # true: train, sample, evaluate, and compare Mip0 only
+subpixel_sampling_enable: true
+subpixel_sampling_ratio: 0.5
+subpixel_jitter: 0.5
 
 # ---------- feature grid configs ----------
 feature_grid_configs:

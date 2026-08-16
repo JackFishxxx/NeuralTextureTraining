@@ -136,6 +136,9 @@ class Config():
         ### ---------- trainer configs ---------- ###
         self.max_iter = params.max_iter
         self.batch_size = params.batch_size
+        self.subpixel_sampling_enable = bool(getattr(params, 'subpixel_sampling_enable', True))
+        self.subpixel_sampling_ratio = float(getattr(params, 'subpixel_sampling_ratio', 0.25))
+        self.subpixel_jitter = float(getattr(params, 'subpixel_jitter', 0.5))
         self.learning_rate = params.learning_rate
         self.momentum = params.momentum
         self.weight_decay = params.weight_decay
@@ -389,6 +392,9 @@ def get_args():
                         help='maximum training iteration')
     parser.add_argument('--batch_size', type=int, default=16384,
                         help='batch size')
+    parser.add_argument('--subpixel_sampling_enable', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--subpixel_sampling_ratio', type=float, default=0.25)
+    parser.add_argument('--subpixel_jitter', type=float, default=0.5)
     parser.add_argument('--learning_rate', type=float, default=0.01,
                         help='learning rate')
     parser.add_argument('--momentum', type=float, default=0.9,

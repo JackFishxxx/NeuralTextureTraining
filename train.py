@@ -86,6 +86,9 @@ class Trainer:
         self.texture_height = dataset.texture_height
         self.texture_width = dataset.texture_width
         self.mip0_only = bool(getattr(configs, "mip0_only", False))
+        self.subpixel_sampling_enable = bool(getattr(configs, "subpixel_sampling_enable", True))
+        self.subpixel_sampling_ratio = float(getattr(configs, "subpixel_sampling_ratio", 0.25))
+        self.subpixel_jitter = float(getattr(configs, "subpixel_jitter", 0.5))
 
         # Canonical per-channel weights; eval keeps diffuse weight, training loss may zero direct diffuse.
         self.eval_weights = dataset.get_canonical_loss_weights(
@@ -340,6 +343,28 @@ class Trainer:
                 base_loss = self._compute_reconstruction_loss(gt_texture, predict_texture, loss_weights, curr_iter)
 
             total_loss = base_loss
+            if self.subpixel_sampling_enable and self.subpixel_sampling_ratio > 0.0:
+                n_sub = max(1, int(round(self.batch_size * self.subpixel_sampling_ratio)))
+                sub_mips = self.sample_probabilities.multinomial(n_sub, replacement=True)
+                sub_xy = torch.stack([
+                    torch.randint(0, self.texture_height, (n_sub,), device=self.device).float(),
+                    torch.randint(0, self.texture_width, (n_sub,), device=self.device).float(),
+                ], dim=1)
+                sub_xy += (torch.rand((n_sub, 2), device=self.device) * 2.0 - 1.0) * self.subpixel_jitter
+                sub_gt = self.dataset.expand_to_canonical(self.dataset.sample_continuous(sub_xy, sub_mips)).to(torch.float16)
+                sub_uv = torch.stack([(sub_xy[:, 1] + 0.5) / self.texture_width,
+                                      (sub_xy[:, 0] + 0.5) / self.texture_height], dim=1)
+                sub_mip_uv = sub_mips.float()[:, None] / (self.num_mips - 1) if self.num_mips > 1 else torch.zeros((n_sub, 1), device=self.device)
+                sub_input = torch.cat([sub_uv, sub_mip_uv], dim=1)
+                if self.super_resolution_enable:
+                    sub_base = self.dataset.expand_to_canonical(self.dataset.get_superres_base_continuous(sub_xy, sub_mips)).to(torch.float16)
+                    sub_input = torch.cat([sub_input, sub_base], dim=1)
+                    sub_pred = self.model(sub_input)
+                    sub_loss = self._compute_superres_residual_loss(sub_gt - sub_base, sub_pred, loss_weights)
+                else:
+                    sub_pred = self.model(sub_input)
+                    sub_loss = self._compute_reconstruction_loss(sub_gt, sub_pred, loss_weights)
+                total_loss = total_loss + self.subpixel_sampling_ratio * sub_loss
             codec_loss = None
             consistency_loss = None
             mip0 = batch_index[:, 2] == 0

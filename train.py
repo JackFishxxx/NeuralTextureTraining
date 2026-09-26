@@ -405,11 +405,20 @@ class Trainer:
                     self.dataset.get_superres_base(batch_index)
                 ).to(torch.float16)
 
-            # xys -> uvs
-            # shift the sample position from [0, 1, ..., 1023] -> [0.5, 1.5, ..., 1023.5]
-            # uvs = ((xys + 0.5) / mip_scale) / (texture_weight / mip_scale)
-            us = (xs + 0.5) / self.texture_width
-            vs = (ys + 0.5) / self.texture_height
+            # Use texel centers in the selected mip plane. The dataset indexes
+            # discrete targets after integer downscaling, so floor the base
+            # coordinates before converting them to mip-local UVs.
+            if self.mip0_only:
+                us = (xs.float() + 0.5) / self.texture_width
+                vs = (ys.float() + 0.5) / self.texture_height
+            else:
+                mip_scale = torch.pow(2.0, mips.float())
+                mip_x = torch.floor(xs.float() / mip_scale)
+                mip_y = torch.floor(ys.float() / mip_scale)
+                mip_width = self.texture_width / mip_scale
+                mip_height = self.texture_height / mip_scale
+                us = (mip_x + 0.5) / mip_width
+                vs = (mip_y + 0.5) / mip_height
             mips = mips.float() / (self.num_mips - 1) if self.num_mips > 1 else torch.zeros_like(mips, dtype=torch.float32)
             batch_input = torch.cat([us, vs, mips], dim=1)
             if superres_base is not None:
@@ -448,6 +457,14 @@ class Trainer:
                 sub_uv = torch.stack([(sub_xy[:, 1] + 0.5) / self.texture_width,
                                       (sub_xy[:, 0] + 0.5) / self.texture_height], dim=1)
                 sub_mip_uv = sub_mips.float()[:, None] / (self.num_mips - 1) if self.num_mips > 1 else torch.zeros((n_sub, 1), device=self.device)
+                if not self.mip0_only:
+                    sub_scale = torch.pow(2.0, sub_mips.float())
+                    sub_mip_x = sub_xy[:, 1] / sub_scale
+                    sub_mip_y = sub_xy[:, 0] / sub_scale
+                    sub_mip_width = self.texture_width / sub_scale
+                    sub_mip_height = self.texture_height / sub_scale
+                    sub_uv = torch.stack([(sub_mip_x + 0.5) / sub_mip_width,
+                                          (sub_mip_y + 0.5) / sub_mip_height], dim=1)
                 sub_input = torch.cat([sub_uv, sub_mip_uv], dim=1)
                 if self.super_resolution_enable:
                     sub_base = self.dataset.expand_to_canonical(self.dataset.get_superres_base_continuous(sub_xy, sub_mips)).to(torch.float16)

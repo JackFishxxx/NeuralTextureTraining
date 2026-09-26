@@ -265,11 +265,24 @@ class TextureDataset(torch.nn.Module):
                 elif h != target_h or w != target_w:
                     print(f"Warning: Resizing '{texture_type}' from {h}x{w} to {target_h}x{target_w} "
                           f"to match other textures.")
-                    textures[texture_type] = TF.resize(
-                        textures[texture_type], [target_h, target_w],
-                        interpolation=TF.InterpolationMode.BILINEAR,
-                        antialias=True,
-                    )
+                    if texture_type == "normal":
+                        normal_vec = normalize_normal_rgb(
+                            decode_normal(textures[texture_type], self.normal_encoding)
+                        )
+                        normal_vec = TF.resize(
+                            normal_vec, [target_h, target_w],
+                            interpolation=TF.InterpolationMode.BILINEAR,
+                            antialias=True,
+                        )
+                        textures[texture_type] = encode_normal(
+                            normal_to_rgb(normal_vec), self.normal_encoding
+                        )
+                    else:
+                        textures[texture_type] = TF.resize(
+                            textures[texture_type], [target_h, target_w],
+                            interpolation=TF.InterpolationMode.BILINEAR,
+                            antialias=True,
+                        )
                     textures[texture_type] = torch.clamp(textures[texture_type], 0.0, 1.0)
 
         textures_ordered = []

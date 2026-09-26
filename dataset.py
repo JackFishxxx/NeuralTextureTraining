@@ -214,9 +214,9 @@ class TextureDataset(torch.nn.Module):
                 color_mode = self.texture_configs[texture_type]['color_mode']
             image = image.convert(color_mode)
             tensor = TF.to_tensor(image)
-            if texture_type != "normal":
+            if texture_type == "diffuse":
                 tensor = torch.pow(tensor, 2.2)
-            else:
+            elif texture_type == "normal":
                 tensor = encode_normal(tensor, self.normal_encoding)
         return tensor
 

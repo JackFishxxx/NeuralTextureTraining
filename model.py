@@ -73,6 +73,8 @@ class TCNNModel(torch.nn.Module):
     def __getstate__(self):
         state = super().__getstate__()
         state["_qat_param_cache"] = {}
+        state["optimizer"] = None
+        state["scheduler"] = None
         return state
 
     def __init__(self, config: Config):

@@ -431,6 +431,7 @@ class Trainer:
                 base_loss = self._compute_reconstruction_loss(gt_texture, predict_texture, loss_weights, curr_iter)
 
             total_loss = base_loss
+            subpixel_loss = None
             pbr_clean_loss = None
             pbr_codec_loss = None
             if self.pbr_loss_enable and self.pbr_loss_weight > 0.0:
@@ -458,7 +459,7 @@ class Trainer:
                 else:
                     sub_pred = self.model(sub_input)
                     sub_loss = self._compute_reconstruction_loss(sub_gt, sub_pred, loss_weights)
-                total_loss = total_loss + self.subpixel_sampling_ratio * sub_loss
+                subpixel_loss = self.subpixel_sampling_ratio * sub_loss
             codec_loss = None
             consistency_loss = None
             mip0 = batch_index[:, 2] == 0
@@ -499,6 +500,9 @@ class Trainer:
                 if self.pbr_loss_enable and self.pbr_loss_weight > 0.0:
                     codec_final = (codec_base + codec_predict).clamp(0.0, 1.0) if codec_base is not None else codec_predict
                     pbr_codec_loss = self._compute_pbr_render_loss(codec_gt.float(), codec_final.float())
+
+            if subpixel_loss is not None:
+                total_loss = total_loss + subpixel_loss
 
             if pbr_clean_loss is not None:
                 effective_pbr_loss = pbr_clean_loss

@@ -31,6 +31,7 @@ from Comparison_ASTC import (
     _render_model_mip0,
     _ref_astc_hw_from_side,
     _traditional_baseline_resampled,
+    _compute_group_metrics,
     apply_astc_to_feature_grids,
     run_astc_comparison_pipeline,
 )
@@ -802,6 +803,20 @@ class Trainer:
             return psnr_value, ssim_value, float(self.lpips(visual_pred, visual_gt).item())
         return psnr_value, ssim_value, None
 
+    def _compute_material_metrics(
+        self, pred: torch.Tensor, gt: torch.Tensor
+    ) -> dict:
+        """Compute per-material groups plus the evaluation-weighted overall score."""
+        return _compute_group_metrics(
+            pred,
+            gt,
+            self.dataset,
+            self.psnr,
+            self.ssim,
+            self.lpips,
+            eval_weights=self.eval_weights,
+        )
+
     def _save_mip_visuals(self, pred: torch.Tensor, gt: torch.Tensor, output_root: str, filename: str) -> None:
         save_image = torch.cat([pred, gt], dim=3).squeeze()
         for vc in self.vis_configs:
@@ -822,6 +837,7 @@ class Trainer:
         psnr_list: List[float] = []
         ssim_list: List[float] = []
         lpips_list: List[float] = []
+        material_group_order = ("diffuse", "normal", "romsd", "average")
         should_save_visuals = curr_iter % self.save_interval == 0
 
         feature_grid_backup = self._backup_feature_grid_state()
@@ -833,16 +849,26 @@ class Trainer:
             eval_mips = range(1) if self.mip0_only else range(self.num_mips)
             for mip in eval_mips:
                 pred, gt, mip_height, mip_width = self._render_mip_pair(mip)
-                psnr_value, ssim_value, lpips_value = self._compute_mip_metrics(pred, gt, mip_height, mip_width)
+                material_metrics = self._compute_material_metrics(pred, gt)
+                psnr_value, ssim_value, lpips_value = material_metrics["average"]
 
                 psnr_list.append(psnr_value)
                 ssim_list.append(ssim_value)
-                metric_prefix = "NormalAngular" if self._metric_texture_name() == "normal" else ""
-                self.writer.add_scalar(f'{metric_prefix}PSNR_Mip{mip}/train', psnr_value, curr_iter)
-                self.writer.add_scalar(f'{metric_prefix}SSIM_Mip{mip}/train', ssim_value, curr_iter)
-                if lpips_value is not None:
-                    lpips_list.append(lpips_value)
-                    self.writer.add_scalar(f'{metric_prefix}LPIPS_Mip{mip}/train', lpips_value, curr_iter)
+                lpips_list.append(lpips_value)
+                for group_name in material_group_order:
+                    group_metric = material_metrics.get(group_name)
+                    if group_metric is None:
+                        continue
+                    group_psnr, group_ssim, group_lpips = group_metric
+                    self.writer.add_scalar(
+                        f'Material/{group_name}/PSNR_Mip{mip}/train', group_psnr, curr_iter
+                    )
+                    self.writer.add_scalar(
+                        f'Material/{group_name}/SSIM_Mip{mip}/train', group_ssim, curr_iter
+                    )
+                    self.writer.add_scalar(
+                        f'Material/{group_name}/LPIPS_Mip{mip}/train', group_lpips, curr_iter
+                    )
 
                 if should_save_visuals:
                     self._save_mip_visuals(pred, gt, self.media_path, f"{curr_iter}_{mip}.png")
@@ -855,13 +881,11 @@ class Trainer:
         psnr_avg = self._mean_metric(psnr_list)
         ssim_avg = self._mean_metric(ssim_list)
         lpips_avg = self._mean_metric(lpips_list)
-        metric_prefix = "NormalAngular" if self._metric_texture_name() == "normal" else ""
-        self.writer.add_scalar(f'{metric_prefix}PSNR/train', psnr_avg, curr_iter)
-        self.writer.add_scalar(f'{metric_prefix}SSIM/train', ssim_avg, curr_iter)
-        self.writer.add_scalar(f'{metric_prefix}LPIPS/train', lpips_avg, curr_iter)
+        self.writer.add_scalar('Material/average/PSNR/train', psnr_avg, curr_iter)
+        self.writer.add_scalar('Material/average/SSIM/train', ssim_avg, curr_iter)
+        self.writer.add_scalar('Material/average/LPIPS/train', lpips_avg, curr_iter)
 
-        psnr_label = "NormalAngularPSNR" if self._metric_texture_name() == "normal" else "DiffusePSNR"
-        print(f"Iter:{curr_iter}, {psnr_label}:{psnr_avg:.4f}. {self._loss_stats_str()}")
+        print(f"Iter:{curr_iter}, MaterialPSNR:{psnr_avg:.4f}. {self._loss_stats_str()}")
         return psnr_avg
 
     def _postprocess_for_vis(self, image: torch.Tensor, vis_mode: str) -> torch.Tensor:
@@ -907,13 +931,16 @@ class Trainer:
             metric_lines = ["Mip NormalAngularPSNR NormalAngularSSIM NormalAngularLPIPS\n"]
         else:
             metric_lines = ["Mip PSNR SSIM LPIPS\n"]
+        material_metric_lines = ["Mip Group PSNR SSIM LPIPS\n"]
+        material_group_order = ("diffuse", "normal", "romsd", "average")
 
         was_training = self.model.training
         try:
             self.model.eval()
             for mip in self._infer_mips():
                 pred, gt, mip_height, mip_width = self._render_mip_pair(mip)
-                psnr_value, ssim_value, lpips_value = self._compute_mip_metrics(pred, gt, mip_height, mip_width)
+                material_metrics = self._compute_material_metrics(pred, gt)
+                psnr_value, ssim_value, lpips_value = material_metrics["average"]
 
                 psnr_list.append(psnr_value)
                 ssim_list.append(ssim_value)
@@ -923,6 +950,14 @@ class Trainer:
 
                 self._save_mip_visuals(pred, gt, self.infer_path, f"Mip_{mip}.png")
                 metric_lines.append(f"Mip_{mip} {psnr_value:.4f} {ssim_value:.4f} {lpips_for_line:.4f}\n")
+                for group_name in material_group_order:
+                    group_metric = material_metrics.get(group_name)
+                    if group_metric is None:
+                        continue
+                    material_metric_lines.append(
+                        f"Mip_{mip} {group_name} {group_metric[0]:.4f} "
+                        f"{group_metric[1]:.4f} {group_metric[2]:.4f}\n"
+                    )
         finally:
             self.model.train(was_training)
 
@@ -932,6 +967,11 @@ class Trainer:
         metric_lines.append(f"AVER {psnr_avg} {ssim_avg} {lpips_avg}\n")
         with open(os.path.join(self.infer_path, "metrics.txt"), "w+", encoding="utf-8") as file:
             file.writelines(metric_lines)
+        material_metric_lines.append(
+            f"AVER average {psnr_avg:.4f} {ssim_avg:.4f} {lpips_avg:.4f}\n"
+        )
+        with open(os.path.join(self.infer_path, "metrics_material.txt"), "w+", encoding="utf-8") as file:
+            file.writelines(material_metric_lines)
 
         if self.enable_astc_compare:
             self.run_astc_comparison(output_root=self.infer_path)

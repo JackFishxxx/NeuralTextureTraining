@@ -343,17 +343,22 @@ def _render_model_mip0(model, dataset, texture_height: int, texture_width: int, 
 # ---------------------------------------------------------------------------
 
 def _compute_ssim_safe(pred_ref: torch.Tensor, gt_ref: torch.Tensor, ssim_metric) -> float:
+    ssim_metric.reset()
     pred_ref = torch.nan_to_num(pred_ref.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     gt_ref = torch.nan_to_num(gt_ref.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-    ssim_t, _ = ssim_metric(pred_ref, gt_ref)
+    ssim_result = ssim_metric(pred_ref, gt_ref)
+    ssim_t = ssim_result[0] if isinstance(ssim_result, tuple) else ssim_result
     v = float(ssim_t.item())
+    ssim_metric.reset()
     if math.isfinite(v):
         return v
     if pred_ref.shape[1] > 1:
         pg = pred_ref.mean(dim=1, keepdim=True)
         gg = gt_ref.mean(dim=1, keepdim=True)
-        ssim_t2, _ = ssim_metric(pg, gg)
+        ssim_result2 = ssim_metric(pg, gg)
+        ssim_t2 = ssim_result2[0] if isinstance(ssim_result2, tuple) else ssim_result2
         v2 = float(ssim_t2.item())
+        ssim_metric.reset()
         if math.isfinite(v2):
             return v2
     return 0.0
@@ -370,7 +375,9 @@ def _compute_metrics_from_refs(
         pred_ref = decode_normal(pred_ref, normal_encoding)
         gt_ref = decode_normal(gt_ref, normal_encoding)
     else:
+        psnr_metric.reset()
         psnr_value = float(psnr_metric(pred_ref, gt_ref).item())
+        psnr_metric.reset()
     if not math.isfinite(psnr_value):
         psnr_value = 0.0
     ssim_value = _compute_ssim_safe(pred_ref, gt_ref, ssim_metric)
@@ -391,10 +398,14 @@ def _compute_metrics_from_refs(
             for channel_idx in range(c):
                 p = pred_ref[:, channel_idx:channel_idx + 1].repeat(1, 3, 1, 1)
                 g = gt_ref[:, channel_idx:channel_idx + 1].repeat(1, 3, 1, 1)
+                lpips_metric.reset()
                 values.append(float(lpips_metric(p.float(), g.float()).item()))
+                lpips_metric.reset()
             lpips_value = float(np.mean(values)) if values else 0.0
             return psnr_value, ssim_value, lpips_value
+        lpips_metric.reset()
         lpips_value = float(lpips_metric(lpips_pred.float(), lpips_gt.float()).item())
+        lpips_metric.reset()
         if not math.isfinite(lpips_value):
             lpips_value = 0.0
     else:

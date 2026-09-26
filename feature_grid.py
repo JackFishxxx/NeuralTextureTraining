@@ -26,9 +26,24 @@ class FeatureGridSpec:
     @classmethod
     def from_config(cls, cfg: Dict, default_quantize_bits: int, default_save_bits: int, default_lr: float) -> "FeatureGridSpec":
         max_res = int(cfg.get("max_resolution", 1024))
-        n_levels = int(cfg.get("n_levels", 1))
+        if max_res <= 0 or (max_res & (max_res - 1)) != 0:
+            raise ValueError("max_resolution must be a positive power of two")
+        default_levels = max(1, max_res.bit_length() - 2)
+        n_levels = int(cfg.get("n_levels", default_levels))
         qbits = int(cfg.get("quantize_bits", default_quantize_bits))
         sbits = int(cfg.get("save_bits", default_save_bits))
+        if n_levels <= 0 or n_levels > max_res.bit_length():
+            raise ValueError(
+                f"n_levels must be in [1, {max_res.bit_length()}] for max_resolution={max_res}"
+            )
+        if qbits not in (2, 4, 8):
+            raise ValueError("quantize_bits must be one of 2, 4, 8 for RGBA8 DDS export")
+        if sbits not in (8, 16, 32, 64) or sbits < qbits:
+            raise ValueError("save_bits must be one of 8, 16, 32, 64 and >= quantize_bits")
+        if sbits % qbits != 0:
+            raise ValueError("save_bits must be divisible by quantize_bits")
+        if sbits // qbits > 4:
+            raise ValueError("feature-grid export supports at most four channels per level")
         base_res = max(1, int(max_res >> (n_levels - 1)))
         return cls(
             max_resolution=max_res,

@@ -265,27 +265,29 @@ Training simulates quantization error in the forward pass so the model adapts to
 ### ASTC-Aware Latent Training
 
 FNTC can train against the real `astcenc` round-trip instead of using only a noise approximation.
-When enabled, the trainer periodically quantizes the highest-resolution feature level, runs ASTC
-6x6, caches the decoded latent texture, and evaluates an ASTC branch with the same super-resolution
-base used at deployment. A clean QAT branch remains active to prevent the latent representation from
-drifting toward a codec-only solution.
+On each scheduled codec step, the trainer samples current highest-level feature blocks, runs an
+ASTC round-trip on an aligned block atlas, and trains on the actual decoded values. No decoded
+latent snapshot is reused after the parameters change. The codec branch uses the compressed
+super-resolution base; a clean QAT branch remains active between codec steps.
 
 Recommended settings in `config.yaml`:
 
 ```yaml
 astc_aware_enable: true
 astc_codec_in_loop_enable: true
-astc_codec_in_loop_interval: 1000
+astc_codec_in_loop_interval: 100
+astc_codec_blocks_per_step: 32
 astc_codec_start_frac: 0.3
-astc_codec_lod0_prob: 1.0
-astc_codec_loss_weight: 0.7
-astc_clean_loss_weight: 0.3
+astc_codec_mip0_prob: 1.0
+astc_codec_loss_weight: 0.3
+astc_clean_loss_weight: 0.7
 astc_consistency_weight: 0.0
 ```
 
-`astc_codec_start_frac` reserves an initial clean-QAT phase. After calibration, `astc_codec_lod0_prob`
-increases full-resolution samples so the codec branch receives sufficient training signal. The ASTC
-comparison requires an `astcenc` executable; it is downloaded or resolved through `astcenc_path`.
+`astc_codec_start_frac` reserves an initial clean-QAT phase. Set
+`astc_codec_in_loop_interval: 1` to perform a real ASTC pass every iteration;
+`astc_codec_mip0_prob` is the probability of running a scheduled pass. The ASTC
+comparison requires an `astcenc` executable, resolved through `astcenc_path`.
 
 ### Seamless Tiling (Wrap Boundary Constraint)
 

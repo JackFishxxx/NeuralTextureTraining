@@ -267,25 +267,27 @@ diffuse(3) | normal(3 或 2) | roughness(1) | occlusion(1) | metallic(1) | specu
 ### ASTC 感知 Latent 训练
 
 FNTC 支持直接使用真实 `astcenc` 往返结果进行训练，而不只依赖噪声近似。启用后，训练器会
-定期对最高分辨率 feature level 执行量化和 ASTC 6x6 编解码，将解码后的 latent 缓存下来，
-并使用部署时相同的超分 base 训练 ASTC 分支。同时保留 clean QAT 分支，避免 latent 退化为只适应
-codec 的表示。
+在预定 codec 步从当前最高分辨率 feature level 抽取 ASTC block，拼成对齐的 atlas 做真实
+编解码，并直接用该步的解码结果训练，不再跨参数更新复用旧的 latent 快照。ASTC 分支使用压缩后的
+超分 base；其余迭代继续进行 clean QAT 训练。
 
 推荐在 `config.yaml` 中使用：
 
 ```yaml
 astc_aware_enable: true
 astc_codec_in_loop_enable: true
-astc_codec_in_loop_interval: 1000
+astc_codec_in_loop_interval: 100
+astc_codec_blocks_per_step: 32
 astc_codec_start_frac: 0.3
-astc_codec_lod0_prob: 1.0
-astc_codec_loss_weight: 0.7
-astc_clean_loss_weight: 0.3
+astc_codec_mip0_prob: 1.0
+astc_codec_loss_weight: 0.3
+astc_clean_loss_weight: 0.7
 astc_consistency_weight: 0.0
 ```
 
-`astc_codec_start_frac` 用于保留初始 clean-QAT 预训练阶段。完成校准后，
-`astc_codec_lod0_prob` 提高全分辨率样本比例，保证 codec 分支获得足够训练信号。
+`astc_codec_start_frac` 用于保留初始 clean-QAT 预训练阶段。设置
+`astc_codec_in_loop_interval: 1` 可每次迭代都执行真实 ASTC；`astc_codec_mip0_prob`
+表示预定 codec 步实际执行的概率。
 ASTC 对比需要可用的 `astcenc` 可执行文件，程序会通过 `astcenc_path` 自动定位或下载。
 
 ### 无缝平铺（Wrap Boundary Constraint）

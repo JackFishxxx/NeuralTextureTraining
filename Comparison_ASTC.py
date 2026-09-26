@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 import torchvision.transforms.functional as TF
-from feature_grid import feature_tensor_to_int, int_to_feature_tensor
+from feature_grid import feature_tensor_to_int, int_to_feature_tensor, quantize_feature_tensor
 from normal_encoding import decode_normal, normal_angular_psnr
 
 
@@ -287,6 +287,76 @@ def apply_astc_to_feature_grids(astc_model, roundtrip_rgba: Callable[[np.ndarray
 
         recovered_tensor = torch.from_numpy(recovered.reshape(-1)).to(params.device).float()
         params.data[offset : offset + level_count] = int_to_feature_tensor(recovered_tensor, spec)
+
+
+@torch.no_grad()
+def roundtrip_feature_blocks(
+    model, grid_idx: int, block_xy: torch.Tensor,
+    roundtrip_rgba: Callable[[np.ndarray], np.ndarray], block_size: Tuple[int, int],
+) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    """Encode current quantized feature blocks and return flat parameter replacements.
+
+    Blocks are assembled into an ASTC-aligned atlas. ASTC blocks encode
+    independently, so one codec invocation covers the selected positions.
+    """
+    if block_xy.ndim != 2 or block_xy.shape[1] != 2 or block_xy.shape[0] == 0:
+        raise ValueError("block_xy must have shape [N, 2] with N > 0")
+    block_w, block_h = map(int, block_size)
+    if block_w <= 0 or block_h <= 0:
+        raise ValueError("ASTC block dimensions must be positive")
+
+    grid = model.feature_grids[grid_idx]
+    params = model._get_grid_params_tensor(grid)
+    spec = model.feature_grid_specs[grid_idx]
+    offset, _, resolution = spec.highest_level_slice()
+    channels = spec.n_features_per_level
+    blocks = block_xy.to(device=params.device, dtype=torch.long)
+    local_y, local_x = torch.meshgrid(
+        torch.arange(block_h, device=params.device),
+        torch.arange(block_w, device=params.device), indexing="ij",
+    )
+    xs = blocks[:, 0, None, None] * block_w + local_x
+    ys = blocks[:, 1, None, None] * block_h + local_y
+    valid = (xs < resolution) & (ys < resolution)
+    texels = ys.clamp(max=resolution - 1) * resolution + xs.clamp(max=resolution - 1)
+    indices = offset + texels[..., None] * channels + torch.arange(channels, device=params.device)
+    codes = feature_tensor_to_int(params[indices], spec).cpu().numpy()
+    recovered = np.empty_like(codes, dtype=np.float32)
+
+    count = len(blocks)
+    atlas_cols = min(8, count)
+    atlas_rows = math.ceil(count / atlas_cols)
+    channel_groups = [list(range(channels))]
+    if getattr(model, "direct_diffuse_enabled", False) and grid_idx == 0 and channels > 3:
+        channel_groups = [[0, 1, 2], list(range(3, channels))]
+
+    for group in channel_groups:
+        atlas = np.full((atlas_rows * block_h, atlas_cols * block_w, 4), 255, dtype=np.uint8)
+        for block_idx in range(count):
+            top = block_idx // atlas_cols * block_h
+            left = block_idx % atlas_cols * block_w
+            for rgba_channel, feature_channel in enumerate(group):
+                atlas[top:top + block_h, left:left + block_w, rgba_channel] = np.rint(
+                    codes[block_idx, :, :, feature_channel] * (255.0 / (spec.quant_step_count - 1))
+                ).astype(np.uint8)
+        decoded = roundtrip_rgba(atlas)
+        for block_idx in range(count):
+            top = block_idx // atlas_cols * block_h
+            left = block_idx % atlas_cols * block_w
+            for rgba_channel, feature_channel in enumerate(group):
+                recovered[block_idx, :, :, feature_channel] = np.rint(
+                    decoded[top:top + block_h, left:left + block_w, rgba_channel]
+                    * ((spec.quant_step_count - 1) / 255.0)
+                )
+
+    decoded_codes = torch.from_numpy(recovered).to(device=params.device)
+    decoded_features = int_to_feature_tensor(decoded_codes, spec)
+    valid_channels = valid[..., None].expand_as(indices)
+    flat_indices = indices[valid_channels].reshape(-1)
+    flat_features = decoded_features[valid_channels].reshape(-1)
+    source = quantize_feature_tensor(params.index_select(0, flat_indices), spec)
+    rms_codes = float(((flat_features - source) * spec.quant_step_count).square().mean().sqrt().item())
+    return flat_indices, flat_features, rms_codes
 
 
 # ---------------------------------------------------------------------------

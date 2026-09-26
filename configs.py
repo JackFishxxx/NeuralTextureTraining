@@ -143,6 +143,7 @@ class Config():
         self.astc_codec_in_loop_enable = bool(getattr(params, "astc_codec_in_loop_enable", False))
         self.astc_codec_update_latent = bool(getattr(params, "astc_codec_update_latent", False))
         self.astc_codec_in_loop_interval = int(getattr(params, "astc_codec_in_loop_interval", 5000))
+        self.astc_codec_blocks_per_step = int(getattr(params, "astc_codec_blocks_per_step", 32))
         self.astc_codec_loss_weight = float(getattr(params, "astc_codec_loss_weight", 0.7))
         self.astc_clean_loss_weight = float(getattr(params, "astc_clean_loss_weight", 0.3))
         self.astc_consistency_weight = float(getattr(params, "astc_consistency_weight", 0.1))
@@ -151,6 +152,7 @@ class Config():
         if (self.astc_aware_noise_scale < 0.0
                 or not 0.0 <= self.astc_aware_start_frac <= 1.0
                 or self.astc_codec_in_loop_interval <= 0
+                or self.astc_codec_blocks_per_step <= 0
                 or min(self.astc_codec_loss_weight, self.astc_clean_loss_weight,
                        self.astc_consistency_weight) < 0.0):
             raise ValueError("invalid ASTC-aware latent settings")
@@ -417,7 +419,9 @@ def get_args():
     parser.add_argument('--astc_codec_update_latent', action=argparse.BooleanOptionalAction, default=False,
                         help='use a straight-through codec gradient to update feature-grid latents (experimental)')
     parser.add_argument('--astc_codec_in_loop_interval', type=int, default=5000,
-                        help='iterations between real ASTC latent calibration passes')
+                        help='iterations between exact ASTC block-training passes (1 = every iteration)')
+    parser.add_argument('--astc_codec_blocks_per_step', type=int, default=32,
+                        help='number of ASTC blocks sampled during each exact codec-training pass')
     parser.add_argument('--astc_codec_loss_weight', type=float, default=0.7,
                         help='reconstruction loss weight for the real-ASTC training branch')
     parser.add_argument('--astc_clean_loss_weight', type=float, default=0.3,
@@ -425,7 +429,7 @@ def get_args():
     parser.add_argument('--astc_consistency_weight', type=float, default=0.1,
                         help='output consistency weight between ASTC and clean branches')
     parser.add_argument('--astc_codec_mip0_prob', type=float, default=0.5,
-                        help='probability of sampling Mip0 during ASTC codec-in-loop training')
+                        help='probability of running an ASTC pass when its interval is due')
     parser.add_argument('--astc_codec_start_frac', type=float, default=0.0,
                         help='fraction of training reserved for clean latent pretraining before codec loss')
     parser.add_argument(

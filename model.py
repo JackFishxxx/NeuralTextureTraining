@@ -73,6 +73,7 @@ class TCNNModel(torch.nn.Module):
     def __getstate__(self):
         state = super().__getstate__()
         state["_qat_param_cache"] = {}
+        state["_astc_codec_patches"] = {}
         state["optimizer"] = None
         state["scheduler"] = None
         return state
@@ -118,6 +119,7 @@ class TCNNModel(torch.nn.Module):
         self.astc_codec_update_latent = bool(getattr(config, "astc_codec_update_latent", False))
         self.astc_codec_calibrated = False
         self.astc_codec_branch_enabled = False
+        self._astc_codec_patches = {}
         # Network output matches the selected canonical texture layout.
         self.normal_encoding = str(getattr(config, "normal_encoding", "xyz")).lower()
         self.num_channels = canonical_num_channels(self.normal_encoding)
@@ -535,15 +537,25 @@ class TCNNModel(torch.nn.Module):
             clipped_mips = torch.clamp(mips, max=grid_levels - num_sampled_mips)
             selected_level_f = grid_levels - num_sampled_mips - clipped_mips
             grid_uvs = self._texel_aligned_grid_uv(uvs, selected_level_f, self.feature_grid_base_res[idx])
+            active_params = None
             if self.quantize and self.training:
-                quantized_params = self._get_qat_grid_params(idx, feature_grid)
-                all_features = functional_call(feature_grid, {"params": quantized_params}, (grid_uvs,))
+                active_params = self._get_qat_grid_params(idx, feature_grid)
+                patch = self._astc_codec_patches.get(idx) if self.astc_codec_branch_enabled else None
+                if patch is not None:
+                    patch_indices, decoded_values = patch
+                    sampled_params = active_params.index_select(0, patch_indices)
+                    decoded_values = decoded_values.to(dtype=active_params.dtype)
+                    if self.astc_codec_update_latent:
+                        decoded_values = sampled_params + (decoded_values - sampled_params).detach()
+                    active_params = active_params.index_copy(0, patch_indices, decoded_values)
+                all_features = functional_call(feature_grid, {"params": active_params}, (grid_uvs,))
             else:
                 all_features = feature_grid(grid_uvs)
             cols = (grid_levels - num_sampled_mips - clipped_mips) * grid_fpl + torch.arange(grid_fpl * num_sampled_mips).to(self.device)
             sampled_features = torch.gather(all_features, 1, cols.to(torch.int64))
 
-            if self.training and self.num_sampled_mips == 1 and self.astc_codec_branch_enabled:
+            if (self.training and self.num_sampled_mips == 1 and self.astc_codec_branch_enabled
+                    and idx not in self._astc_codec_patches):
                 selected_res = self.feature_grid_base_res[idx] * torch.pow(
                     2.0, selected_level_f
                 )
@@ -571,9 +583,15 @@ class TCNNModel(torch.nn.Module):
                 if not self.astc_codec_update_latent:
                     sampled_features = sampled_features.detach()
 
+            if (self.training and self.astc_codec_branch_enabled
+                    and idx in self._astc_codec_patches and not self.astc_codec_update_latent):
+                sampled_features = sampled_features.detach()
+
             if self.direct_diffuse_enabled and idx == 0:
                 nearest_uvs = self._nearest_grid_uv(uvs, selected_level_f, self.feature_grid_base_res[idx])
-                nearest_features = torch.gather(feature_grid(nearest_uvs), 1, cols.to(torch.int64))
+                nearest_all = (functional_call(feature_grid, {"params": active_params}, (nearest_uvs,))
+                               if active_params is not None else feature_grid(nearest_uvs))
+                nearest_features = torch.gather(nearest_all, 1, cols.to(torch.int64))
                 direct_diffuse = self._decode_direct_diffuse_features(nearest_features)
 
             features.append(sampled_features)

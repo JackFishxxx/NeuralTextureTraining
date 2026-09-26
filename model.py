@@ -515,10 +515,19 @@ class TCNNModel(torch.nn.Module):
                 )
                 highest_level = self.feature_grid_n_levels[idx] - 1
                 highest_mask = (selected_level_f == float(highest_level)).to(sampled_features.dtype)
-                codec_error = self._sample_astc_codec_error(idx, uvs)
-                if codec_error.numel() > 0:
-                    codec_approx = sampled_features + codec_error.detach()
-                    sampled_features = sampled_features * (1.0 - highest_mask) + codec_approx * highest_mask
+                codec_texture = self._sample_astc_codec_texture(idx, uvs)
+                if codec_texture.numel() > 0:
+                    # Use the actual ASTC-decoded latent in the codec branch.
+                    # The optional STE lets experimental latent updates see an
+                    # identity gradient through the non-differentiable codec.
+                    if self.astc_codec_update_latent:
+                        codec_features = sampled_features + (codec_texture - sampled_features).detach()
+                    else:
+                        codec_features = codec_texture.detach()
+                    sampled_features = (
+                        sampled_features * (1.0 - highest_mask)
+                        + codec_features * highest_mask
+                    )
                 else:
                     perturbation = self._astc_aware_latent_noise(
                         uvs, selected_level_f, selected_res, sampled_features.shape[1]

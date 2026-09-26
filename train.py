@@ -622,10 +622,11 @@ class Trainer:
 
     @torch.no_grad()
     def _calibrate_astc_aware_latent(self, curr_iter: int) -> None:
-        """Measure real astcenc latent error and update the training proxy amplitude.
+        """Refresh the real ASTC-decoded latent used by the codec branch.
 
-        The codec call is outside autograd. Subsequent training iterations use the
-        measured RMS code error in the differentiable block-correlated proxy.
+        The codec call is outside autograd. Subsequent codec-branch iterations
+        use the cached decoded latent directly; the measured RMS remains a
+        diagnostic and fallback proxy scale.
         """
         probe = copy.deepcopy(self.model).eval()
         probe.simulate_quantize()

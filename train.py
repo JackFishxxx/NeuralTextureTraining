@@ -689,7 +689,9 @@ class Trainer:
                 w1 = min(w0 + step, mip_width)
                 inp, fr, fc = self._mip_plane_tile(h0, h1, w0, w1, mip_height, mip_width, mip_f, device)
                 if self.super_resolution_enable:
-                    base = self.dataset.superres_base_cache[mip, fr, fc, :]
+                    local_indices = torch.stack([fr, fc, torch.full_like(fr, mip)], dim=1)
+                    local_indices[:, :2] *= 2 ** mip
+                    base = self.dataset.get_superres_base(local_indices)
                     base = self.dataset.expand_to_canonical(base).float()
                     residual = self.model(torch.cat([inp, base], dim=1)).float()
                     out[fr, fc, :] = (base + residual).clamp(0.0, 1.0)
@@ -726,7 +728,7 @@ class Trainer:
             os.makedirs(os.path.join(root, vc['display_name']), exist_ok=True)
 
     def _canonical_gt_mip(self, mip: int, mip_height: int, mip_width: int) -> torch.Tensor:
-        gt_slice = self.dataset.mip_cache[mip, :mip_height, :mip_width, :]
+        gt_slice = self.dataset.mip_cache[mip]
         gt_canonical = self.dataset.expand_to_canonical(
             gt_slice.reshape(-1, gt_slice.shape[-1])
         ).reshape(mip_height, mip_width, -1)

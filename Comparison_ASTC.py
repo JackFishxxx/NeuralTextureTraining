@@ -201,7 +201,7 @@ def _traditional_baseline_resampled(
             mh = dataset.texture_height // (2 ** mip)
             mw = dataset.texture_width // (2 ** mip)
             if (mh, mw) == (ref_h, ref_w):
-                cached = dataset.mip_cache[mip, :mh, :mw, :]
+                cached = dataset.mip_cache[mip]
                 cached = dataset.expand_to_canonical(cached.reshape(-1, cached.shape[-1]))
                 src = cached.reshape(mh, mw, -1).permute(2, 0, 1)[None, ...]
                 break
@@ -226,7 +226,7 @@ def _astc_roundtrip_superres_base_mip0(dataset, roundtrip_rgba, base_resolution:
     source_mip_offset = max(0, int(round(math.log2(ratio)))) if ratio > 1.0 else 0
     source_mip = min(source_mip_offset, dataset.num_mips - 1)
     h, w = h0 // (2 ** source_mip), w0 // (2 ** source_mip)
-    source = dataset.mip_cache[source_mip, :h, :w, :]
+    source = dataset.mip_cache[source_mip]
     source = dataset.expand_to_canonical(source.reshape(-1, source.shape[-1]))
     source = source.reshape(h, w, -1).permute(2, 0, 1)[None, ...]
     compressed = build_traditional_astc_prediction(
@@ -298,7 +298,7 @@ def _render_gt_mip0(dataset, texture_height: int, texture_width: int) -> torch.T
     mip = 0
     mip_height = texture_height // (2 ** mip)
     mip_width = texture_width // (2 ** mip)
-    gt_slice = dataset.mip_cache[mip, :mip_height, :mip_width, :]
+    gt_slice = dataset.mip_cache[mip]
     gt_canonical = dataset.expand_to_canonical(gt_slice.reshape(-1, gt_slice.shape[-1]))
     gt_canonical = gt_canonical.reshape(mip_height, mip_width, -1)
     return gt_canonical.permute(2, 0, 1)[None, ...]
@@ -319,7 +319,7 @@ def _render_model_mip0(model, dataset, texture_height: int, texture_width: int, 
     base = None
     if getattr(model, "super_resolution_enable", False):
         if superres_base_override is None:
-            base_data = dataset.superres_base_cache[mip, :H, :W, :].reshape(-1, dataset.num_channels)
+            base_data = dataset.superres_base_cache[mip].reshape(-1, dataset.num_channels)
             base = dataset.expand_to_canonical(base_data).float()
         else:
             base_chw = superres_base_override[0] if superres_base_override.ndim == 4 else superres_base_override

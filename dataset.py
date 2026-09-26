@@ -107,7 +107,7 @@ class TextureDataset(torch.nn.Module):
             batch_index: TensorType["batch_size", 3]
         ) -> List[TensorType["batch_size", "num_channels"]]:
 
-        # mip_cache: [self.num_mips, self.texture_height, self.texture_width, self.num_channels]
+        # mip_cache stores one compact [H_mip, W_mip, C] tensor per level.
         # batch_index: [batch_size, 3]
 
         batch_size = batch_index.shape[0]
@@ -120,7 +120,14 @@ class TextureDataset(torch.nn.Module):
         scaled_xs = xs // mip_scale
         scaled_ys = ys // mip_scale
 
-        batch_data = self.mip_cache[mips, scaled_ys, scaled_xs, :]
+        batch_data = torch.empty(
+            (batch_index.shape[0], self.num_channels),
+            device=self.mip_cache[0].device,
+            dtype=self.mip_cache[0].dtype,
+        )
+        for mip, level in enumerate(self.mip_cache):
+            mask = mips == mip
+            batch_data[mask] = level[scaled_ys[mask], scaled_xs[mask]]
 
         return batch_data
 
@@ -132,14 +139,19 @@ class TextureDataset(torch.nn.Module):
         mip_i = mips.to(torch.long).reshape(-1)
         scale = torch.pow(torch.tensor(2.0, device=sample_xy.device), mip_i).float()
         x, y = sample_xy[:, 1].float() / scale, sample_xy[:, 0].float() / scale
-        h = (self.texture_height // scale.to(torch.long)).clamp_min(1)
-        w = (self.texture_width // scale.to(torch.long)).clamp_min(1)
+        h = torch.tensor([level.shape[0] for level in source], device=sample_xy.device)[mip_i]
+        w = torch.tensor([level.shape[1] for level in source], device=sample_xy.device)[mip_i]
         fx, fy = torch.floor(x), torch.floor(y)
         x0, y0 = torch.remainder(fx.to(torch.long), w), torch.remainder(fy.to(torch.long), h)
         x1, y1 = torch.remainder(x0 + 1, w), torch.remainder(y0 + 1, h)
-        tx, ty = (x - fx).to(source.dtype), (y - fy).to(source.dtype)
-        c00 = source[mip_i, y0, x0]; c10 = source[mip_i, y0, x1]
-        c01 = source[mip_i, y1, x0]; c11 = source[mip_i, y1, x1]
+        dtype = source[0].dtype
+        tx, ty = (x - fx).to(dtype), (y - fy).to(dtype)
+        c00 = torch.empty((len(mip_i), source[0].shape[-1]), device=source[0].device, dtype=dtype)
+        c10, c01, c11 = c00.clone(), c00.clone(), c00.clone()
+        for mip, level in enumerate(source):
+            mask = mip_i == mip
+            c00[mask], c10[mask] = level[y0[mask], x0[mask]], level[y0[mask], x1[mask]]
+            c01[mask], c11[mask] = level[y1[mask], x0[mask]], level[y1[mask], x1[mask]]
         return ((1-tx[:,None])*(1-ty[:,None])*c00 + tx[:,None]*(1-ty[:,None])*c10
                 + (1-tx[:,None])*ty[:,None]*c01 + tx[:,None]*ty[:,None]*c11)
 
@@ -159,7 +171,16 @@ class TextureDataset(torch.nn.Module):
             raise RuntimeError("Super-resolution is not enabled for this dataset")
         ys, xs, mips = batch_index[:, 0], batch_index[:, 1], batch_index[:, 2]
         mip_scale = 2 ** mips
-        return self.superres_base_cache[mips, ys // mip_scale, xs // mip_scale, :]
+        out = torch.empty(
+            (batch_index.shape[0], self.num_channels),
+            device=self.superres_base_cache[0].device,
+            dtype=self.superres_base_cache[0].dtype,
+        )
+        scaled_ys, scaled_xs = ys // mip_scale, xs // mip_scale
+        for mip, level in enumerate(self.superres_base_cache):
+            mask = mips == mip
+            out[mask] = level[scaled_ys[mask], scaled_xs[mask]]
+        return out
         
 
     @staticmethod
@@ -323,9 +344,7 @@ class TextureDataset(torch.nn.Module):
 
     def generate_mip(self) -> TensorType["num_mips", "mip_height", "mip_width", "num_channels"]:
 
-        mip_cache = torch.zeros(
-            [self.num_mips, self.texture_height, self.texture_width, self.num_channels]
-        )
+        mip_cache = []
         # here is a bug in pytorch while using a tensor on cuda to interpolate
         # from a large size to a small size, e.g. [1024, 1024] -> [8, 8]
         # the bug was not fixed since 2023
@@ -349,15 +368,15 @@ class TextureDataset(torch.nn.Module):
                 previous_parts[texture_type] = mip_parts[-1]
             mip_texture = torch.cat(mip_parts, dim=0).permute(1, 2, 0)
             # [mip, H, W, C] <- [mip_H, mip_W, C]
-            mip_cache[mip, :mip_height, :mip_width, :] = mip_texture
+            mip_cache.append(mip_texture)
 
-        mip_cache = mip_cache.to(self.device)
+        mip_cache = [m.to(self.device) for m in mip_cache]
 
         return mip_cache
 
     def generate_superres_base(self) -> TensorType["num_mips", "H", "W", "num_channels"]:
         """Build baselines from a texture half the maximum feature-grid resolution."""
-        base_cache = torch.zeros_like(self.mip_cache)
+        base_cache = []
         texture_max_edge = max(self.texture_height, self.texture_width)
         ratio = texture_max_edge / float(self.superres_input_max_edge)
         source_mip_offset = max(0, int(round(math.log2(ratio)))) if ratio > 1.0 else 0
@@ -371,15 +390,15 @@ class TextureDataset(torch.nn.Module):
             out_w = self.texture_width // (2 ** mip)
             source_mip = min(mip + source_mip_offset, self.num_mips - 1)
             if source_mip == mip:
-                base_cache[mip, :out_h, :out_w, :] = self.mip_cache[mip, :out_h, :out_w, :]
+                base_cache.append(self.mip_cache[mip].clone())
                 continue
             low_h = self.texture_height // (2 ** source_mip)
             low_w = self.texture_width // (2 ** source_mip)
-            low = self.mip_cache[source_mip, :low_h, :low_w, :].permute(2, 0, 1)[None].float()
+            low = self.mip_cache[source_mip].permute(2, 0, 1)[None].float()
             upsampled = torch.nn.functional.interpolate(
                 low, size=(out_h, out_w), mode="bilinear", align_corners=False
             )
-            base_cache[mip, :out_h, :out_w, :] = upsampled.squeeze(0).permute(1, 2, 0)
+            base_cache.append(upsampled.squeeze(0).permute(1, 2, 0))
         return base_cache
     
     def get_output_loss_weights(self, config_weights: Optional[Dict[str, float]] = None) -> List[float]:
@@ -415,6 +434,8 @@ class TextureDataset(torch.nn.Module):
 
     def expand_mip_to_canonical(self, mip_tensor: TensorType["num_mips", "H", "W", "num_channels"]) -> TensorType["num_mips", "H", "W", 11]:
         """Expand mip_cache [num_mips, H, W, num_channels] to [num_mips, H, W, canonical_channels]; fill missing with 0."""
+        if isinstance(mip_tensor, list):
+            return [self.expand_mip_to_canonical_level(level) for level in mip_tensor]
         num_mips, h, w, c = mip_tensor.shape
         device = mip_tensor.device
         dtype = mip_tensor.dtype
@@ -423,6 +444,17 @@ class TextureDataset(torch.nn.Module):
             ds_start, ds_end = self.channel_slices[tex_type]
             canon_start, canon_end = self.canonical_channel_slices[tex_type]
             out[:, :, :, canon_start:canon_end] = mip_tensor[:, :, :, ds_start:ds_end]
+        return out
+
+    def expand_mip_to_canonical_level(self, mip_tensor: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros(
+            (*mip_tensor.shape[:-1], self.canonical_num_channels),
+            device=mip_tensor.device, dtype=mip_tensor.dtype,
+        )
+        for tex_type in self.available_textures:
+            ds_start, ds_end = self.channel_slices[tex_type]
+            canon_start, canon_end = self.canonical_channel_slices[tex_type]
+            out[..., canon_start:canon_end] = mip_tensor[..., ds_start:ds_end]
         return out
 
     def get_canonical_loss_weights(self, config_weights: Optional[Dict[str, float]] = None) -> List[float]:

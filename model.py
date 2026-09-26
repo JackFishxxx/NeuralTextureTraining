@@ -90,6 +90,8 @@ class TCNNModel(torch.nn.Module):
         self._qat_noise_mult_start = float(getattr(config, "qat_noise_mult_start", 1.0))
         self._qat_noise_mult_end = float(getattr(config, "qat_noise_mult_end", 0.25))
         self._qat_noise_warmup_frac = float(getattr(config, "qat_noise_warmup_frac", 0.0))
+        self._qat_param_cache = {}
+        self._qat_param_cache_iter = None
 
         self.current_iter = 0
 
@@ -281,6 +283,32 @@ class TCNNModel(torch.nn.Module):
         p = (t - w) / max(1, T - w)
         c = 0.5 * (1.0 + math.cos(math.pi * p))
         return self._qat_noise_mult_end + (self._qat_noise_mult_start - self._qat_noise_mult_end) * c
+
+    def _get_qat_grid_params(self, grid_idx: int, feature_grid: torch.nn.Module) -> torch.Tensor:
+        """Build one quantized grid per iteration/branch and reuse it across forwards."""
+        if self._qat_param_cache_iter != self.current_iter:
+            self._qat_param_cache.clear()
+            self._qat_param_cache_iter = self.current_iter
+
+        params = self._get_grid_params_tensor(feature_grid)
+        branch = bool(self.astc_codec_branch_enabled)
+        key = (int(grid_idx), branch)
+        cached = self._qat_param_cache.get(key)
+        if cached is not None and cached[0] == params._version:
+            return cached[1]
+
+        if branch:
+            noisy_params = params
+        else:
+            step = 1.0 / self.feature_grid_specs[grid_idx].quant_step_count
+            multiplier = self._qat_noise_multiplier()
+            noise = torch.zeros_like(params)
+            if multiplier != 0.0:
+                noise = (torch.rand_like(params) - 0.5) * step * multiplier
+            noisy_params = params + noise
+        quantized = quantize_feature_ste(noisy_params, self.feature_grid_specs[grid_idx])
+        self._qat_param_cache[key] = (params._version, quantized)
+        return quantized
 
     def _astc_aware_latent_noise(self, uvs, selected_level, res, channels):
         """Deterministic block-correlated perturbation approximating ASTC endpoint error."""
@@ -496,13 +524,7 @@ class TCNNModel(torch.nn.Module):
             selected_level_f = grid_levels - num_sampled_mips - clipped_mips
             grid_uvs = self._texel_aligned_grid_uv(uvs, selected_level_f, self.feature_grid_base_res[idx])
             if self.quantize and self.training:
-                params = self._get_grid_params_tensor(feature_grid)
-                if self.astc_codec_branch_enabled:
-                    noisy_params = params
-                else:
-                    step = 1.0 / self.feature_grid_specs[idx].quant_step_count
-                    noisy_params = params + (torch.rand_like(params) - 0.5) * step * self._qat_noise_multiplier()
-                quantized_params = quantize_feature_ste(noisy_params, self.feature_grid_specs[idx])
+                quantized_params = self._get_qat_grid_params(idx, feature_grid)
                 all_features = functional_call(feature_grid, {"params": quantized_params}, (grid_uvs,))
             else:
                 all_features = feature_grid(grid_uvs)

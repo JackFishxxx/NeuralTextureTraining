@@ -70,6 +70,11 @@ class TiledPositionalEncoding(torch.nn.Module):
 
 class TCNNModel(torch.nn.Module):
 
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["_qat_param_cache"] = {}
+        return state
+
     def __init__(self, config: Config):
         super().__init__()
 
@@ -101,7 +106,11 @@ class TCNNModel(torch.nn.Module):
         self.n_hidden_layers = config.n_hidden_layers
         self.output_activation = getattr(config, "output_activation", "hard_swish")
         self.astc_aware_enable = bool(getattr(config, "astc_aware_enable", False))
-        self.astc_aware_block = int(getattr(config, "astc_aware_block", 6))
+        astc_block = getattr(config, "astc_aware_block", (6, 6))
+        self.astc_aware_block = (
+            (int(astc_block), int(astc_block)) if isinstance(astc_block, int)
+            else tuple(int(edge) for edge in astc_block)
+        )
         self.astc_aware_noise_scale = float(getattr(config, "astc_aware_noise_scale", 1.0))
         self.astc_aware_start_frac = float(getattr(config, "astc_aware_start_frac", 0.1))
         self.astc_codec_update_latent = bool(getattr(config, "astc_codec_update_latent", False))
@@ -314,7 +323,8 @@ class TCNNModel(torch.nn.Module):
         """Deterministic block-correlated perturbation approximating ASTC endpoint error."""
         if not self.astc_aware_enable or self.current_iter < int(self.max_iter * self.astc_aware_start_frac):
             return torch.zeros((uvs.shape[0], channels), device=uvs.device, dtype=uvs.dtype)
-        block = torch.floor(uvs * res / float(self.astc_aware_block))
+        block_size = uvs.new_tensor(self.astc_aware_block)
+        block = torch.floor(uvs * res / block_size)
         channel = torch.arange(channels, device=uvs.device, dtype=uvs.dtype)[None, :]
         seed = (block[:, 0:1] * 12.9898 + block[:, 1:2] * 78.233
                 + channel * 37.719 + float(self.current_iter) * 0.0137)
@@ -764,11 +774,10 @@ class TCNNModel(torch.nn.Module):
             # Convert packed features to uint8 for R8G8B8A8 format
             # Packed features are in the range [0, 2^quantize_bits - 1]
             # We need to scale them to [0, 255] for uint8
-            scale_factor = 255.0 / (2 ** save_model.quantize_bits - 1)
-
             # For each matching grid, extract highest-resolution level and form a single R8G8B8A8 DDS
             for idx, ints in enumerate(quant_ints_list):
                 orig_i = matching_indices[idx]
+                scale_factor = 255.0 / (2 ** save_model.feature_grid_quantize_bits[orig_i] - 1)
                 ints_np = ints.cpu().numpy()
                 base_res = int(self.feature_grid_base_res[orig_i])
                 n_levels = int(self.feature_grid_n_levels[orig_i])

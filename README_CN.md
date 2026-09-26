@@ -137,7 +137,7 @@ python train.py \
     --data_dir ./data/test \
     --save_dir ./outputs \
     --quantize_bits 4 \
-    --save_bits 32
+    --save_bits 16
 ```
 
 如果想要重新训练已经训练了一段时间的模型，可以使用 `--load_iter` 和  `--load_dir` 指令：
@@ -148,7 +148,7 @@ python train.py \
     --data_dir ./data/test \
     --save_dir ./outputs \
     --quantize_bits 4 \
-    --save_bits 32 \
+    --save_bits 16 \
     --load_iter 50000 \
     --load_dir outputs/yyyy-mm-dd-hh-mm-ss
 ```
@@ -199,7 +199,7 @@ python train.py \
     --data_dir ./data/test \
     --save_dir ./outputs \
     --quantize_bits 4 \
-    --save_bits 32 \
+    --save_bits 16 \
     --load_iter 50000 \
     --load_dir outputs/yyyy-mm-dd-hh-mm-ss
 ```
@@ -304,8 +304,8 @@ ASTC 对比需要可用的 `astcenc` 可执行文件，程序会通过 `astcenc_
 |------|------|
 | `max_resolution` | 最大分辨率 |
 | `n_levels` | Mip 层级数 |
-| `quantize_bits` | 量化精度（2/4/8/16 位） |
-| `save_bits` | 保存精度（8/16/32/64 位） |
+| `quantize_bits` | 量化精度（2/4/8 位） |
+| `save_bits` | 每像素特征位数（8/16/32 位，最多 4 通道） |
 | `learning_rate` | 独立学习率 |
 
 ### 可配置的纹理损失权重

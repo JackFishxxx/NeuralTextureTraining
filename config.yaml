@@ -40,7 +40,6 @@ pos_encoding_tile_size: 16
 
 # ---------- astc aware configs ----------
 astc_aware_enable: true
-astc_aware_block: 6
 astc_aware_noise_scale: 1.0
 astc_aware_start_frac: 0.0
 astc_codec_in_loop_enable: true

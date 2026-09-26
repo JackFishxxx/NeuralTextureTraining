@@ -134,7 +134,7 @@ python train.py \
     --data_dir ./data/test \
     --save_dir ./outputs \
     --quantize_bits 4 \
-    --save_bits 32
+    --save_bits 16
 ```
 
 To resume training from a checkpoint, use `--load_iter` and `--load_dir`:
@@ -145,7 +145,7 @@ python train.py \
     --data_dir ./data/test \
     --save_dir ./outputs \
     --quantize_bits 4 \
-    --save_bits 32 \
+    --save_bits 16 \
     --load_iter 50000 \
     --load_dir outputs/yyyy-mm-dd-hh-mm-ss
 ```
@@ -196,7 +196,7 @@ python train.py \
     --data_dir ./data/test \
     --save_dir ./outputs \
     --quantize_bits 4 \
-    --save_bits 32 \
+    --save_bits 16 \
     --load_iter 50000 \
     --load_dir outputs/yyyy-mm-dd-hh-mm-ss
 ```
@@ -303,8 +303,8 @@ The model supports **heterogeneous feature grids** through the `feature_grid_con
 |-------|-------------|
 | `max_resolution` | Maximum resolution of the grid |
 | `n_levels` | Number of Mip levels |
-| `quantize_bits` | Quantization precision (2 / 4 / 8 / 16 bits) |
-| `save_bits` | Save precision (8 / 16 / 32 / 64 bits) |
+| `quantize_bits` | Quantization precision (2 / 4 / 8 bits) |
+| `save_bits` | Feature bits per texel (8 / 16 / 32 bits; at most 4 channels) |
 | `learning_rate` | Per-grid learning rate |
 
 ### Configurable Per-Texture Loss Weights

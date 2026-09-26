@@ -1,11 +1,12 @@
 import argparse
 import os
-import math
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
 import yaml
+from feature_grid import FeatureGridSpec
 
 
 def _parse_bool(value):
@@ -17,6 +18,16 @@ def _parse_bool(value):
     if text in {"0", "false", "no", "off"}:
         return False
     raise argparse.ArgumentTypeError(f"expected a boolean, got '{value}'")
+
+
+def _normalize_astc_block(value: str) -> tuple[str, tuple[int, int]]:
+    match = re.fullmatch(r"\s*(\d+)\s*[xX]\s*(\d+)\s*", str(value))
+    if match is None:
+        raise ValueError("astc_block must use the form WxH, such as 6x6")
+    width, height = int(match.group(1)), int(match.group(2))
+    if width <= 0 or height <= 0:
+        raise ValueError("astc_block dimensions must be positive")
+    return f"{width}x{height}", (width, height)
 
 
 def mip_sampling_probabilities(num_mips: int, mip0_only: bool, device: str = "cpu") -> torch.Tensor:
@@ -127,7 +138,6 @@ class Config():
         self.qat_noise_mult_end = float(getattr(params, "qat_noise_mult_end", 0.25))
         self.qat_noise_warmup_frac = float(getattr(params, "qat_noise_warmup_frac", 0.1))
         self.astc_aware_enable = bool(getattr(params, "astc_aware_enable", False))
-        self.astc_aware_block = int(getattr(params, "astc_aware_block", 6))
         self.astc_aware_noise_scale = float(getattr(params, "astc_aware_noise_scale", 1.0))
         self.astc_aware_start_frac = float(getattr(params, "astc_aware_start_frac", 0.0))
         self.astc_codec_in_loop_enable = bool(getattr(params, "astc_codec_in_loop_enable", False))
@@ -138,7 +148,7 @@ class Config():
         self.astc_consistency_weight = float(getattr(params, "astc_consistency_weight", 0.1))
         self.astc_codec_mip0_prob = float(getattr(params, "astc_codec_mip0_prob", 0.5))
         self.astc_codec_start_frac = float(getattr(params, "astc_codec_start_frac", 0.0))
-        if (self.astc_aware_block <= 0 or self.astc_aware_noise_scale < 0.0
+        if (self.astc_aware_noise_scale < 0.0
                 or not 0.0 <= self.astc_aware_start_frac <= 1.0
                 or self.astc_codec_in_loop_interval <= 0
                 or min(self.astc_codec_loss_weight, self.astc_clean_loss_weight,
@@ -261,7 +271,7 @@ class Config():
         self.enable_astc_compare = bool(params.enable_astc_compare)
         self.astcenc_path = params.astcenc_path
         self.astcenc_quality = params.astcenc_quality
-        self.astc_block = params.astc_block
+        self.astc_block, self.astc_aware_block = _normalize_astc_block(params.astc_block)
         self.ref_astc_resolution = getattr(params, "ref_astc_resolution", None)
 
         ### ---------- PBR scene comparison ---------- ###
@@ -303,32 +313,17 @@ class Config():
         if self.feature_grid_configs is not None:
             processed: List[Dict] = []
             for cfg in self.feature_grid_configs:
-                max_res = int(cfg.get("max_resolution", 1024))
-                # check max_res
-                if max_res <= 0:
-                    raise ValueError("max_resolution must be a positive integer")
-
-                n_levels = int(cfg.get("n_levels", int(math.log2(max_res>>1))))
-                #n_levels = int(cfg.get("n_levels", 1))
-                # check n_levels
-                if n_levels <= 0:
-                    raise ValueError("n_levels must be a positive integer")
-
-                qbits = int(cfg.get("quantize_bits", self.quantize_bits))
-                sbits = int(cfg.get("save_bits", self.save_bits))
-                # check quantize bits and save bits
-                if sbits < qbits:
-                    raise ValueError("The save bits should not be less than the quantize bits.")
-
-                lr = cfg.get("learning_rate", self.learning_rate)
+                spec = FeatureGridSpec.from_config(
+                    cfg, self.quantize_bits, self.save_bits, self.learning_rate
+                )
 
                 processed.append({
-                    "max_resolution": max_res,
-                    "n_levels": n_levels,
-                    "quantize_bits": qbits,
-                    "save_bits": sbits,
-                    "learning_rate": lr,
-                    "interpolation": str(cfg.get("interpolation", "Linear")),
+                    "max_resolution": spec.max_resolution,
+                    "n_levels": spec.n_levels,
+                    "quantize_bits": spec.quantize_bits,
+                    "save_bits": spec.save_bits,
+                    "learning_rate": spec.learning_rate,
+                    "interpolation": spec.interpolation,
                 })
 
             self.feature_grid_configs = processed
@@ -388,10 +383,10 @@ def get_args():
     ### ---------- quantization configs ---------- ###
     parser.add_argument('--quantize_bits', type=int, default=8,
                         help='choose the bits to quantize',
-                        choices=[2, 4, 8, 16])
+                        choices=[2, 4, 8])
     parser.add_argument('--save_bits', type=int, default=32,
                         help='choose the bits to quantize',
-                        choices=[8, 16, 32, 64])
+                        choices=[8, 16, 32])
     parser.add_argument(
         '--qat_noise_schedule',
         type=str,
@@ -413,8 +408,6 @@ def get_args():
     )
     parser.add_argument('--astc_aware_enable', action=argparse.BooleanOptionalAction, default=False,
                         help='inject block-correlated ASTC-like latent noise during training')
-    parser.add_argument('--astc_aware_block', type=int, default=6,
-                        help='ASTC-aware latent block edge in texels')
     parser.add_argument('--astc_aware_noise_scale', type=float, default=1.0,
                         help='latent ASTC perturbation in 8-bit code steps')
     parser.add_argument('--astc_aware_start_frac', type=float, default=0.0,

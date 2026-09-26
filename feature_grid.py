@@ -38,8 +38,8 @@ class FeatureGridSpec:
             )
         if qbits not in (2, 4, 8):
             raise ValueError("quantize_bits must be one of 2, 4, 8 for RGBA8 DDS export")
-        if sbits not in (8, 16, 32, 64) or sbits < qbits:
-            raise ValueError("save_bits must be one of 8, 16, 32, 64 and >= quantize_bits")
+        if sbits not in (8, 16, 32) or sbits < qbits:
+            raise ValueError("save_bits must be one of 8, 16, 32 and >= quantize_bits")
         if sbits % qbits != 0:
             raise ValueError("save_bits must be divisible by quantize_bits")
         if sbits // qbits > 4:

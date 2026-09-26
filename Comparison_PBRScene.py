@@ -257,7 +257,7 @@ def render_pbr_scene(texture: torch.Tensor, slices: Dict[str, tuple], normal_enc
     )
     if albedo.shape[1] == 1:
         albedo = np.repeat(albedo, 3, axis=1)
-    albedo = np.clip(albedo, 0, 1) ** 2.2
+    albedo = np.clip(albedo, 0, 1)
     rough = np.clip(_sample(
         maps.get("roughness", np.full((1, 1, 1), 0.5, np.float32)), uv, uv_dx, uv_dy, mip_lod_bias
     ), 0.045, 1)

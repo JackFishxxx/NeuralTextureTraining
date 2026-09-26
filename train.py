@@ -239,9 +239,7 @@ class Trainer:
         view = torch.tensor([0.0, 0.0, 1.0], device=pred.device, dtype=pred.dtype)
         half = (light + view) / torch.clamp(torch.linalg.vector_norm(light + view), min=1e-6)
         def shade(diff, normal, rough, metal, spec):
-            diff = torch.clamp(diff, 0, 1) ** 2.2
-            nvec = normal * 2.0 - 1.0
-            normal = nvec / torch.sqrt(torch.clamp((nvec * nvec).sum(1, keepdim=True), min=1e-4))
+            diff = torch.clamp(diff, 0, 1)
             ndotl = torch.clamp((normal * light[None]).sum(1, keepdim=True), 0, 1)
             ndoth = torch.clamp((normal * half[None]).sum(1, keepdim=True), 0, 1)
             vdoth = torch.clamp((view[None] * half[None]).sum(1, keepdim=True), 0, 1)

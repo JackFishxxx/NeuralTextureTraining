@@ -210,10 +210,14 @@ class TextureDataset(torch.nn.Module):
         """
         name = filename.lower()
         channel_map: List[Tuple[str, int]]
+        is_metallic_smoothness = any(
+            token in name for token in ("metallicsmoothness", "metallic_smoothness", "metallic-smoothness")
+        )
 
-        if "metallicsmoothness" in name or "metallic_smoothness" in name or "metallic-smoothness" in name:
-            # Unity-style packed map observed in data_batch: R=metallic, A=smoothness/roughness proxy.
-            # Use alpha when present; otherwise fall back to green.
+        if is_metallic_smoothness:
+            # Unity-style packed map observed in data_batch: R=metallic and
+            # A/G=smoothness. Convert smoothness to the roughness convention
+            # used by the renderer and training target.
             rough_idx = 3 if tensor.shape[0] >= 4 else min(1, tensor.shape[0] - 1)
             channel_map = [("metallic", 0), ("roughness", rough_idx)]
         else:
@@ -223,7 +227,10 @@ class TextureDataset(torch.nn.Module):
         packed: Dict[str, torch.Tensor] = {}
         for tex_type, channel_idx in channel_map:
             if channel_idx < tensor.shape[0]:
-                packed[tex_type] = tensor[channel_idx:channel_idx + 1]
+                channel = tensor[channel_idx:channel_idx + 1]
+                if tex_type == "roughness" and is_metallic_smoothness:
+                    channel = 1.0 - channel
+                packed[tex_type] = channel
         return packed
 
     def _load_texture_tensor(self, filepath: str, texture_type: str) -> torch.Tensor:

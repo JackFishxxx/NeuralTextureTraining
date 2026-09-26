@@ -50,12 +50,22 @@ def decode_normal(encoded: torch.Tensor, normal_encoding: str = 'xyz') -> torch.
     if enc in {'xyz', 'rgb'}:
         return normal_to_rgb(normalize_normal_rgb(encoded))
     xy = _take(encoded, 0, 2) * 2.0 - 1.0
-    x = xy.narrow(cd, 0, 1)
-    y = xy.narrow(cd, 1, 1)
     if enc == 'xy':
-        z = torch.sqrt(torch.clamp(1.0 - (xy ** 2).sum(dim=cd, keepdim=True), min=0.0))
+        # Project out-of-disk predictions slightly inside the hemisphere so
+        # sqrt() never receives a zero argument during training backprop.
+        xy_sq = (xy ** 2).sum(dim=cd, keepdim=True)
+        max_radius_sq = 1.0 - 1e-4
+        scale = torch.sqrt(torch.clamp(
+            max_radius_sq / torch.clamp(xy_sq, min=1e-8), max=1.0
+        ))
+        xy = xy * scale
+        x = xy.narrow(cd, 0, 1)
+        y = xy.narrow(cd, 1, 1)
+        z = torch.sqrt(torch.clamp(1.0 - (xy ** 2).sum(dim=cd, keepdim=True), min=1e-4))
         return normal_to_rgb(torch.cat([x, y, z], dim=cd))
     if enc == 'hemi_oct':
+        x = xy.narrow(cd, 0, 1)
+        y = xy.narrow(cd, 1, 1)
         px = (x + y) * 0.5
         py = (x - y) * 0.5
         z = 1.0 - px.abs() - py.abs()

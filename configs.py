@@ -8,6 +8,17 @@ import torch
 import yaml
 
 
+def _parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"expected a boolean, got '{value}'")
+
+
 def mip_sampling_probabilities(num_mips: int, mip0_only: bool, device: str = "cpu") -> torch.Tensor:
     if num_mips < 1:
         raise ValueError("num_mips must be at least 1")
@@ -28,7 +39,7 @@ def mip_sampling_probabilities(num_mips: int, mip0_only: bool, device: str = "cp
 def inference_mips(num_mips: int, mip0_only: bool) -> range:
     if num_mips < 1:
         raise ValueError("num_mips must be at least 1")
-    return range(1) if mip0_only else range(max(1, num_mips - 4))
+    return range(1) if mip0_only else range(num_mips)
 
 
 def _load_yaml_defaults(config_path=None):
@@ -70,6 +81,11 @@ class Config():
         self.load_iter = params.load_iter
         self.load_dir = params.load_dir
         self.mode = params.mode
+        if self.mode == "infer":
+            if not self.load_dir:
+                raise ValueError("infer mode requires --load_dir")
+            if self.load_iter == 0:
+                raise ValueError("infer mode requires --load_iter (use -1 for the newest checkpoint)")
 
         ### ---------- groups batching configs ---------- ###
         self.groups_batching = params.groups_batching
@@ -77,6 +93,12 @@ class Config():
         self.groups_save_dir = params.groups_save_dir
         self.groups_max_workers = params.groups_max_workers
         self.groups_verbose = params.groups_verbose
+        if self.groups_max_workers <= 0:
+            raise ValueError("groups_max_workers must be positive")
+        if self.groups_batching and self.groups_max_workers != 1:
+            raise ValueError(
+                "groups_max_workers > 1 is not implemented; use 1 for sequential group training"
+            )
         # Auto-discover all texture group subdirectories under groups_batch_dir
         if self.groups_batching:
             if not os.path.isdir(self.groups_batch_dir):
@@ -92,7 +114,7 @@ class Config():
             self.groups_list: List[str] = []
 
         ### ---------- quantization configs ---------- ###
-        self.quantize = params.quantize
+        self.quantize = True
         self.quantize_bits = params.quantize_bits
         self.save_bits = params.save_bits
         # Feature-grid QAT: multiplicative noise schedule (ANA-style cosine anneal)
@@ -359,13 +381,11 @@ def get_args():
     parser.add_argument('--groups_save_dir', type=str, default='save_batch',
                         help='root directory for saving GroupsBatching results (each group gets its own subfolder)')
     parser.add_argument('--groups_max_workers', type=int, default=1,
-                        help='number of concurrent training workers for GroupsBatching (default 1 = sequential)')
-    parser.add_argument('--groups_verbose', action='store_true', default=False,
+                        help='reserved worker count; GroupsBatching currently supports only 1')
+    parser.add_argument('--groups_verbose', action=argparse.BooleanOptionalAction, default=False,
                         help='print per-group training details instead of aggregate progress only')
 
     ### ---------- quantization configs ---------- ###
-    parser.add_argument('--quantize', type=bool, default=True,
-                        help='whether to quantize the model or not')
     parser.add_argument('--quantize_bits', type=int, default=8,
                         help='choose the bits to quantize',
                         choices=[2, 4, 8, 16])
@@ -455,8 +475,10 @@ def get_args():
                         help='YAML mapping of per-texture loss/eval weights')
 
     ### ---------- early stopping configs ---------- ###
-    parser.add_argument('--early_stop', action='store_true', default=True,
+    parser.add_argument('--early_stop', nargs='?', const=True, type=_parse_bool, default=False,
                         help='enable early stopping when PSNR improvement is below threshold')
+    parser.add_argument('--no-early_stop', dest='early_stop', action='store_false',
+                        help='disable early stopping')
     parser.add_argument('--early_stop_interval', type=int, default=5000,
                         help='number of iterations per segment for early stopping PSNR evaluation')
     parser.add_argument('--early_stop_psnr_threshold', type=float, default=0.01,

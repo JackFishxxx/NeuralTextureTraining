@@ -269,7 +269,7 @@ class Trainer:
         groups = {
             "diffuse": ["diffuse"],
             "normal": ["normal"],
-            "romd": ["roughness", "occlusion", "metallic", "displacement"],
+            "romsd": ["roughness", "occlusion", "metallic", "specular", "displacement"],
         }
         total_loss = torch.tensor(0.0, device=gt_texture.device, dtype=torch.float32)
         stats = {}
@@ -314,7 +314,8 @@ class Trainer:
         residual_stat = self._last_loss_stats.get("superres_residual")
         if residual_stat is not None:
             terms = []
-            for group, label in (("diffuse", "diffuse"), ("normal", "normal"), ("romd", "ROMD")):
+            for group, label in (("diffuse", "diffuse"), ("normal", "normal"),
+                                 ("romsd", "ROMSD")):
                 stat = residual_stat.get(group)
                 if stat is not None:
                     terms.append(f"{label} loss:{stat['loss']:.6f}")
@@ -323,10 +324,10 @@ class Trainer:
         labels = {
             "diffuse": "Weighted diffuse loss",
             "normal": "Weighted normal angular loss",
-            "romd": "Weighted ROMD loss",
+            "romsd": "Weighted ROMSD loss",
         }
         parts = []
-        for group in ("diffuse", "normal", "romd"):
+        for group in ("diffuse", "normal", "romsd"):
             stat = self._last_loss_stats.get(group)
             value = "-" if stat is None else f"{stat['loss']:.6f}"
             parts.append(f"{labels[group]}:{value}")
@@ -345,7 +346,7 @@ class Trainer:
             for group, textures in {
                 "diffuse": ["diffuse"],
                 "normal": ["normal"],
-                "romd": ["roughness", "occlusion", "metallic", "displacement"],
+                "romsd": ["roughness", "occlusion", "metallic", "specular", "displacement"],
             }.items():
                 idx = self._group_indices(textures, target_residual.device)
                 if idx.numel() == 0:
@@ -792,6 +793,12 @@ class Trainer:
         ssim_value, _ = self.ssim(visual_pred, visual_gt)
         ssim_value = float(ssim_value.item())
         if mip_height >= 128 and mip_width >= 128:
+            if visual_pred.shape[1] == 1:
+                visual_pred = visual_pred.repeat(1, 3, 1, 1)
+                visual_gt = visual_gt.repeat(1, 3, 1, 1)
+            elif visual_pred.shape[1] == 2:
+                visual_pred = visual_pred[:, :1].repeat(1, 3, 1, 1)
+                visual_gt = visual_gt[:, :1].repeat(1, 3, 1, 1)
             return psnr_value, ssim_value, float(self.lpips(visual_pred, visual_gt).item())
         return psnr_value, ssim_value, None
 
@@ -823,8 +830,8 @@ class Trainer:
             self.model.eval()
             self.model.simulate_quantize()
 
-            # Training evaluation intentionally checks Mip0 only to keep the loop responsive.
-            for mip in [0]:
+            eval_mips = range(1) if self.mip0_only else range(self.num_mips)
+            for mip in eval_mips:
                 pred, gt, mip_height, mip_width = self._render_mip_pair(mip)
                 psnr_value, ssim_value, lpips_value = self._compute_mip_metrics(pred, gt, mip_height, mip_width)
 
@@ -887,8 +894,6 @@ class Trainer:
         return canon[first]
 
     def _infer_mips(self) -> range:
-        # Skip the smallest four mip levels during inference, but always keep
-        # Mip0 so tiny datasets still produce an output and metrics file.
         return inference_mips(self.num_mips, self.mip0_only)
 
     @torch.no_grad()

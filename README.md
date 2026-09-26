@@ -133,7 +133,6 @@ python train.py \
     --mode train \
     --data_dir ./data/test \
     --save_dir ./outputs \
-    --quantize True \
     --quantize_bits 4 \
     --save_bits 32
 ```
@@ -145,7 +144,6 @@ python train.py \
     --mode train \
     --data_dir ./data/test \
     --save_dir ./outputs \
-    --quantize True \
     --quantize_bits 4 \
     --save_bits 32 \
     --load_iter 50000 \
@@ -197,7 +195,6 @@ python train.py \
     --mode infer \
     --data_dir ./data/test \
     --save_dir ./outputs \
-    --quantize True \
     --quantize_bits 4 \
     --save_bits 32 \
     --load_iter 50000 \

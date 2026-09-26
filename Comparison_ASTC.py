@@ -386,7 +386,7 @@ def _compute_metrics_from_refs(
             lpips_pred, lpips_gt = pred_ref, gt_ref
         else:
             # LPIPS accepts RGB only. Evaluate each scalar material channel
-            # independently instead of silently dropping displacement from ROMD.
+            # independently instead of silently dropping displacement from ROMSD.
             values = []
             for channel_idx in range(c):
                 p = pred_ref[:, channel_idx:channel_idx + 1].repeat(1, 3, 1, 1)
@@ -411,13 +411,13 @@ def _metric_channel_groups(dataset) -> Dict[str, list]:
     if "normal" in dataset.available_textures:
         ns, ne = canon["normal"]
         groups["normal"] = list(range(ns, ne))
-    romd: list = []
-    for tex_type in ("roughness", "occlusion", "metallic", "displacement"):
+    romsd: list = []
+    for tex_type in ("roughness", "occlusion", "metallic", "specular", "displacement"):
         if tex_type in dataset.available_textures:
             s, e = canon[tex_type]
-            romd.extend(range(s, e))
-    if romd:
-        groups["romd"] = romd
+            romsd.extend(range(s, e))
+    if romsd:
+        groups["romsd"] = romsd
     return groups
 
 
@@ -451,7 +451,7 @@ def _compute_group_metrics(pred_image, gt_image, dataset, psnr_metric, ssim_metr
         )
 
     if group_metrics:
-        order = [n for n in ("diffuse", "normal", "romd") if n in group_metrics]
+        order = [n for n in ("diffuse", "normal", "romsd") if n in group_metrics]
         weights = _group_metric_weights(dataset, eval_weights)
         vals = np.array([group_metrics[n] for n in order], dtype=np.float64)
         ws = np.array([max(0.0, weights.get(n, 1.0)) for n in order], dtype=np.float64)
@@ -495,8 +495,10 @@ def _resolve_metric_group_for_texture(texture_name: str) -> str:
         return "diffuse"
     if "normal" in name:
         return "normal"
+    if "specular" in name:
+        return "romsd"
     if any(k in name for k in ("rough", "occlusion", "ao", "metal", "displace", "height")):
-        return "romd"
+        return "romsd"
     return "average"
 
 
@@ -808,7 +810,7 @@ def run_astc_comparison_pipeline(
     }
     metrics_path = os.path.join(compare_root, f"metrics_astc_{astc_codec.astc_block}.txt")
     with open(metrics_path, "w", encoding="utf-8") as f:
-        group_order = ("diffuse", "normal", "romd", "average")
+        group_order = ("diffuse", "normal", "romsd", "average")
         for method_name, method_metrics in metrics.items():
             for group_name in group_order:
                 if group_name not in method_metrics:
@@ -822,7 +824,7 @@ def run_astc_comparison_pipeline(
         avg = method_metrics.get("average")
         diff = method_metrics.get("diffuse")
         norm = method_metrics.get("normal")
-        romd = method_metrics.get("romd")
+        romsd = method_metrics.get("romsd")
         if method_name == "fntc_quantized":
             display_name = "FNTC_uncompressed"
         elif method_name == fntc_astc_name:
@@ -840,7 +842,7 @@ def run_astc_comparison_pipeline(
             f"[ASTC Test] {display_label:<42} Weighted {_format_metric_triplet(avg)} "
             f"(Diffuse {_format_metric_triplet(diff)}, "
             f"NormalAngular {_format_metric_triplet(norm)}, "
-            f"ROMD {_format_metric_triplet(romd)})"
+            f"ROMSD {_format_metric_triplet(romsd)})"
         )
 
     _save_comparison_strip(

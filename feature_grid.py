@@ -79,6 +79,12 @@ def quantize_feature_tensor(params: torch.Tensor, spec: FeatureGridSpec) -> torc
     return ints / float(n) + spec.quant_min
 
 
+def quantize_feature_ste(params: torch.Tensor, spec: FeatureGridSpec) -> torch.Tensor:
+    """Use export's quantization grid in forward and identity gradients in backward."""
+    quantized = quantize_feature_tensor(params, spec)
+    return params + (quantized - params).detach()
+
+
 def feature_tensor_to_int(params: torch.Tensor, spec: FeatureGridSpec) -> torch.Tensor:
     """Map feature floats to integer quantization codes [0, 2^qbits - 1]."""
     n = spec.quant_step_count

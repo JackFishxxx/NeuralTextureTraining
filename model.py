@@ -5,6 +5,7 @@ import copy
 import numpy as np
 import tinycudann as tcnn
 import torch.nn.functional as F
+from torch.func import functional_call
 from torchtyping import TensorType
 
 from configs import Config
@@ -13,7 +14,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 
 from utils import write_dds_r8g8b8a8
-from feature_grid import FeatureGridSpec, feature_tensor_to_int, feature_to_unorm, quantize_feature_tensor, unorm_to_feature
+from feature_grid import FeatureGridSpec, feature_tensor_to_int, feature_to_unorm, quantize_feature_ste, quantize_feature_tensor, unorm_to_feature
 from normal_encoding import normal_encoding_channels
 
 # Fixed channel order aligned with: diffuse, normal, roughness, occlusion, metallic, specular, displacement
@@ -491,32 +492,22 @@ class TCNNModel(torch.nn.Module):
         for idx, feature_grid in enumerate(self.feature_grids):
             grid_levels = self.feature_grid_n_levels[idx]
             grid_fpl = self.feature_grid_n_features_per_level[idx]
-            qbits = self.feature_grid_quantize_bits[idx]
-
             clipped_mips = torch.clamp(mips, max=grid_levels - num_sampled_mips)
             selected_level_f = grid_levels - num_sampled_mips - clipped_mips
             grid_uvs = self._texel_aligned_grid_uv(uvs, selected_level_f, self.feature_grid_base_res[idx])
-            all_features = feature_grid(grid_uvs)  # [B, grid_levels * grid_fpl]
+            if self.quantize and self.training:
+                params = self._get_grid_params_tensor(feature_grid)
+                if self.astc_codec_branch_enabled:
+                    noisy_params = params
+                else:
+                    step = 1.0 / self.feature_grid_specs[idx].quant_step_count
+                    noisy_params = params + (torch.rand_like(params) - 0.5) * step * self._qat_noise_multiplier()
+                quantized_params = quantize_feature_ste(noisy_params, self.feature_grid_specs[idx])
+                all_features = functional_call(feature_grid, {"params": quantized_params}, (grid_uvs,))
+            else:
+                all_features = feature_grid(grid_uvs)
             cols = (grid_levels - num_sampled_mips - clipped_mips) * grid_fpl + torch.arange(grid_fpl * num_sampled_mips).to(self.device)
             sampled_features = torch.gather(all_features, 1, cols.to(torch.int64))
-
-            if self.quantize and self.training:
-                # Per-grid quantization step size
-                N_k = 2 ** qbits
-                Q_k = 1.0 / N_k
-
-                # STE (Straight-Through Estimator) quantization simulation:
-                # Quantize in forward pass, but let gradients pass through unchanged.
-                noise_range = 0.5 * Q_k
-                mult = self._qat_noise_multiplier()
-                noise = (torch.rand_like(sampled_features) * 2 - 1) * noise_range * mult
-                if self.astc_codec_branch_enabled:
-                    noise = torch.zeros_like(noise)
-                sampled_features_noisy = sampled_features + noise
-                # Quantize (round to grid) then use STE
-                quantized = torch.round(sampled_features_noisy / Q_k) * Q_k
-                # Straight-through: forward uses quantized, backward uses sampled_features
-                sampled_features = sampled_features + (quantized - sampled_features).detach()
 
             if self.training and self.num_sampled_mips == 1 and self.astc_codec_branch_enabled:
                 selected_res = self.feature_grid_base_res[idx] * torch.pow(
@@ -526,9 +517,6 @@ class TCNNModel(torch.nn.Module):
                 highest_mask = (selected_level_f == float(highest_level)).to(sampled_features.dtype)
                 codec_error = self._sample_astc_codec_error(idx, uvs)
                 if codec_error.numel() > 0:
-                    # Apply the last measured ASTC error to the current quantized
-                    # latent. This stays useful as the feature grid evolves and
-                    # keeps an identity-gradient surrogate for latent updates.
                     codec_approx = sampled_features + codec_error.detach()
                     sampled_features = sampled_features * (1.0 - highest_mask) + codec_approx * highest_mask
                 else:

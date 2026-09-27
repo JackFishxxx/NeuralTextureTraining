@@ -21,7 +21,7 @@ import tinycudann as tcnn
 from configs import get_args, inference_mips, mip_sampling_probabilities
 from model import TCNNModel
 from dataset import TextureDataset
-from normal_encoding import decode_normal, normal_angular_loss, normal_angular_psnr
+from normal_encoding import decode_normal, normal_angular_loss, normal_angular_psnr, normal_vectors
 from configs import Config
 from Comparison_ASTC import (
     ASTCCodec,
@@ -197,26 +197,6 @@ class Trainer:
     def _compute_pbr_render_loss(self, gt: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
         """Differentiable shaded-RGB loss for PBR-sensitive material channels."""
         slices = self.dataset.canonical_channel_slices
-        def safe_decode_normal(encoded: torch.Tensor) -> torch.Tensor:
-            """Decode tangent normals without sqrt-at-zero NaN gradients."""
-            enc = self.normal_encoding.lower().replace('-', '_')
-            if enc in {'xy', 'hemi_oct', 'hemi_octa'}:
-                xy = encoded[:, :2] * 2.0 - 1.0
-                radius = torch.sqrt(torch.clamp((xy * xy).sum(1, keepdim=True), min=1e-12))
-                # Keep the square-root argument strictly positive. This is
-                # essential because d(sqrt(x))/dx is infinite at x=0.
-                xy = xy * torch.clamp(0.999 / radius, max=1.0)
-                if enc == 'xy':
-                    z = torch.sqrt(torch.clamp(1.0 - (xy * xy).sum(1, keepdim=True), min=1e-4))
-                    return torch.cat([xy, z], dim=1)
-                px = (xy[:, :1] + xy[:, 1:2]) * 0.5
-                py = (xy[:, :1] - xy[:, 1:2]) * 0.5
-                pz = 1.0 - px.abs() - py.abs()
-                oct_n = torch.cat([px, py, pz], dim=1)
-                return oct_n / torch.sqrt(torch.clamp((oct_n * oct_n).sum(1, keepdim=True), min=1e-4))
-            # XYZ encoding has no square-root boundary; normalize with epsilon.
-            xyz = encoded[:, :3] * 2.0 - 1.0
-            return xyz / torch.sqrt(torch.clamp((xyz * xyz).sum(1, keepdim=True), min=1e-4))
         def get_pair(name, channels=1, default=0.0):
             if name not in self.dataset.available_textures:
                 shape = (gt.shape[0], channels)
@@ -232,8 +212,8 @@ class Trainer:
         gt_metal, pr_metal = get_pair("metallic", 1, 0.0)
         gt_spec, pr_spec = get_pair("specular", 1, 0.5)
 
-        gt_n = safe_decode_normal(gt_norm)
-        pr_n = safe_decode_normal(pr_norm)
+        gt_n = normal_vectors(gt_norm, self.normal_encoding)
+        pr_n = normal_vectors(pr_norm, self.normal_encoding)
         # Use a fixed tangent-space light with positive Z so a flat normal map
         # receives direct light and all PBR channels get useful gradients.
         light = torch.tensor([-0.35, 0.45, 0.82], device=pred.device, dtype=pred.dtype)

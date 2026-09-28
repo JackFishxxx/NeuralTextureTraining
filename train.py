@@ -164,6 +164,13 @@ class Trainer:
             astcenc_quality=self.astcenc_quality,
             astc_block=self.astc_block,
         )
+        self._codec_phase_logged = False
+        print(
+            f"[ASTC Codec] in_loop={'enabled' if getattr(configs, 'astc_codec_in_loop_enable', False) else 'disabled'}, "
+            f"interval={self.configs.astc_codec_in_loop_interval}, "
+            f"start_frac={self.astc_codec_start_frac:.3f}, "
+            f"loss_weight={self.astc_codec_loss_weight:.3f}"
+        )
         if (self.enable_astc_compare or self.enable_pbr_compare
                 or getattr(configs, "astc_codec_in_loop_enable", False)):
             self.astc_codec.ensure_executable()
@@ -412,6 +419,9 @@ class Trainer:
                 bool(getattr(self.configs, "astc_codec_in_loop_enable", False))
                 and curr_iter >= int(self.max_iter * self.astc_codec_start_frac)
             )
+            if codec_phase_active and not self._codec_phase_logged:
+                print(f"[ASTC Codec] phase active at iter {curr_iter}", flush=True)
+                self._codec_phase_logged = True
             codec_start_iter = int(self.max_iter * self.astc_codec_start_frac)
             codec_interval = int(self.configs.astc_codec_in_loop_interval)
             codec_due = codec_phase_active and (curr_iter - codec_start_iter) % codec_interval == 0
@@ -592,6 +602,7 @@ class Trainer:
 
             # track whether ASTC comparison was already run this iteration (avoid duplicate runs)
             _astc_already_ran = False
+            _pbr_already_ran = False
 
             # eval
             if curr_iter % self.eval_interval == 0:
@@ -615,21 +626,23 @@ class Trainer:
                                 # Fallback to eval PSNR if ASTC metrics unavailable
                                 current_psnr = self._early_stop_avg_psnr / self._early_stop_eval_count
                             psnr_improvement = current_psnr - self._early_stop_prev_psnr
-                            print(f"[EarlyStopCheck] Iter {curr_iter}: {fntc_astc_name} avg PSNR = {current_psnr:.4f} dB, "
-                                  f"improvement = {psnr_improvement:.4f} dB, threshold = {self.early_stop_psnr_threshold:.4f} dB")
                         else:
                             self._early_stop_avg_psnr /= self._early_stop_eval_count
                             current_psnr = self._early_stop_avg_psnr
                             psnr_improvement = current_psnr - self._early_stop_prev_psnr
-                            print(f"[EarlyStopCheck] Iter {curr_iter}: PSNR = {current_psnr:.4f} dB, "
-                                  f"improvement = {psnr_improvement:.4f} dB, threshold = {self.early_stop_psnr_threshold:.4f} dB")
+                        if self.enable_pbr_compare:
+                            self.run_pbr_comparison(curr_iter=curr_iter, output_root=self.media_path)
+                            _pbr_already_ran = True
+                        label = f"{fntc_astc_name} avg PSNR" if self.enable_astc_compare else "PSNR"
+                        print(f"[EarlyStopCheck] Iter {curr_iter}: {label} = {current_psnr:.4f} dB, "
+                              f"improvement = {psnr_improvement:.4f} dB, threshold = {self.early_stop_psnr_threshold:.4f} dB")
                         if psnr_improvement < self.early_stop_psnr_threshold:
                             print(f"[EarlyStopCheck] PSNR improvement ({psnr_improvement:.4f} dB) < threshold "
                                   f"({self.early_stop_psnr_threshold:.4f} dB). Stopping training at iter {curr_iter}.")
-                            # save model before stopping
+                            # save model after all terminal comparisons
                             self.model.save(curr_iter, self.model_path)
                             self._log_checkpoint_interval(curr_iter)
-                            # When enable_astc_compare is True, ASTC comparison was already run above for the metric check
+                            # When enable_astc_compare is True, ASTC comparison was already run above for the metric check.
                             self._log_total_training_time()
                             return
                         else:
@@ -641,13 +654,16 @@ class Trainer:
                 # print(self.model.optimizer.param_groups[0]['lr'], self.model.optimizer.param_groups[1]['lr'])
 
             if curr_iter > 0 and curr_iter % self.save_interval == 0:
-                self.model.save(curr_iter, self.model_path)
                 if self.enable_astc_compare and not _astc_already_ran:
                     self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path)
+                if self.enable_pbr_compare and not _pbr_already_ran:
+                    self.run_pbr_comparison(curr_iter=curr_iter, output_root=self.media_path)
+                self.model.save(curr_iter, self.model_path)
                 self._log_checkpoint_interval(curr_iter)
 
             if (self.enable_pbr_compare and curr_iter > 0
-                    and curr_iter % self.pbr_compare_interval == 0):
+                    and curr_iter % self.pbr_compare_interval == 0
+                    and curr_iter % self.save_interval != 0):
                 self.run_pbr_comparison(curr_iter=curr_iter, output_root=self.media_path)
 
             if curr_iter > 0 and curr_iter % 10000 == 0:

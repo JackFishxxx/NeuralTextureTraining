@@ -140,7 +140,7 @@ class Config():
         self.astc_aware_enable = bool(getattr(params, "astc_aware_enable", False))
         self.astc_aware_noise_scale = float(getattr(params, "astc_aware_noise_scale", 1.0))
         self.astc_aware_start_frac = float(getattr(params, "astc_aware_start_frac", 0.0))
-        self.astc_codec_in_loop_enable = bool(getattr(params, "astc_codec_in_loop_enable", False))
+        self.astc_codec_in_loop_enable = bool(getattr(params, "astc_codec_in_loop_enable", True))
         self.astc_codec_update_latent = bool(getattr(params, "astc_codec_update_latent", False))
         self.astc_codec_in_loop_interval = int(getattr(params, "astc_codec_in_loop_interval", 5000))
         self.astc_codec_blocks_per_step = int(getattr(params, "astc_codec_blocks_per_step", 32))
@@ -414,8 +414,8 @@ def get_args():
                         help='latent ASTC perturbation in 8-bit code steps')
     parser.add_argument('--astc_aware_start_frac', type=float, default=0.0,
                         help='fraction of training held without ASTC-aware perturbation')
-    parser.add_argument('--astc_codec_in_loop_enable', action=argparse.BooleanOptionalAction, default=False,
-                        help='periodically calibrate ASTC-aware latent noise using real astcenc round-trips')
+    parser.add_argument('--astc_codec_in_loop_enable', action='store_true', default=True,
+                        help='periodically calibrate ASTC-aware latent noise using real astcenc round-trips (always enabled)')
     parser.add_argument('--astc_codec_update_latent', action=argparse.BooleanOptionalAction, default=False,
                         help='use a straight-through codec gradient to update feature-grid latents (experimental)')
     parser.add_argument('--astc_codec_in_loop_interval', type=int, default=5000,
@@ -440,7 +440,7 @@ def get_args():
     )
 
     ### ---------- trainer configs ---------- ###
-    parser.add_argument('--max_iter', type=int, default=400000,
+    parser.add_argument('--max_iter', type=int, default=100000,
                         help='maximum training iteration')
     parser.add_argument('--batch_size', type=int, default=16384,
                         help='batch size')
@@ -472,10 +472,8 @@ def get_args():
                         help='YAML mapping of per-texture loss/eval weights')
 
     ### ---------- early stopping configs ---------- ###
-    parser.add_argument('--early_stop', nargs='?', const=True, type=_parse_bool, default=False,
-                        help='enable early stopping when PSNR improvement is below threshold')
-    parser.add_argument('--no-early_stop', dest='early_stop', action='store_false',
-                        help='disable early stopping')
+    parser.add_argument('--early_stop', action='store_true', default=True,
+                        help='enable early stopping when PSNR improvement is below threshold (default: enabled)')
     parser.add_argument('--early_stop_interval', type=int, default=5000,
                         help='number of iterations per segment for early stopping PSNR evaluation')
     parser.add_argument('--early_stop_psnr_threshold', type=float, default=0.01,

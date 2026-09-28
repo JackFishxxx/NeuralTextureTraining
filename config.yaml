@@ -52,6 +52,9 @@ astc_codec_start_frac: 0.3
 astc_codec_mip0_prob: 1.0
 # Clean and ASTC branches use different bases; residual consistency is optional.
 astc_consistency_weight: 0.0
+astc_decoder_finetune_enable: true
+astc_decoder_finetune_steps: 5000
+astc_decoder_finetune_lr_multiplier: 0.5
 
 # ---------- PBR scene comparison configs ----------
 enable_pbr_compare: true

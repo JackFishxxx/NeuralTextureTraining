@@ -120,6 +120,7 @@ class TCNNModel(torch.nn.Module):
         self.astc_codec_calibrated = False
         self.astc_codec_branch_enabled = False
         self._astc_codec_patches = {}
+        self._decoder_adaptation_features = None
         # Network output matches the selected canonical texture layout.
         self.normal_encoding = str(getattr(config, "normal_encoding", "xyz")).lower()
         self.num_channels = canonical_num_channels(self.normal_encoding)
@@ -299,6 +300,8 @@ class TCNNModel(torch.nn.Module):
 
     def _get_qat_grid_params(self, grid_idx: int, feature_grid: torch.nn.Module) -> torch.Tensor:
         """Build one quantized grid per iteration/branch and reuse it across forwards."""
+        if self._decoder_adaptation_features is not None:
+            return self._decoder_adaptation_features[grid_idx]
         if self._qat_param_cache_iter != self.current_iter:
             self._qat_param_cache.clear()
             self._qat_param_cache_iter = self.current_iter
@@ -620,6 +623,9 @@ class TCNNModel(torch.nn.Module):
             feature_grid.load_state_dict(state_dict)
 
     def clamp_value(self):
+
+        if self._decoder_adaptation_features is not None:
+            return
 
         apply_wrap = (
             self.wrap_boundary_constraint

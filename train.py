@@ -158,6 +158,10 @@ class Trainer:
         self.astc_consistency_weight = float(getattr(configs, "astc_consistency_weight", 0.1))
         self.astc_codec_mip0_prob = float(getattr(configs, "astc_codec_mip0_prob", 0.5))
         self.astc_codec_start_frac = float(getattr(configs, "astc_codec_start_frac", 0.0))
+        self.astc_decoder_finetune_enable = bool(getattr(configs, "astc_decoder_finetune_enable", False))
+        self.astc_decoder_finetune_steps = int(getattr(configs, "astc_decoder_finetune_steps", 5000))
+        self.astc_decoder_finetune_lr_multiplier = float(getattr(configs, "astc_decoder_finetune_lr_multiplier", 0.5))
+        self._astc_decoder_finetune_active = False
         self.astc_codec_blocks_per_step = int(getattr(configs, "astc_codec_blocks_per_step", 32))
         self.astc_codec = ASTCCodec(
             astcenc_path=self.astcenc_path,
@@ -644,6 +648,8 @@ class Trainer:
                             self._log_checkpoint_interval(curr_iter)
                             # When enable_astc_compare is True, ASTC comparison was already run above for the metric check.
                             self._log_total_training_time()
+                            if self.astc_decoder_finetune_enable and not self._astc_decoder_finetune_active:
+                                self._run_configured_astc_decoder_finetune()
                             return
                         else:
                             self._early_stop_prev_psnr = current_psnr
@@ -671,6 +677,44 @@ class Trainer:
                 tcnn.free_temporary_memory()
 
         self._log_total_training_time()
+        if self.astc_decoder_finetune_enable and not self._astc_decoder_finetune_active:
+            self._run_configured_astc_decoder_finetune()
+
+    def _run_configured_astc_decoder_finetune(self) -> None:
+        from astc_decoder_finetune import finetune_astc_decoder
+
+        if self._astc_decoder_finetune_active:
+            return
+        self._astc_decoder_finetune_active = True
+        try:
+            baseline_iteration = int(self.model.current_iter)
+            self.model.save(baseline_iteration, self.model_path)
+            baseline_astc = self.run_astc_comparison(curr_iter=baseline_iteration, output_root=self.media_path)
+            baseline_pbr = self.run_pbr_comparison(curr_iter=baseline_iteration, output_root=self.media_path) \
+                if self.enable_pbr_compare else None
+            stats = finetune_astc_decoder(
+                self,
+                steps=self.astc_decoder_finetune_steps,
+                lr_multiplier=self.astc_decoder_finetune_lr_multiplier,
+            )
+            adapted_iteration = baseline_iteration + self.astc_decoder_finetune_steps
+            self.model.save(adapted_iteration, self.model_path)
+            adapted_astc = self.run_astc_comparison(curr_iter=adapted_iteration, output_root=self.media_path)
+            adapted_pbr = self.run_pbr_comparison(curr_iter=adapted_iteration, output_root=self.media_path) \
+                if self.enable_pbr_compare else None
+            output = {
+                "baseline_iteration": baseline_iteration,
+                "adapted_iteration": adapted_iteration,
+                "baseline": baseline_astc,
+                "baseline_pbr": baseline_pbr,
+                "adapted": adapted_astc,
+                "adapted_pbr": adapted_pbr,
+                "adaptation": stats,
+            }
+            with open(os.path.join(self.save_path, "astc_decoder_finetune.json"), "w", encoding="utf-8") as file:
+                json.dump(output, file, indent=2)
+        finally:
+            self._astc_decoder_finetune_active = False
 
     def _cuda_trim_eval_mem(self, synchronize: bool = False) -> None:
         if self.device != "cuda":

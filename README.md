@@ -251,6 +251,8 @@ Training supports **automatic PSNR-based early stopping** to avoid wasting time 
 | `--early_stop_interval` | `5000` | Iterations per PSNR evaluation segment |
 | `--early_stop_psnr_threshold` | `0.01` | Minimum PSNR improvement threshold (dB) |
 
+Two-stage training is enabled by default (`two_stage_finetune_enable`). Stage one jointly trains feature textures and a decoder with zero hidden layers and no positional encoding. Stage two preserves the feature textures, uses their fixed quantized ASTC round-trip features, and trains a newly initialized decoder configured by `n_hidden_layers`, `n_neurons`, and `n_frequencies`. Its step limit and learning-rate multiplier are `two_stage_finetune_max_steps` and `two_stage_finetune_lr_multiplier`. Both stages share `early_stop`, `early_stop_interval`, and `early_stop_psnr_threshold`, with a fresh early-stop window for stage two. With early stopping disabled, both stages run to their respective step limits.
+
 ### Quantization-Aware Training (QAT)
 
 Training simulates quantization error in the forward pass so the model adapts to inference-time precision loss:

@@ -149,11 +149,6 @@ class Config():
         self.astc_consistency_weight = float(getattr(params, "astc_consistency_weight", 0.1))
         self.astc_codec_mip0_prob = float(getattr(params, "astc_codec_mip0_prob", 0.5))
         self.astc_codec_start_frac = float(getattr(params, "astc_codec_start_frac", 0.0))
-        self.astc_decoder_finetune_enable = bool(getattr(params, "astc_decoder_finetune_enable", False))
-        self.astc_decoder_finetune_steps = int(getattr(params, "astc_decoder_finetune_steps", 1000))
-        self.astc_decoder_finetune_lr_multiplier = float(
-            getattr(params, "astc_decoder_finetune_lr_multiplier", 0.5)
-        )
         if (self.astc_aware_noise_scale < 0.0
                 or not 0.0 <= self.astc_aware_start_frac <= 1.0
                 or self.astc_codec_in_loop_interval <= 0
@@ -173,6 +168,12 @@ class Config():
         self.astc_consistency_weight /= total_astc_weight
 
         ### ---------- trainer configs ---------- ###
+        self.two_stage_finetune_enable = bool(getattr(params, "two_stage_finetune_enable", True))
+        self.two_stage_finetune_max_steps = int(getattr(params, "two_stage_finetune_max_steps", 5000))
+        self.two_stage_finetune_lr_multiplier = float(
+            getattr(params, "two_stage_finetune_lr_multiplier", 1.0)
+        )
+
         self.max_iter = params.max_iter
         self.batch_size = params.batch_size
         self.subpixel_sampling_enable = bool(getattr(params, 'subpixel_sampling_enable', True))
@@ -437,12 +438,6 @@ def get_args():
                         help='probability of running an ASTC pass when its interval is due')
     parser.add_argument('--astc_codec_start_frac', type=float, default=0.0,
                         help='fraction of training reserved for clean latent pretraining before codec loss')
-    parser.add_argument('--astc_decoder_finetune_enable', action='store_true', default=False,
-                        help='after baseline training, freeze ASTC-decoded features and fine-tune the decoder')
-    parser.add_argument('--astc_decoder_finetune_steps', type=int, default=5000,
-                        help='additional decoder-only steps after baseline training')
-    parser.add_argument('--astc_decoder_finetune_lr_multiplier', type=float, default=0.5,
-                        help='learning-rate multiplier during decoder-only ASTC adaptation')
     parser.add_argument(
         '--qat_noise_warmup_frac',
         type=float,
@@ -451,6 +446,13 @@ def get_args():
     )
 
     ### ---------- trainer configs ---------- ###
+    parser.add_argument('--two_stage_finetune_enable', action=argparse.BooleanOptionalAction, default=True,
+                        help='train zero-layer features first, then a new decoder on frozen ASTC features')
+    parser.add_argument('--two_stage_finetune_max_steps', type=int, default=5000,
+                        help='maximum ASTC decoder-only steps after the zero-layer baseline stops')
+    parser.add_argument('--two_stage_finetune_lr_multiplier', type=float, default=1.0,
+                        help='learning-rate multiplier for the newly initialized second-stage decoder')
+
     parser.add_argument('--max_iter', type=int, default=100000,
                         help='maximum training iteration')
     parser.add_argument('--batch_size', type=int, default=16384,

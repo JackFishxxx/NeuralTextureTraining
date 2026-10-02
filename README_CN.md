@@ -253,6 +253,8 @@ diffuse(3) | normal(3 或 2) | roughness(1) | occlusion(1) | metallic(1) | specu
 | `--early_stop_interval` | `5000` | 计算 PSNR 提升的迭代间隔 |
 | `--early_stop_psnr_threshold` | `0.01` | 最小 PSNR 提升阈值（dB） |
 
+双阶段训练默认启用（`two_stage_finetune_enable`）：第一阶段以 0 隐藏层、无 positional encoding 的网络联合训练 feature texture 和 decoder；第二阶段保留第一阶段 feature texture，固定其量化及 ASTC 压缩解压后的 feature，重新初始化由 `n_hidden_layers`、`n_neurons`、`n_frequencies` 指定的 decoder，仅训练网络。第二阶段最多执行 `two_stage_finetune_max_steps` 步，学习率倍率由 `two_stage_finetune_lr_multiplier` 指定。两阶段复用 `early_stop`、`early_stop_interval` 和 `early_stop_psnr_threshold`，第二阶段重新统计早停窗口；关闭早停时，两阶段分别运行至步数上限。
+
 ### 量化感知训练（QAT）
 
 训练时使用**量化感知训练**，在前向传播中模拟量化误差，使模型适应推理时的精度损失：

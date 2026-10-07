@@ -1,6 +1,6 @@
 from torch.utils.data import Dataset
 from configs import Config
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from torchtyping import TensorType
 
 import torch
@@ -132,26 +132,36 @@ class TextureDataset(torch.nn.Module):
         return batch_data
 
     @torch.no_grad()
-    def sample_continuous(self, sample_xy: torch.Tensor, mips: torch.Tensor,
+    def sample_continuous(self, sample_xy: torch.Tensor, mips: Union[torch.Tensor, int],
                           cache: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Bilinear sample mip_cache at fractional full-resolution coordinates (repeat wrap)."""
+        """Bilinear repeat sampling; an integer mip avoids dynamic GPU masking."""
         source = self.mip_cache if cache is None else cache
-        mip_i = mips.to(torch.long).reshape(-1)
-        scale = torch.pow(torch.tensor(2.0, device=sample_xy.device), mip_i).float()
+        fixed_mip = isinstance(mips, int)
+        if fixed_mip:
+            level = source[mips]
+            scale = float(2 ** mips)
+            h, w = level.shape[:2]
+        else:
+            mip_i = mips.to(torch.long).reshape(-1)
+            scale = torch.pow(torch.tensor(2.0, device=sample_xy.device), mip_i).float()
+            h = torch.tensor([level.shape[0] for level in source], device=sample_xy.device)[mip_i]
+            w = torch.tensor([level.shape[1] for level in source], device=sample_xy.device)[mip_i]
         x, y = sample_xy[:, 1].float() / scale, sample_xy[:, 0].float() / scale
-        h = torch.tensor([level.shape[0] for level in source], device=sample_xy.device)[mip_i]
-        w = torch.tensor([level.shape[1] for level in source], device=sample_xy.device)[mip_i]
         fx, fy = torch.floor(x), torch.floor(y)
         x0, y0 = torch.remainder(fx.to(torch.long), w), torch.remainder(fy.to(torch.long), h)
         x1, y1 = torch.remainder(x0 + 1, w), torch.remainder(y0 + 1, h)
         dtype = source[0].dtype
         tx, ty = (x - fx).to(dtype), (y - fy).to(dtype)
-        c00 = torch.empty((len(mip_i), source[0].shape[-1]), device=source[0].device, dtype=dtype)
-        c10, c01, c11 = c00.clone(), c00.clone(), c00.clone()
-        for mip, level in enumerate(source):
-            mask = mip_i == mip
-            c00[mask], c10[mask] = level[y0[mask], x0[mask]], level[y0[mask], x1[mask]]
-            c01[mask], c11[mask] = level[y1[mask], x0[mask]], level[y1[mask], x1[mask]]
+        if fixed_mip:
+            c00, c10 = level[y0, x0], level[y0, x1]
+            c01, c11 = level[y1, x0], level[y1, x1]
+        else:
+            c00 = torch.empty((len(mip_i), source[0].shape[-1]), device=source[0].device, dtype=dtype)
+            c10, c01, c11 = c00.clone(), c00.clone(), c00.clone()
+            for mip, level in enumerate(source):
+                mask = mip_i == mip
+                c00[mask], c10[mask] = level[y0[mask], x0[mask]], level[y0[mask], x1[mask]]
+                c01[mask], c11[mask] = level[y1[mask], x0[mask]], level[y1[mask], x1[mask]]
         return ((1-tx[:,None])*(1-ty[:,None])*c00 + tx[:,None]*(1-ty[:,None])*c10
                 + (1-tx[:,None])*ty[:,None]*c01 + tx[:,None]*ty[:,None]*c11)
 

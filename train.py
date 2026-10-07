@@ -167,13 +167,20 @@ class Trainer(ASTCAwareTrainer):
         print(f"Total training time: {self.duration_time}")
 
     def _group_indices(self, textures: List[str], device: torch.device) -> torch.Tensor:
+        key = (tuple(textures), device)
+        if not hasattr(self, "_loss_group_indices"):
+            self._loss_group_indices = {}
+        if key in self._loss_group_indices:
+            return self._loss_group_indices[key]
         idx = []
         for tex in textures:
             if tex not in self.dataset.available_textures:
                 continue
             s, e = self.dataset.canonical_channel_slices[tex]
             idx.extend(range(s, e))
-        return torch.tensor(idx, device=device, dtype=torch.long)
+        indices = torch.tensor(idx, device=device, dtype=torch.long)
+        self._loss_group_indices[key] = indices
+        return indices
 
     def _compute_pbr_render_loss(self, gt: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
         """Differentiable shaded-RGB loss for PBR-sensitive material channels."""
@@ -197,10 +204,14 @@ class Trainer(ASTCAwareTrainer):
         pr_n = normal_vectors(pr_norm, self.normal_encoding)
         # Use a fixed tangent-space light with positive Z so a flat normal map
         # receives direct light and all PBR channels get useful gradients.
-        light = torch.tensor([-0.35, 0.45, 0.82], device=pred.device, dtype=pred.dtype)
-        light = light / torch.clamp(torch.linalg.vector_norm(light), min=1e-6)
-        view = torch.tensor([0.0, 0.0, 1.0], device=pred.device, dtype=pred.dtype)
-        half = (light + view) / torch.clamp(torch.linalg.vector_norm(light + view), min=1e-6)
+        lighting = getattr(self, "_pbr_lighting", None)
+        if lighting is None or lighting[0].device != pred.device or lighting[0].dtype != pred.dtype:
+            light = torch.tensor([-0.35, 0.45, 0.82], device=pred.device, dtype=pred.dtype)
+            light = light / torch.clamp(torch.linalg.vector_norm(light), min=1e-6)
+            view = torch.tensor([0.0, 0.0, 1.0], device=pred.device, dtype=pred.dtype)
+            half = (light + view) / torch.clamp(torch.linalg.vector_norm(light + view), min=1e-6)
+            self._pbr_lighting = (light, view, half)
+        light, view, half = self._pbr_lighting
         def shade(diff, normal, rough, metal, spec):
             diff = torch.clamp(diff, 0, 1)
             ndotl = torch.clamp((normal * light[None]).sum(1, keepdim=True), 0, 1)
@@ -304,8 +315,7 @@ class Trainer(ASTCAwareTrainer):
         mse = (target_residual.float() - predicted_residual.float()).pow(2).mean(dim=0)
         loss = (mse * loss_weights.float()).sum()
         if curr_iter is not None:
-            self.writer.add_scalar('Loss/superres_residual', loss.item(), curr_iter)
-            stats = {"loss": float(loss.detach().item())}
+            group_losses = {}
             for group, textures in {
                 "diffuse": ["diffuse"],
                 "normal": ["normal"],
@@ -315,7 +325,12 @@ class Trainer(ASTCAwareTrainer):
                 if idx.numel() == 0:
                     continue
                 group_loss = (mse.index_select(0, idx) * loss_weights.index_select(0, idx).float()).sum()
-                stats[group] = {"loss": float(group_loss.detach().item())}
+                group_losses[group] = group_loss.detach()
+            values = torch.stack([loss.detach(), *group_losses.values()]).tolist()
+            self.writer.add_scalar('Loss/superres_residual', values[0], curr_iter)
+            stats = {"loss": values[0]}
+            for group, value in zip(group_losses, values[1:]):
+                stats[group] = {"loss": value}
                 self.writer.add_scalar(f'Loss/superres_residual_{group}', stats[group]["loss"], curr_iter)
             self._last_loss_stats = {"superres_residual": stats}
         return loss
@@ -323,6 +338,7 @@ class Trainer(ASTCAwareTrainer):
 
     def train(self) -> None:
 
+        loss_weights = torch.tensor(self.output_loss_weights, device=self.device, dtype=torch.float32)
         for curr_iter in range(self.trained_iter, self.max_iter):
 
             codec_due = self._begin_astc_step(curr_iter)
@@ -345,12 +361,14 @@ class Trainer(ASTCAwareTrainer):
             batch_index = torch.cat([ys, xs, mips], dim=1)
 
             # Get data; expand to canonical 11 channels, missing texture positions filled with 0
-            gt_texture = self.dataset(batch_index)  # [batch_size, num_channels]
+            gt_texture = (self.dataset.mip_cache[0][ys[:, 0], xs[:, 0]]
+                          if self.mip0_only else self.dataset(batch_index))
             gt_texture = self.dataset.expand_to_canonical(gt_texture).to(torch.float16)
             superres_base = None
             if self.super_resolution_enable:
                 superres_base = self.dataset.expand_to_canonical(
-                    self.dataset.get_superres_base(batch_index)
+                    self.dataset.superres_base_cache[0][ys[:, 0], xs[:, 0]]
+                    if self.mip0_only else self.dataset.get_superres_base(batch_index)
                 ).to(torch.float16)
 
             # Use texel centers in the selected mip plane. The dataset indexes
@@ -371,12 +389,12 @@ class Trainer(ASTCAwareTrainer):
             batch_input = torch.cat([us, vs, mips], dim=1)
             if superres_base is not None:
                 batch_input = torch.cat([batch_input, superres_base], dim=1)
-            loss_weights = torch.tensor(self.output_loss_weights, device=self.device, dtype=torch.float32)
             total_loss = self._training_batch_loss(
                 batch_input, gt_texture, superres_base, loss_weights, curr_iter, codec_due
             )
 
-            self.writer.add_scalar('Loss/train', total_loss.item(), curr_iter)
+            loss_value = total_loss.item()
+            self.writer.add_scalar('Loss/train', loss_value, curr_iter)
             # optimize
             total_loss.backward()
             if self.pbr_loss_enable:
@@ -385,7 +403,7 @@ class Trainer(ASTCAwareTrainer):
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self._step_astc_parameters(codec_due)
             self.model.optimizer.step()
-            self.model.scheduler.step(metrics=total_loss.item())
+            self.model.scheduler.step(metrics=loss_value)
 
             # print(self.model.optimizer.param_groups[0]['lr'], self.model.optimizer.param_groups[1]['lr'])
 

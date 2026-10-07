@@ -406,9 +406,10 @@ class ASTCAwareTrainer:
         grid = model.astc_proxy[0]
         spec = model.feature_grid_specs[0]
         channels = model.num_channels
-        dim = 4 + 1 + channels
+        dim = 4 + 1 + channels + 1  # feature basis, mip, SR base, explicit bias
         basis = torch.zeros((5, dim), device=self.device)
         basis[1:, :4] = torch.eye(4, device=self.device)
+        basis[:, -1] = 1
         values = model.network(basis).float()
         matrix = (values[1:] - values[:1]).T  # [channels,4]
         weights = torch.tensor(self.output_loss_weights, device=self.device)
@@ -424,8 +425,10 @@ class ASTCAwareTrainer:
         for begin in range(0, len(base), 65536):
             batch = base[begin : begin + 65536]
             inputs = torch.zeros((len(batch), dim), device=self.device)
-            inputs[:, 5:] = batch
-            residual = target[begin : begin + len(batch)] - batch - model.network(inputs).float()
+            inputs[:, 5 : 5 + channels] = batch
+            inputs[:, -1] = 1
+            residual = (target[begin : begin + len(batch)] - batch
+                        - model.network(inputs).float() - model.decoder_output_bias.float())
             projected.append(
                 (residual @ transform).clamp(
                     spec.quant_min, spec.quant_min + (spec.quant_step_count - 1) / spec.quant_step_count

@@ -333,6 +333,9 @@ output_activation: hard_swish
 `n_hidden_layers: 0` 表示无隐藏层的直接映射；可通过 CLI 覆盖 `--n_neurons`、
 `--n_hidden_layers` 和 `--output_activation`。
 
+当前 tiny-cuda-nn CutlassMLP 构建会忽略 `use_bias`，因此模型显式追加常数输入作为第一层
+bias，并增加 `decoder_output_bias` 作为输出层 bias。这样不依赖 tiny-cuda-nn 的隐式 bias。
+
 ### 神经纹理超分
 
 在 `config.yaml` 中设置 `super_resolution_enable: true` 并指定

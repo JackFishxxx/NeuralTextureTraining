@@ -336,6 +336,10 @@ output_activation: hard_swish
 `n_hidden_layers: 0` selects a direct mapping without hidden layers. These values can also be
 overridden with `--n_neurons`, `--n_hidden_layers`, and `--output_activation`.
 
+The bundled tiny-cuda-nn CutlassMLP ignores `use_bias`. FNTC appends a constant
+input for first-layer bias and stores an explicit `decoder_output_bias` parameter
+for the output layer.
+
 ### Neural Texture Super-Resolution
 
 Set `super_resolution_enable: true` and configure `super_resolution_base_resolution` to train

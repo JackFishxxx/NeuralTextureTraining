@@ -225,16 +225,24 @@ class TCNNModel(torch.nn.Module):
             if not self.feature_grid_n_features_per_level or self.feature_grid_n_features_per_level[0] < 3:
                 raise ValueError("direct_diffuse_infer_mode requires feature grid 0 to have at least 3 channels")
         superres_input_dims = self.num_channels if self.super_resolution_enable else 0
-        n_input_dims = self.positional_encoding.n_output_dims + total_grid_features + superres_input_dims + 1
+        # tiny-cuda-nn CutlassMLP exposes one flat weight tensor and ignores
+        # use_bias. Append a constant input explicitly to provide a real bias.
+        n_input_dims = self.positional_encoding.n_output_dims + total_grid_features + superres_input_dims + 2
         print(f"total_grid_features={total_grid_features}, n_input_dims={n_input_dims}")
         self.network = tcnn.Network(
             n_input_dims=n_input_dims,
             n_output_dims=self.num_channels,
             network_config=network_config,
         )
+        # CutlassMLP ignores `use_bias` in this tiny-cuda-nn build. The constant
+        # input supplies first-layer bias; this parameter supplies output bias.
+        self.decoder_output_bias = torch.nn.Parameter(
+            torch.zeros(self.num_channels, device=self.device, dtype=torch.float32)
+        )
 
         # add optimizer params config
-        optimizer_params = [{'params': self.network.parameters(), 'lr': getattr(config, 'network_learning_rate', 0.002)}]
+        optimizer_params = [{'params': [*self.network.parameters(), self.decoder_output_bias],
+                             'lr': getattr(config, 'network_learning_rate', 0.002)}]
         for idx, feature_grid in enumerate(self.feature_grids):
             lr = self.feature_grid_learning_rates[idx]
             optimizer_params.append({'params': feature_grid.parameters(), 'lr': lr})
@@ -520,9 +528,10 @@ class TCNNModel(torch.nn.Module):
         input_parts = [positional_encodings, features, mip_encodings]
         if self.super_resolution_enable:
             input_parts.append(x[:, 3:])
+        input_parts.append(torch.ones((len(x), 1), device=x.device, dtype=features.dtype))
         inputs = torch.cat(input_parts, dim=1)
 
-        outputs = self.network(inputs)
+        outputs = self.network(inputs) + self.decoder_output_bias.to(dtype=self.network.params.dtype)
         if not self.super_resolution_enable:
             outputs = self._apply_output_activation(outputs)
         if direct_diffuse is not None:
@@ -706,7 +715,8 @@ class TCNNModel(torch.nn.Module):
             save_kwargs = {
                 'info': info,
                 'astc_proxy': np.array(bool(len(self.astc_proxy)), dtype=np.bool_),
-                'network': save_model.network.state_dict()["params"].numpy()
+                'network': save_model.network.state_dict()["params"].numpy(),
+                'decoder_output_bias': save_model.decoder_output_bias.detach().numpy()
             }
 
             network_data_path = os.path.join(save_path, f"network_data.npz")

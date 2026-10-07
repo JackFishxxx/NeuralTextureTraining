@@ -108,19 +108,13 @@ class TCNNModel(torch.nn.Module):
         self.n_neurons = config.n_neurons
         self.n_hidden_layers = config.n_hidden_layers
         self.output_activation = getattr(config, "output_activation", "hard_swish")
-        self.astc_aware_enable = bool(getattr(config, "astc_aware_enable", False))
-        astc_block = getattr(config, "astc_aware_block", (6, 6))
-        self.astc_aware_block = (
-            (int(astc_block), int(astc_block)) if isinstance(astc_block, int)
-            else tuple(int(edge) for edge in astc_block)
-        )
-        self.astc_aware_noise_scale = float(getattr(config, "astc_aware_noise_scale", 1.0))
-        self.astc_aware_start_frac = float(getattr(config, "astc_aware_start_frac", 0.1))
-        self.astc_codec_update_latent = bool(getattr(config, "astc_codec_update_latent", False))
-        self.astc_codec_calibrated = False
+        self.astc_codec_backend = config.astc_codec_backend
+        self.astc_proxy_enabled = self.astc_codec_backend == "astc_differentiable_proxy"
+        self.astc_codec_update_latent = config.astc_codec_update_latent
         self.astc_codec_branch_enabled = False
         self._astc_codec_patches = {}
         self._decoder_adaptation_features = None
+        self.astc_proxy = torch.nn.ModuleList()
         # Network output matches the selected canonical texture layout.
         self.normal_encoding = str(getattr(config, "normal_encoding", "xyz")).lower()
         self.num_channels = canonical_num_channels(self.normal_encoding)
@@ -148,9 +142,6 @@ class TCNNModel(torch.nn.Module):
             self.feature_grid_learning_rates.append(grid_cfg.get('learning_rate', config.learning_rate))
 
         self.init_model(config)
-        for idx in range(len(self.feature_grids)):
-            self.register_buffer(f"_astc_decoded_texture_{idx}", torch.empty(0), persistent=False)
-            self.register_buffer(f"_astc_error_texture_{idx}", torch.empty(0), persistent=False)
         if config.load_dir is not None:
             self.load_ckpt(config)
 
@@ -306,6 +297,10 @@ class TCNNModel(torch.nn.Module):
             self._qat_param_cache.clear()
             self._qat_param_cache_iter = self.current_iter
 
+        if self.astc_codec_branch_enabled and self.astc_proxy_enabled and len(self.astc_proxy):
+            from Core.ASTC_Aware.differentiable_proxy import sample_proxy_grid
+            return sample_proxy_grid(self, grid_idx, feature_grid)
+
         params = self._get_grid_params_tensor(feature_grid)
         branch = bool(self.astc_codec_branch_enabled)
         key = (int(grid_idx), branch)
@@ -326,74 +321,19 @@ class TCNNModel(torch.nn.Module):
         self._qat_param_cache[key] = (params._version, quantized)
         return quantized
 
-    def _astc_aware_latent_noise(self, uvs, selected_level, res, channels):
-        """Deterministic block-correlated perturbation approximating ASTC endpoint error."""
-        if not self.astc_aware_enable or self.current_iter < int(self.max_iter * self.astc_aware_start_frac):
-            return torch.zeros((uvs.shape[0], channels), device=uvs.device, dtype=uvs.dtype)
-        block_size = uvs.new_tensor(self.astc_aware_block)
-        block = torch.floor(uvs * res / block_size)
-        channel = torch.arange(channels, device=uvs.device, dtype=uvs.dtype)[None, :]
-        seed = (block[:, 0:1] * 12.9898 + block[:, 1:2] * 78.233
-                + channel * 37.719 + float(self.current_iter) * 0.0137)
-        hashed = torch.frac(torch.sin(seed) * 43758.5453) - 0.5
-        return hashed * (self.astc_aware_noise_scale / 255.0)
-
-    def set_astc_codec_noise_scale(self, scale: float) -> None:
-        """Update proxy amplitude from a measured real ASTC latent RMS error."""
-        self.astc_aware_noise_scale = float(max(0.0, scale))
-        self.astc_codec_calibrated = True
-
-    def set_astc_codec_decoded_texture(
-        self, grid_idx: int, decoded: torch.Tensor, source: torch.Tensor = None
-    ) -> None:
-        """Cache an ASTC decode and, when available, its error from the encoded source."""
-        name = f"_astc_decoded_texture_{int(grid_idx)}"
-        if not hasattr(self, name):
-            raise IndexError(f"invalid feature grid index {grid_idx}")
-        decoded = decoded.detach().to(device=self.device, dtype=torch.float32).contiguous()
-        setattr(self, name, decoded)
-        error_name = f"_astc_error_texture_{int(grid_idx)}"
-        if source is not None:
-            source = source.detach().to(device=self.device, dtype=torch.float32)
-            setattr(self, error_name, (decoded - source).contiguous())
-        self.astc_codec_calibrated = True
-
-    def _sample_astc_codec_texture(self, grid_idx: int, uvs: torch.Tensor) -> torch.Tensor:
-        decoded = getattr(self, f"_astc_decoded_texture_{int(grid_idx)}")
-        if decoded.numel() == 0:
-            return torch.empty(0, device=uvs.device, dtype=uvs.dtype)
-        texture = decoded.permute(2, 0, 1).unsqueeze(0)
-        grid = (torch.remainder(uvs, 1.0) * 2.0 - 1.0).view(1, -1, 1, 2)
-        sampled = F.grid_sample(texture, grid, mode="bilinear", padding_mode="border", align_corners=False)
-        return sampled.squeeze(0).squeeze(-1).transpose(0, 1).to(dtype=uvs.dtype)
-
-    def _sample_astc_codec_error(self, grid_idx: int, uvs: torch.Tensor) -> torch.Tensor:
-        error = getattr(self, f"_astc_error_texture_{int(grid_idx)}")
-        if error.numel() == 0:
-            return torch.empty(0, device=uvs.device, dtype=uvs.dtype)
-        texture = error.permute(2, 0, 1).unsqueeze(0)
-        grid = (torch.remainder(uvs, 1.0) * 2.0 - 1.0).view(1, -1, 1, 2)
-        sampled = F.grid_sample(texture, grid, mode="bilinear", padding_mode="border", align_corners=False)
-        return sampled.squeeze(0).squeeze(-1).transpose(0, 1).to(dtype=uvs.dtype)
 
     def load_ckpt(self, config: Config) -> None:
-
-        # TODO
         ckpt_iter = config.load_iter
         ckpt_dir = os.path.join(config.load_dir, "models")
         if ckpt_iter == -1:
-            files = [f for f in os.listdir(ckpt_dir) if f.endswith(".pth")]
-            if not files:
-                raise FileNotFoundError(f"No checkpoint found in {ckpt_dir}")
-
-            iters = [int(os.path.splitext(f)[0]) for f in files if os.path.splitext(f)[0].isdigit()]
+            iters = [int(name.removeprefix("train_result_")) for name in os.listdir(ckpt_dir)
+                     if name.startswith("train_result_") and name.removeprefix("train_result_").isdigit()
+                     and os.path.isfile(os.path.join(ckpt_dir, name, "model.pth"))]
             if not iters:
-                raise ValueError(f"No valid iter checkpoints found in {ckpt_dir}")
-
+                raise FileNotFoundError(f"No checkpoint found in {ckpt_dir}")
             ckpt_iter = max(iters)
-
-        ckpt_path = os.path.join(ckpt_dir, f"{ckpt_iter}.pth")
-        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        ckpt_path = os.path.join(ckpt_dir, f"train_result_{ckpt_iter}", "model.pth")
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=True)
         self.load_state_dict(ckpt)
 
     @staticmethod
@@ -498,7 +438,12 @@ class TCNNModel(torch.nn.Module):
         )
         if bool(torch.all(res <= 1)):
             return torch.zeros_like(uvs)
-        return torch.clamp((uvs * res - 0.5) / torch.clamp(res - 1.0, min=1.0), 0.0, 1.0)
+        scale = torch.clamp(res - 1.0, min=1.0)
+        # tiny-cuda-nn evaluates grid position = input * (resolution-1) + .5.
+        # Cancel its .5 offset so a texture center samples its stored texel.
+        # The first texel intentionally uses a small negative encoding input;
+        # its resulting grid position is zero, not a wrapped negative index.
+        return ((uvs * res - 0.5).clamp(min=0.0).minimum(res - 1.0) - 0.5) / scale
 
     def _nearest_grid_uv(self, uvs: torch.Tensor, selected_level, base_res: int) -> torch.Tensor:
         """Nearest texel center in tiny-cuda-nn grid coordinates."""
@@ -513,7 +458,7 @@ class TCNNModel(torch.nn.Module):
             return torch.zeros_like(uvs)
         texel = torch.floor(uvs * res).clamp(min=0.0)
         texel = torch.minimum(texel, torch.clamp(res - 1.0, min=0.0))
-        return torch.clamp(texel / torch.clamp(res - 1.0, min=1.0), 0.0, 1.0)
+        return (texel - 0.5) / torch.clamp(res - 1.0, min=1.0)
 
     def forward(self, x: torch.Tensor) -> TensorType["batch_size", "num_channels"]:
 
@@ -548,7 +493,7 @@ class TCNNModel(torch.nn.Module):
                     patch_indices, decoded_values = patch
                     sampled_params = active_params.index_select(0, patch_indices)
                     decoded_values = decoded_values.to(dtype=active_params.dtype)
-                    if self.astc_codec_update_latent:
+                    if self.astc_codec_update_latent and not self.astc_proxy_enabled:
                         decoded_values = sampled_params + (decoded_values - sampled_params).detach()
                     active_params = active_params.index_copy(0, patch_indices, decoded_values)
                 all_features = functional_call(feature_grid, {"params": active_params}, (grid_uvs,))
@@ -557,37 +502,9 @@ class TCNNModel(torch.nn.Module):
             cols = (grid_levels - num_sampled_mips - clipped_mips) * grid_fpl + torch.arange(grid_fpl * num_sampled_mips).to(self.device)
             sampled_features = torch.gather(all_features, 1, cols.to(torch.int64))
 
-            if (self.training and self.num_sampled_mips == 1 and self.astc_codec_branch_enabled
-                    and idx not in self._astc_codec_patches):
-                selected_res = self.feature_grid_base_res[idx] * torch.pow(
-                    2.0, selected_level_f
-                )
-                highest_level = self.feature_grid_n_levels[idx] - 1
-                highest_mask = (selected_level_f == float(highest_level)).to(sampled_features.dtype)
-                codec_texture = self._sample_astc_codec_texture(idx, uvs)
-                if codec_texture.numel() > 0:
-                    # Use the actual ASTC-decoded latent in the codec branch.
-                    # The optional STE lets experimental latent updates see an
-                    # identity gradient through the non-differentiable codec.
-                    if self.astc_codec_update_latent:
-                        codec_features = sampled_features + (codec_texture - sampled_features).detach()
-                    else:
-                        codec_features = codec_texture.detach()
-                    sampled_features = (
-                        sampled_features * (1.0 - highest_mask)
-                        + codec_features * highest_mask
-                    )
-                else:
-                    perturbation = self._astc_aware_latent_noise(
-                        uvs, selected_level_f, selected_res, sampled_features.shape[1]
-                    )
-                    sampled_features = sampled_features + perturbation * highest_mask
-
-                if not self.astc_codec_update_latent:
-                    sampled_features = sampled_features.detach()
-
             if (self.training and self.astc_codec_branch_enabled
-                    and idx in self._astc_codec_patches and not self.astc_codec_update_latent):
+                    and idx in self._astc_codec_patches and not self.astc_codec_update_latent
+                    and not self.astc_proxy_enabled):
                 sampled_features = sampled_features.detach()
 
             if self.direct_diffuse_enabled and idx == 0:
@@ -623,6 +540,8 @@ class TCNNModel(torch.nn.Module):
             feature_grid.load_state_dict(state_dict)
 
     def clamp_value(self):
+        for codec in self.astc_proxy:
+            codec.clamp_parameters()
 
         if self._decoder_adaptation_features is not None:
             return
@@ -748,6 +667,17 @@ class TCNNModel(torch.nn.Module):
 
         return info
 
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        if not len(self.astc_proxy) and "astc_proxy.0.endpoints" in state_dict:
+            from Core.ASTC_Aware.differentiable_proxy import ASTCProxyGrid
+            i = 0
+            while f"astc_proxy.{i}.endpoints" in state_dict:
+                self.astc_proxy.append(ASTCProxyGrid.from_state(
+                    state_dict, f"astc_proxy.{i}.", self.device
+                ))
+                i += 1
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
     @torch.no_grad()
     def save(self, curr_iter: int, model_path: str) -> None:
 
@@ -775,12 +705,16 @@ class TCNNModel(torch.nn.Module):
 
             save_kwargs = {
                 'info': info,
+                'astc_proxy': np.array(bool(len(self.astc_proxy)), dtype=np.bool_),
                 'network': save_model.network.state_dict()["params"].numpy()
             }
 
             network_data_path = os.path.join(save_path, f"network_data.npz")
             # Save parameters to npz (features moved to DDS files)
             np.savez(network_data_path, **save_kwargs)
+            for i, codec in enumerate(save_model.astc_proxy):
+                with open(os.path.join(save_path, f"feature_grid_{i}.astc"), "wb") as file:
+                    file.write(codec.export_astc())
 
             # ----------------------------------------------------------------------------------
             # - process the range of feature textures

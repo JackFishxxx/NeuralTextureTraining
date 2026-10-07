@@ -139,6 +139,9 @@ def train_two_stage(params, config=None):
         target.num_channels = first.num_channels
         target.pos_encoding_reference_edge = first.pos_encoding_reference_edge
         second = TCNNModel(target)
+        second.astc_proxy = copy.deepcopy(source.astc_proxy)
+        for parameter in second.astc_proxy.parameters():
+            parameter.requires_grad_(False)
         with torch.no_grad():
             for old_grid, new_grid in zip(source.feature_grids, second.feature_grids):
                 new_grid.params.copy_(old_grid.params)

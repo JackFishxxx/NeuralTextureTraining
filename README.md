@@ -266,30 +266,40 @@ Training simulates quantization error in the forward pass so the model adapts to
 
 ### ASTC-Aware Latent Training
 
-FNTC can train against the real `astcenc` round-trip instead of using only a noise approximation.
-On each scheduled codec step, the trainer samples current highest-level feature blocks, runs an
-ASTC round-trip on an aligned block atlas, and trains on the actual decoded values. No decoded
-latent snapshot is reused after the parameters change. The codec branch uses the compressed
-super-resolution base; a clean QAT branch remains active between codec steps.
+Training implementation is in `Core/ASTC_Aware`.
 
-Recommended settings in `config.yaml`:
+Backends are `astcenc` and `astc_differentiable_proxy`. The latter uses legal ASTC decoding in forward and surrogate gradients in backward, implemented with CUDA. Only current backend names and the `astc_proxy` checkpoint format are supported.
+
+`astcenc` periodically encodes the currently sampled feature blocks on CPU.
+`astc_differentiable_proxy` directly trains legal endpoint/weight parameters on CUDA every step
+after warmup, with validated symbol searches and low-frequency material projection. Both use
+the existing reconstruction/PBR losses; LPIPS remains an evaluation metric. Backend dependencies
+resolve automatically. The default `config.yaml` uses:
 
 ```yaml
 astc_aware_enable: true
-astc_codec_in_loop_enable: true
+astc_codec_backend: astc_differentiable_proxy
+astc_codec_start_frac: 0.1
+astc_learning_rate: 0.001
 astc_codec_in_loop_interval: 100
-astc_codec_blocks_per_step: 32
-astc_codec_start_frac: 0.3
-astc_codec_mip0_prob: 1.0
-astc_codec_loss_weight: 0.3
-astc_clean_loss_weight: 0.7
-astc_consistency_weight: 0.0
+astc_codec_update_latent: false
+astc_decoder_projection_interval: 500
 ```
 
-`astc_codec_start_frac` reserves an initial clean-QAT phase. Set
-`astc_codec_in_loop_interval: 1` to perform a real ASTC pass every iteration;
-`astc_codec_mip0_prob` is the probability of running a scheduled pass. The ASTC
-comparison requires an `astcenc` executable, resolved through `astcenc_path`.
+The codec interval and optional latent identity STE apply to the CPU backend. Setting the
+projection interval to 0 disables material projection. ASTC comparison uses the existing
+`astcenc_path`, `astcenc_quality` and `astc_block` settings.
+
+The proxy requires CUDA-enabled PyTorch, a matching CUDA toolkit, a C++ compiler and ninja.
+It reuses `tools/astc_encoder_source/Source`, downloading the pinned encoder source there if absent.
+It currently supports quantized Mip0 with four-channel feature grids and direct diffuse disabled.
+Material projection additionally requires one grid at the GT resolution and a linear SR decoder
+without PE; other configurations should set `astc_decoder_projection_interval: 0`.
+
+Stage two freezes the learned bitstream. Checkpoints are loaded from
+`models/train_result_<iteration>/model.pth`; `--load_iter -1` selects the latest completed checkpoint.
+The previous two-seed quality figures included a perceptual loss that has since been removed;
+they do not establish long-budget quality or speed for the current recipe.
 
 ### Seamless Tiling (Wrap Boundary Constraint)
 

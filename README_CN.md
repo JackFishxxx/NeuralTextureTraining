@@ -268,29 +268,35 @@ diffuse(3) | normal(3 或 2) | roughness(1) | occlusion(1) | metallic(1) | specu
 
 ### ASTC 感知 Latent 训练
 
-FNTC 支持直接使用真实 `astcenc` 往返结果进行训练，而不只依赖噪声近似。启用后，训练器会
-在预定 codec 步从当前最高分辨率 feature level 抽取 ASTC block，拼成对齐的 atlas 做真实
-编解码，并直接用该步的解码结果训练，不再跨参数更新复用旧的 latent 快照。ASTC 分支使用压缩后的
-超分 base；其余迭代继续进行 clean QAT 训练。
+训练实现位于 `Core/ASTC_Aware`。
 
-推荐在 `config.yaml` 中使用：
+后端为 `astcenc` 和 `astc_differentiable_proxy`。后者使用合法 ASTC 前向解码及近似反向梯度，由 CUDA 执行；仅支持当前名称和 `astc_proxy` checkpoint 格式。
+
+`astcenc` 定期在 CPU 编解码当前采样的 feature block。`astc_differentiable_proxy` 在 warmup 后
+每步通过 CUDA 直接训练合法端点/权重，配合经过真实 loss 验证的量化搜索和低频材质投影。
+两者复用项目的材质重建/PBR loss，LPIPS 仅用于评测，后端依赖自动处理。当前默认配置为：
 
 ```yaml
 astc_aware_enable: true
-astc_codec_in_loop_enable: true
+astc_codec_backend: astc_differentiable_proxy
+astc_codec_start_frac: 0.1
+astc_learning_rate: 0.001
 astc_codec_in_loop_interval: 100
-astc_codec_blocks_per_step: 32
-astc_codec_start_frac: 0.3
-astc_codec_mip0_prob: 1.0
-astc_codec_loss_weight: 0.3
-astc_clean_loss_weight: 0.7
-astc_consistency_weight: 0.0
+astc_codec_update_latent: false
+astc_decoder_projection_interval: 500
 ```
 
-`astc_codec_start_frac` 用于保留初始 clean-QAT 预训练阶段。设置
-`astc_codec_in_loop_interval: 1` 可每次迭代都执行真实 ASTC；`astc_codec_mip0_prob`
-表示预定 codec 步实际执行的概率。
-ASTC 对比需要可用的 `astcenc` 可执行文件，程序会通过 `astcenc_path` 自动定位或下载。
+codec 间隔和可选 latent 恒等 STE 仅用于 CPU 后端；投影间隔设为0可关闭材质投影。
+ASTC 对比继续复用项目已有的 `astcenc_path`、`astcenc_quality` 和 `astc_block`。
+
+代理需要 CUDA 版 PyTorch、匹配的 CUDA toolkit、C++ 编译器和 ninja。它复用
+`tools/astc_encoder_source/Source`，源码缺失时下载固定版本到该目录。目前支持量化 Mip0、
+四通道 feature grid，且 direct diffuse 必须关闭。材质投影还要求与 GT 同分辨率的单 grid
+和无 PE 的线性超分 decoder；其他配置应设置 `astc_decoder_projection_interval: 0`。
+
+第二阶段冻结学习后的码流。checkpoint 从 `models/train_result_<迭代>/model.pth` 加载，
+`--load_iter -1` 选择最新已保存模型。此前两个种子的质量结果包含现在已移除的感知 loss，
+不能作为当前方案的长预算质量或速度结论。
 
 ### 无缝平铺（Wrap Boundary Constraint）
 

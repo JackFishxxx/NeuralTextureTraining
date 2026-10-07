@@ -249,6 +249,15 @@ def apply_astc_to_feature_grids(astc_model, roundtrip_rgba: Callable[[np.ndarray
     for grid_idx, feature_grid in enumerate(astc_model.feature_grids):
         params = astc_model._get_grid_params_tensor(feature_grid)
         spec = astc_model.feature_grid_specs[grid_idx]
+        proxy_grids = getattr(astc_model, "astc_proxy", ())
+        if len(proxy_grids):
+            # Decode the learned legal bitstream with official CPU ASTC rules;
+            # re-encoding the clean latent would discard the optimized parameters.
+            rgba = proxy_grids[grid_idx].decode_cpu_image().to(params.device)
+            recovered = torch.round(rgba * (spec.quant_step_count - 1))
+            offset, count, _ = spec.highest_level_slice()
+            params.data[offset:offset+count] = int_to_feature_tensor(recovered.reshape(-1), spec)
+            continue
         qbits = int(spec.quantize_bits)
         n_k = spec.quant_step_count
         n_fpl = int(spec.n_features_per_level)

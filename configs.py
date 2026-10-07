@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import re
 from pathlib import Path
@@ -137,35 +138,33 @@ class Config():
         self.qat_noise_mult_start = float(getattr(params, "qat_noise_mult_start", 1.0))
         self.qat_noise_mult_end = float(getattr(params, "qat_noise_mult_end", 0.25))
         self.qat_noise_warmup_frac = float(getattr(params, "qat_noise_warmup_frac", 0.1))
-        self.astc_aware_enable = bool(getattr(params, "astc_aware_enable", False))
-        self.astc_aware_noise_scale = float(getattr(params, "astc_aware_noise_scale", 1.0))
-        self.astc_aware_start_frac = float(getattr(params, "astc_aware_start_frac", 0.0))
-        self.astc_codec_in_loop_enable = bool(getattr(params, "astc_codec_in_loop_enable", True))
-        self.astc_codec_update_latent = bool(getattr(params, "astc_codec_update_latent", False))
-        self.astc_codec_in_loop_interval = int(getattr(params, "astc_codec_in_loop_interval", 5000))
-        self.astc_codec_blocks_per_step = int(getattr(params, "astc_codec_blocks_per_step", 32))
-        self.astc_codec_loss_weight = float(getattr(params, "astc_codec_loss_weight", 0.7))
-        self.astc_clean_loss_weight = float(getattr(params, "astc_clean_loss_weight", 0.3))
-        self.astc_consistency_weight = float(getattr(params, "astc_consistency_weight", 0.1))
-        self.astc_codec_mip0_prob = float(getattr(params, "astc_codec_mip0_prob", 0.5))
-        self.astc_codec_start_frac = float(getattr(params, "astc_codec_start_frac", 0.0))
-        if (self.astc_aware_noise_scale < 0.0
-                or not 0.0 <= self.astc_aware_start_frac <= 1.0
-                or self.astc_codec_in_loop_interval <= 0
-                or self.astc_codec_blocks_per_step <= 0
-                or min(self.astc_codec_loss_weight, self.astc_clean_loss_weight,
-                       self.astc_consistency_weight) < 0.0):
-            raise ValueError("invalid ASTC-aware latent settings")
-        if not 0.0 <= self.astc_codec_mip0_prob <= 1.0:
-            raise ValueError("astc_codec_mip0_prob must be in [0, 1]")
-        if not 0.0 <= self.astc_codec_start_frac <= 1.0:
-            raise ValueError("astc_codec_start_frac must be in [0, 1]")
-        total_astc_weight = self.astc_clean_loss_weight + self.astc_codec_loss_weight + self.astc_consistency_weight
-        if total_astc_weight <= 0.0:
-            raise ValueError("at least one ASTC-aware loss weight must be positive")
-        self.astc_clean_loss_weight /= total_astc_weight
-        self.astc_codec_loss_weight /= total_astc_weight
-        self.astc_consistency_weight /= total_astc_weight
+        ### ---------- ASTC aware configs ---------- ###
+        backend = params.astc_codec_backend
+        if backend not in ("astcenc", "astc_differentiable_proxy"):
+            raise ValueError("astc_codec_backend must be astcenc or astc_differentiable_proxy")
+        lr = float(params.astc_learning_rate)
+        warmup = float(params.astc_codec_start_frac)
+        projection = int(params.astc_decoder_projection_interval)
+        interval = int(params.astc_codec_in_loop_interval)
+        if (
+            not all(math.isfinite(value) for value in (lr, warmup))
+            or lr <= 0
+            or not 0 <= warmup <= 1
+            or projection < 0
+            or interval < 1
+        ):
+            raise ValueError("Invalid ASTC aware settings")
+        self.astc_aware_enable = bool(params.astc_aware_enable)
+        self.astc_codec_backend = backend
+        self.astc_learning_rate = lr
+        self.astc_codec_start_frac = warmup
+        self.astc_codec_update_latent = (
+            bool(params.astc_codec_update_latent) if backend == "astcenc" else False
+        )
+        # The two-stage trainer temporarily disables codec updates during adaptation.
+        self.astc_codec_in_loop_enable = self.astc_aware_enable and params.mode == "train"
+        self.astc_codec_in_loop_interval = 1 if backend == "astc_differentiable_proxy" else interval
+        self.astc_decoder_projection_interval = projection
 
         ### ---------- trainer configs ---------- ###
         self.two_stage_finetune_enable = bool(getattr(params, "two_stage_finetune_enable", True))
@@ -414,36 +413,27 @@ def get_args():
         default=0.25,
         help='noise multiplier at end of training (cosine tail)',
     )
-    parser.add_argument('--astc_aware_enable', action=argparse.BooleanOptionalAction, default=False,
-                        help='inject block-correlated ASTC-like latent noise during training')
-    parser.add_argument('--astc_aware_noise_scale', type=float, default=1.0,
-                        help='latent ASTC perturbation in 8-bit code steps')
-    parser.add_argument('--astc_aware_start_frac', type=float, default=0.0,
-                        help='fraction of training held without ASTC-aware perturbation')
-    parser.add_argument('--astc_codec_in_loop_enable', action='store_true', default=True,
-                        help='periodically calibrate ASTC-aware latent noise using real astcenc round-trips (always enabled)')
-    parser.add_argument('--astc_codec_update_latent', action=argparse.BooleanOptionalAction, default=False,
-                        help='use a straight-through codec gradient to update feature-grid latents (experimental)')
-    parser.add_argument('--astc_codec_in_loop_interval', type=int, default=5000,
-                        help='iterations between exact ASTC block-training passes (1 = every iteration)')
-    parser.add_argument('--astc_codec_blocks_per_step', type=int, default=32,
-                        help='number of ASTC blocks sampled during each exact codec-training pass')
-    parser.add_argument('--astc_codec_loss_weight', type=float, default=0.7,
-                        help='reconstruction loss weight for the real-ASTC training branch')
-    parser.add_argument('--astc_clean_loss_weight', type=float, default=0.3,
-                        help='reconstruction loss weight for the clean QAT branch')
-    parser.add_argument('--astc_consistency_weight', type=float, default=0.1,
-                        help='output consistency weight between ASTC and clean branches')
-    parser.add_argument('--astc_codec_mip0_prob', type=float, default=0.5,
-                        help='probability of running an ASTC pass when its interval is due')
-    parser.add_argument('--astc_codec_start_frac', type=float, default=0.0,
-                        help='fraction of training reserved for clean latent pretraining before codec loss')
     parser.add_argument(
         '--qat_noise_warmup_frac',
         type=float,
         default=0.1,
         help='fraction of (max_iter-1) iterations holding mult_start before cosine decay',
     )
+
+    ### ---------- ASTC aware configs ---------- ###
+    group = parser.add_argument_group("ASTC aware")
+    group.add_argument("--astc_aware_enable", action=argparse.BooleanOptionalAction, default=True)
+    group.add_argument("--astc_codec_backend", choices=["astcenc", "astc_differentiable_proxy"], default="astc_differentiable_proxy")
+    group.add_argument("--astc_codec_start_frac", type=float, default=0.1,
+                        help="clean warmup fraction")
+    group.add_argument("--astc_learning_rate", type=float, default=0.001,
+                        help="proxy endpoint and weight learning rate")
+    group.add_argument("--astc_codec_in_loop_interval", type=int, default=100,
+                        help="CPU codec interval; proxy runs every step")
+    group.add_argument("--astc_codec_update_latent", action=argparse.BooleanOptionalAction, default=False,
+                        help="CPU latent identity STE")
+    group.add_argument("--astc_decoder_projection_interval", type=int, default=500,
+                        help="proxy material projection interval; 0 disables it")
 
     ### ---------- trainer configs ---------- ###
     parser.add_argument('--two_stage_finetune_enable', action=argparse.BooleanOptionalAction, default=True,

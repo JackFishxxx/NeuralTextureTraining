@@ -301,6 +301,36 @@ Stage two freezes the learned bitstream. Checkpoints are loaded from
 The previous two-seed quality figures included a perceptual loss that has since been removed;
 they do not establish long-budget quality or speed for the current recipe.
 
+### Feature Gradient Inputs
+
+Feature gradient options are configured in the `feature gradient configs` section:
+
+```yaml
+feature_gradient_count: 4  # 0 off | 2 right/down | 4 axial | 8 3x3 | 24 5x5
+```
+
+`Core/Feature_Gradient/sampling.py` samples the center and positions one feature
+texel away with bilinear repeat addressing, then appends each neighbor-minus-center
+difference to the decoder input. The differences do not add feature bitstream bytes,
+but they increase decoder input size and sampling cost. Checkpoints and
+`network_data.npz` record the direction count; inference must use the same value.
+
+The two-stage entry disables gradient inputs during representation learning and
+enables the configured count during decoder adaptation. In single-stage training,
+gradients participate in representation learning directly; set
+`astc_decoder_projection_interval: 0` because pointwise material projection does
+not support spatial difference inputs.
+
+The compact default uses four axial differences and a 1x32 decoder. Larger stencils
+require relaxing the compact input limit and are intended for offline experiments.
+
+ASTC training uses the same differentiably decoded texture for every feature-gradient
+sample; stage two uses frozen decoded features.
+
+`ASTCAwareTrainer.refine_gradient_codec` is an explicit fixed-decoder refinement
+pass that validates legal codec proposals over complete block neighborhoods. It
+is not automatically added to the default training flow.
+
 ### Seamless Tiling (Wrap Boundary Constraint)
 
 The feature grid supports a **wrap boundary constraint**: during training, left/right and top/bottom border features (as well as corners) are softly tied together, preventing visible seams when the feature texture is sampled in Wrap/Repeat mode at runtime.

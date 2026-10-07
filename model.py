@@ -9,6 +9,7 @@ from torch.func import functional_call
 from torchtyping import TensorType
 
 from configs import Config
+from Core.Feature_Gradient.sampling import sample_feature_inputs
 
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -107,6 +108,9 @@ class TCNNModel(torch.nn.Module):
         self.n_frequencies = config.n_frequencies
         self.n_neurons = config.n_neurons
         self.n_hidden_layers = config.n_hidden_layers
+        self.feature_gradient_count = config.feature_gradient_count
+        if self.feature_gradient_count:
+            self.register_buffer("_feature_gradient_count", torch.tensor(self.feature_gradient_count, device=self.device))
         self.output_activation = getattr(config, "output_activation", "hard_swish")
         self.astc_codec_backend = config.astc_codec_backend
         self.astc_proxy_enabled = self.astc_codec_backend == "astc_differentiable_proxy"
@@ -221,6 +225,7 @@ class TCNNModel(torch.nn.Module):
             "n_hidden_layers": config.n_hidden_layers
         }
         total_grid_features = sum(self.feature_grid_n_features_per_level) * self.num_sampled_mips
+        total_grid_features *= 1 + self.feature_gradient_count
         if self.direct_diffuse_enabled:
             if not self.feature_grid_n_features_per_level or self.feature_grid_n_features_per_level[0] < 3:
                 raise ValueError("direct_diffuse_infer_mode requires feature grid 0 to have at least 3 channels")
@@ -492,7 +497,6 @@ class TCNNModel(torch.nn.Module):
             grid_fpl = self.feature_grid_n_features_per_level[idx]
             clipped_mips = torch.clamp(mips, max=grid_levels - num_sampled_mips)
             selected_level_f = grid_levels - num_sampled_mips - clipped_mips
-            grid_uvs = self._texel_aligned_grid_uv(uvs, selected_level_f, self.feature_grid_base_res[idx])
             active_params = None
             if self.quantize and self.training:
                 active_params = self._get_qat_grid_params(idx, feature_grid)
@@ -504,11 +508,10 @@ class TCNNModel(torch.nn.Module):
                     if self.astc_codec_update_latent and not self.astc_proxy_enabled:
                         decoded_values = sampled_params + (decoded_values - sampled_params).detach()
                     active_params = active_params.index_copy(0, patch_indices, decoded_values)
-                all_features = functional_call(feature_grid, {"params": active_params}, (grid_uvs,))
-            else:
-                all_features = feature_grid(grid_uvs)
-            cols = (grid_levels - num_sampled_mips - clipped_mips) * grid_fpl + torch.arange(grid_fpl * num_sampled_mips).to(self.device)
-            sampled_features = torch.gather(all_features, 1, cols.to(torch.int64))
+            params = active_params if active_params is not None else self._get_grid_params_tensor(feature_grid)
+            sampled_features = sample_feature_inputs(
+                params, self.feature_grid_specs[idx], uvs, selected_level_f, self.feature_gradient_count
+            ).to(feature_grid.dtype)
 
             if (self.training and self.astc_codec_branch_enabled
                     and idx in self._astc_codec_patches and not self.astc_codec_update_latent
@@ -519,6 +522,7 @@ class TCNNModel(torch.nn.Module):
                 nearest_uvs = self._nearest_grid_uv(uvs, selected_level_f, self.feature_grid_base_res[idx])
                 nearest_all = (functional_call(feature_grid, {"params": active_params}, (nearest_uvs,))
                                if active_params is not None else feature_grid(nearest_uvs))
+                cols = selected_level_f * grid_fpl + torch.arange(grid_fpl, device=self.device)
                 nearest_features = torch.gather(nearest_all, 1, cols.to(torch.int64))
                 direct_diffuse = self._decode_direct_diffuse_features(nearest_features)
 
@@ -677,6 +681,9 @@ class TCNNModel(torch.nn.Module):
         return info
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
+        saved_count = state_dict.get("_feature_gradient_count")
+        if saved_count is not None and int(saved_count) != self.feature_gradient_count:
+            raise ValueError("Checkpoint feature_gradient_count does not match the model configuration")
         if not len(self.astc_proxy) and "astc_proxy.0.endpoints" in state_dict:
             from Core.ASTC_Aware.differentiable_proxy import ASTCProxyGrid
             i = 0
@@ -714,6 +721,7 @@ class TCNNModel(torch.nn.Module):
 
             save_kwargs = {
                 'info': info,
+                'feature_gradient_count': np.array(self.feature_gradient_count, dtype=np.int32),
                 'astc_proxy': np.array(bool(len(self.astc_proxy)), dtype=np.bool_),
                 'network': save_model.network.state_dict()["params"].numpy(),
                 'decoder_output_bias': save_model.decoder_output_bias.detach().numpy()

@@ -166,6 +166,11 @@ class Config():
         self.astc_codec_in_loop_interval = 1 if backend == "astc_differentiable_proxy" else interval
         self.astc_decoder_projection_interval = projection
 
+        ### ---------- feature gradient configs ---------- ###
+        self.feature_gradient_count = int(params.feature_gradient_count)
+        if self.feature_gradient_count not in (0, 2, 4, 8, 24):
+            raise ValueError("feature_gradient_count must be 0, 2, 4, 8 or 24")
+
         ### ---------- trainer configs ---------- ###
         self.two_stage_finetune_enable = bool(getattr(params, "two_stage_finetune_enable", True))
         self.two_stage_finetune_max_steps = int(getattr(params, "two_stage_finetune_max_steps", 5000))
@@ -434,6 +439,12 @@ def get_args():
                         help="CPU latent identity STE")
     group.add_argument("--astc_decoder_projection_interval", type=int, default=500,
                         help="proxy material projection interval; 0 disables it")
+
+    ### ---------- feature gradient configs ---------- ###
+    group = parser.add_argument_group("feature gradient configs")
+    group.add_argument('--feature_gradient_count', type=int, choices=[0, 2, 4, 8, 24], default=0,
+                       help='feature differences: 0 off, 2 right/down, 4 axial, 8 3x3, 24 5x5; '
+                            'two-stage training applies them only in stage two')
 
     ### ---------- trainer configs ---------- ###
     parser.add_argument('--two_stage_finetune_enable', action=argparse.BooleanOptionalAction, default=True,

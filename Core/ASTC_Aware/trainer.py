@@ -242,16 +242,15 @@ class ASTCAwareTrainer:
 
     @torch.no_grad()
     def _prepare_astc_codec_patches(self, uv, curr_iter):
+        from Core.Feature_Gradient.sampling import bilinear_texel_corners, gradient_directions
+
         block_size = uv.new_tensor(self.configs.astc_aware_block, dtype=torch.long)
         self.model._astc_codec_patches.clear()
         for index, spec in enumerate(self.model.feature_grid_specs):
             resolution = spec.highest_level_slice()[2]
-            lower = torch.floor(uv * resolution - 0.5).long()
-            x = torch.stack((lower[:, 0], lower[:, 0] + 1), 1).clamp(0, resolution - 1)
-            y = torch.stack((lower[:, 1], lower[:, 1] + 1), 1).clamp(0, resolution - 1)
-            corners = torch.stack(
-                (x[:, :, None].expand(-1, -1, 2), y[:, None, :].expand(-1, 2, -1)), -1
-            ).reshape(-1, 2)
+            shifts = uv.new_tensor(((0, 0), *gradient_directions(self.model.feature_gradient_count)))
+            queries = (uv[:, None, :] + shifts[None] / resolution).reshape(-1, 2)
+            corners = bilinear_texel_corners(queries, resolution)[0].reshape(-1, 2)
             blocks = torch.unique(torch.div(corners, block_size, rounding_mode="floor"), dim=0)
             indices, decoded, rms = roundtrip_feature_blocks(
                 self.model,
@@ -463,10 +462,106 @@ class ASTCAwareTrainer:
     def _validate_astc_projection(self):
         model = self.model
         if (model.n_hidden_layers != 0 or model.n_frequencies != 0
+                or model.feature_gradient_count != 0
                 or len(model.feature_grid_specs) != 1 or not self.super_resolution_enable):
-            raise ValueError("Material projection requires one grid and a linear SR decoder without PE; "
+            raise ValueError("Material projection requires one grid and a linear SR decoder without PE/feature gradients; "
                              "set astc_decoder_projection_interval: 0 for other configurations")
         if (model.feature_grid_specs[0].max_resolution != self.texture_width
                 or self.texture_height != self.texture_width):
             raise ValueError("Material projection requires feature and GT dimensions to match; "
                              "set astc_decoder_projection_interval: 0 for other resolutions")
+
+    def refine_gradient_codec(self, steps, learning_rate=0.001, blocks_per_batch=64):
+        """Fit legal codec symbols with the decoder fixed over complete neighborhoods.
+
+        This explicit refinement pass is separate from frozen decoder adaptation.
+        The output patch covers each selected 6x6 block and the gradient/bilinear
+        footprint around it (10x10 for 3x3 inputs, 12x12 for 5x5). Selected rows are
+        updated, and proposals must improve the actual material/PBR objective.
+        """
+        from .differentiable_proxy import ASTCBlockAdam
+        from Core.Feature_Gradient.sampling import gradient_directions
+
+        model = self.model
+        if (self.astc_codec_backend != "astc_differentiable_proxy" or not self.mip0_only
+                or len(model.astc_proxy) != 1 or not model.feature_gradient_count
+                or model._decoder_adaptation_features is not None):
+            raise ValueError("Codec refinement requires a fitted gradient decoder and one Mip0 ASTC proxy")
+        if steps < 1 or blocks_per_batch < 1 or not math.isfinite(learning_rate) or learning_rate <= 0:
+            raise ValueError("Refinement steps, block count and learning rate must be positive")
+        grid = model.astc_proxy[0]
+        height, width = grid._image_shape
+        if (height, width) != (self.texture_height, self.texture_width):
+            raise ValueError("Codec refinement currently requires feature and target resolutions to match")
+        if self.super_resolution_enable and self.astc_superres_base_mip0 is None:
+            raise ValueError("Codec refinement requires the deployment ASTC base")
+        blocks_x, blocks_y = (width + 5) // 6, (height + 5) // 6
+        optimizer = ASTCBlockAdam(model.astc_proxy, learning_rate, learning_rate,
+                                  quantization_aware=True, packed_pair_search=True)
+        loss_weights = torch.tensor(self.output_loss_weights, device=self.device)
+        halo = 1 + max(max(abs(dx), abs(dy)) for dx, dy in gradient_directions(model.feature_gradient_count))
+        ly, lx = torch.meshgrid(torch.arange(-halo, 6 + halo, device=self.device),
+                               torch.arange(-halo, 6 + halo, device=self.device), indexing="ij")
+        parameter_flags = [(parameter, parameter.requires_grad) for parameter in model.parameters()]
+        was_training, old_iteration = model.training, model.current_iter
+        old_branch = model.astc_codec_branch_enabled
+        old_batches = getattr(self, "_astc_proxy_batches", None)
+        old_weights = getattr(self, "_astc_proxy_loss_weights", None)
+        saved = (grid.endpoints.detach().clone(), grid.weights.detach().clone())
+        saved_source = model.feature_grids[0].params.detach().clone()
+        stats = {"steps": steps, "accepted_blocks": 0, "continuous_accepted": 0,
+                 "learning_rate": learning_rate, "blocks_per_batch": blocks_per_batch}
+        stats["loss_weights"] = list(self.output_loss_weights)
+        try:
+            model.train()
+            for parameter, _ in parameter_flags:
+                parameter.requires_grad_(False)
+            grid.requires_grad_(True)
+            for step in range(steps):
+                bx = torch.randint(0, blocks_x, (blocks_per_batch,), device=self.device)
+                by = torch.randint(0, blocks_y, (blocks_per_batch,), device=self.device)
+                ids = (by * blocks_x + bx).unique()
+                xs = (ids[:, None, None] % blocks_x * 6 + lx) % width
+                ys = (ids[:, None, None] // blocks_x * 6 + ly) % height
+                uv = torch.stack(((xs.flatten() + .5) / width, (ys.flatten() + .5) / height), 1)
+                base = self._astc_base_at_uv(uv)
+                target = self.dataset.expand_to_canonical(
+                    self.dataset.mip_cache[0][ys.flatten(), xs.flatten()]
+                ).to(torch.float16)
+                inputs = torch.cat((uv, torch.zeros(len(uv), 1, device=self.device)), 1)
+                if base is not None:
+                    inputs = torch.cat((inputs, base), 1)
+                model.current_iter = old_iteration + step + 1
+                model._qat_param_cache.clear()
+                optimizer.zero_grad()
+                model.astc_codec_branch_enabled = True
+                prediction = model(inputs)
+                loss = self._compute_astc_reconstruction_loss(target, prediction, base, loss_weights)
+                pbr = self._astc_pbr_loss(target, prediction, base)
+                if pbr is not None:
+                    loss = loss + self.pbr_loss_weight * pbr
+                loss.backward()
+                self._astc_proxy_batches = [(inputs, target, base, 1., True)]
+                self._astc_proxy_loss_weights = loss_weights
+                optimizer.step({0: ids}, objective=self._astc_proxy_objective)
+                stats["accepted_blocks"] += optimizer.last_stats.get("accepted_blocks", 0)
+                stats["continuous_accepted"] += optimizer.last_stats.get("continuous_accepted", 0)
+            self._sync_astc_source()
+            self._astc_block_optimizer = None
+            return stats
+        except Exception:
+            with torch.no_grad():
+                grid.endpoints.copy_(saved[0])
+                grid.weights.copy_(saved[1])
+                model.feature_grids[0].params.copy_(saved_source)
+            raise
+        finally:
+            optimizer.zero_grad()
+            for parameter, flag in parameter_flags:
+                parameter.requires_grad_(flag)
+            model.train(was_training)
+            model.current_iter = old_iteration
+            model.astc_codec_branch_enabled = old_branch
+            model._qat_param_cache.clear()
+            self._astc_proxy_batches = old_batches
+            self._astc_proxy_loss_weights = old_weights

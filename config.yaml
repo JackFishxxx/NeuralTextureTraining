@@ -30,13 +30,16 @@ feature_grid_configs:
  #   save_bits: 32
  #   learning_rate: 0.001
 
+# ---------- feature gradient configs ----------
+feature_gradient_count: 4  # 0 off | 2 right/down | 4 axial | 8 3x3 | 24 5x5
+
 # ---------- super resolution configs ----------
 super_resolution_enable: true
 super_resolution_base_resolution: 512
 
 # ---------- tiled positional encoding configs ----------
-n_frequencies: 2
-pos_encoding_tile_size: 16
+n_frequencies: 0
+pos_encoding_tile_size: 6
 
 # ---------- astc aware configs ----------
 astc_aware_enable: true
@@ -50,6 +53,8 @@ astc_codec_in_loop_interval: 100  # astcenc only; CUDA runs every iteration
 astc_codec_update_latent: false  # astcenc identity STE; CUDA learns codec parameters
 
 # ---------- trainer configs ----------
+# Stage1 training inputs: feature grid + super resolution base + mip level + bias
+# Stage2 training inputs: feature grid + feature gradients + positional encoding + SR base + mip level + bias
 two_stage_finetune_enable: true
 two_stage_finetune_max_steps: 50000
 two_stage_finetune_lr_multiplier: 1.0
@@ -75,6 +80,6 @@ pbr_point_lights:
     color: [1.0, 1.0, 1.0]
 
 # ---------- network configs ----------
-n_neurons: 16
+n_neurons: 32
 n_hidden_layers: 1
 learning_rate: 0.002

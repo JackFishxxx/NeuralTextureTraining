@@ -298,6 +298,30 @@ ASTC 对比继续复用项目已有的 `astcenc_path`、`astcenc_quality` 和 `a
 `--load_iter -1` 选择最新已保存模型。此前两个种子的质量结果包含现在已移除的感知 loss，
 不能作为当前方案的长预算质量或速度结论。
 
+### Feature Gradient 输入
+
+Feature gradient 参数位于独立的 `feature gradient configs` 栏目：
+
+```yaml
+feature_gradient_count: 4  # 0 关闭 | 2 右/下 | 4 四轴 | 8 3x3 | 24 5x5
+```
+
+`Core/Feature_Gradient/sampling.py` 对中心及偏移一个 feature 纹素的位置进行
+双线性 repeat 采样，将邻居减去中心的差分拼接到 decoder 输入。差分不增加
+feature 码流，但会增加 decoder 输入和采样开销。checkpoint 和 `network_data.npz`
+会记录梯度方向数，推理必须使用相同配置。
+
+两阶段入口第一阶段关闭梯度输入，第二阶段按配置启用；单阶段训练时梯度直接
+参与表示学习。由于逐纹素材质投影不支持空间差分输入，单阶段使用梯度时应将
+`astc_decoder_projection_interval` 设为 `0`。
+
+紧凑默认使用四个轴向差分和一层 32 神经元网络。更大的邻域需要放宽紧凑输入
+上限，建议仅用于离线实验。
+
+ASTC 阶段的 feature-gradient 采样使用同一份可微解码 feature；第二阶段使用冻结的解码 feature。
+`ASTCAwareTrainer.refine_gradient_codec` 提供显式的完整块邻域码流微调，固定 decoder 并对合法端点/权重候选做材质/PBR 验收；该方法尚未自动插入默认训练流程。
+
+
 ### 无缝平铺（Wrap Boundary Constraint）
 
 特征网格支持**无缝平铺约束**：训练过程中自动同步网格左右、上下及四角的边界特征，使得特征纹理在 Wrap/Repeat 采样模式下不产生接缝，适合需要平铺的材质。

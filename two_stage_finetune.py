@@ -124,9 +124,12 @@ def train_two_stage(params, config=None):
     first = copy.deepcopy(target)
     first.n_hidden_layers = 0
     first.n_frequencies = 0
+    # Learn the ASTC representation with the established pointwise projection;
+    # neighborhood differences belong to the configured decoder adaptation.
+    first.feature_gradient_count = 0
     trainer = Trainer(params, config_override=first)
     try:
-        print("[Two Stage] feature stage: 0 hidden layers, no positional encoding", flush=True)
+        print("[Two Stage] feature stage: 0 hidden layers, no PE or feature gradients", flush=True)
         trainer.train()
         baseline_iteration = int(trainer.model.current_iter)
         trainer.model.save(baseline_iteration, trainer.model_path)
@@ -151,6 +154,7 @@ def train_two_stage(params, config=None):
         print(
             f"[Two Stage] decoder stage: {target.n_hidden_layers} hidden layers, "
             f"width {target.n_neurons}, {target.n_frequencies} PE frequencies; "
+            f"{target.feature_gradient_count} feature gradients; "
             f"source latent frozen at iter {baseline_iteration}", flush=True,
         )
         stats = finetune_astc_decoder(
@@ -167,10 +171,11 @@ def train_two_stage(params, config=None):
         results = {
             "baseline_iteration": baseline_iteration,
             "adapted_iteration": final_iteration,
-            "stage_one": {"hidden_layers": 0, "pe_frequencies": 0},
+            "stage_one": {"hidden_layers": 0, "pe_frequencies": 0, "feature_gradient_count": 0},
             "stage_two": {"hidden_layers": target.n_hidden_layers,
                           "neurons": target.n_neurons,
-                          "pe_frequencies": target.n_frequencies},
+                          "pe_frequencies": target.n_frequencies,
+                          "feature_gradient_count": target.feature_gradient_count},
             "baseline": baseline_astc,
             "baseline_pbr": baseline_pbr,
             "adapted": adapted_astc,

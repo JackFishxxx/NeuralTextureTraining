@@ -816,6 +816,7 @@ class Trainer(ASTCAwareTrainer):
             curr_iter=curr_iter,
             ref_astc_resolution=self.ref_astc_resolution,
             eval_weights=self.eval_weights,
+            inference_tile=self.eval_inference_tile,
         )
 
     @torch.no_grad()
@@ -848,6 +849,7 @@ class Trainer(ASTCAwareTrainer):
                 self.num_mips,
                 self.device,
                 superres_base_override=astc_base,
+                inference_tile=self.eval_inference_tile,
             )
             ref_h, ref_w = _ref_astc_hw_from_side(
                 self.ref_astc_resolution,

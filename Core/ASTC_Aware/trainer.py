@@ -390,10 +390,10 @@ class ASTCAwareTrainer:
 
     @torch.no_grad()
     def _project_astc_decoder_target(self):
-        """Fit legal ASTC to the exact weighted least-squares linear-decoder target.
+        """Fit legal ASTC to a weighted linear-decoder target at grid texel centers.
 
         Unlike a normalized feature-gradient step, this proposal solves for the
-        latent that minimizes current material MSE before legal ASTC projection.
+        latent that minimizes material MSE at those centers before ASTC projection.
         Accept only the actual sampled material objective, keeping codec training
         on CUDA on all ordinary iterations.
         """
@@ -416,10 +416,21 @@ class ASTCAwareTrainer:
         ridge = 1e-5 * gram.diag().mean().clamp_min(1e-6)
         inverse = torch.linalg.inv(gram + torch.eye(4, device=self.device) * ridge)
         transform = (weights[:, None] * matrix) @ inverse
+        resolution = spec.highest_level_slice()[2]
+        # Solve at feature texel centers. Bilinear resizing samples the same UVs
+        # from GT and the deployment SR base when their dimensions differ from
+        # the grid (e.g. 2K textures with the default 1K feature grid).
+        target_image = self.dataset.mip_cache[0].permute(2, 0, 1)[None].float()
+        base_image = self.astc_superres_base_mip0.permute(2, 0, 1)[None].float()
+        if target_image.shape[-2:] != (resolution, resolution):
+            target_image = F.interpolate(target_image, size=(resolution, resolution),
+                                         mode="bilinear", align_corners=False)
+            base_image = F.interpolate(base_image, size=(resolution, resolution),
+                                       mode="bilinear", align_corners=False)
         target = self.dataset.expand_to_canonical(
-            self.dataset.mip_cache[0].reshape(-1, self.dataset.num_channels)
+            target_image[0].permute(1, 2, 0).reshape(-1, self.dataset.num_channels)
         ).float()
-        base = self.astc_superres_base_mip0.reshape(-1, channels).float()
+        base = base_image[0].permute(1, 2, 0).reshape(-1, channels)
         projected = []
         for begin in range(0, len(base), 65536):
             batch = base[begin : begin + 65536]
@@ -433,7 +444,7 @@ class ASTCAwareTrainer:
                     spec.quant_min, spec.quant_min + (spec.quant_step_count - 1) / spec.quant_step_count
                 )
             )
-        latent = torch.cat(projected).reshape(self.texture_height, self.texture_width, 4)
+        latent = torch.cat(projected).reshape(resolution, resolution, 4)
         rgba = (feature_to_unorm(latent, spec) * 255).round().byte().cpu().numpy()
         proposal = ASTCProxyGrid.from_astc(encode_seed(self.astc_codec, rgba), self.device)
         baseline = float(self._astc_proxy_objective())
@@ -466,10 +477,6 @@ class ASTCAwareTrainer:
                 or len(model.feature_grid_specs) != 1 or not self.super_resolution_enable):
             raise ValueError("Material projection requires one grid and a linear SR decoder without PE/feature gradients; "
                              "set astc_decoder_projection_interval: 0 for other configurations")
-        if (model.feature_grid_specs[0].max_resolution != self.texture_width
-                or self.texture_height != self.texture_width):
-            raise ValueError("Material projection requires feature and GT dimensions to match; "
-                             "set astc_decoder_projection_interval: 0 for other resolutions")
 
     def refine_gradient_codec(self, steps, learning_rate=0.001, blocks_per_batch=64):
         """Fit legal codec symbols with the decoder fixed over complete neighborhoods.

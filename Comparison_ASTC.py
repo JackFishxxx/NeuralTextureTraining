@@ -385,31 +385,36 @@ def _render_gt_mip0(dataset, texture_height: int, texture_width: int) -> torch.T
 
 @torch.no_grad()
 def _render_model_mip0(model, dataset, texture_height: int, texture_width: int, num_mips: int, device: str,
-                       superres_base_override: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """Mip0 plane; UV / row-col scatter aligned with train.py (tiled path uses the same math)."""
+                       superres_base_override: Optional[torch.Tensor] = None,
+                       inference_tile: int = 512) -> torch.Tensor:
+    """Render Mip0 in tiles, bounding decoder and feature-gradient temporaries."""
     mip = 0
     H = texture_height >> mip
     W = texture_width >> mip
-    rr, cc = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
     mip_f = float(mip) / max(1, num_mips - 1)
-    inp = torch.stack(
-        ((cc + 0.5) / W, (rr + 0.5) / H, torch.full_like(rr, mip_f)), dim=-1
-    ).to(device).reshape(-1, 3)
-    base = None
-    if getattr(model, "super_resolution_enable", False):
-        if superres_base_override is None:
-            base_data = dataset.superres_base_cache[mip].reshape(-1, dataset.num_channels)
-            base = dataset.expand_to_canonical(base_data).float()
-        else:
-            base_chw = superres_base_override[0] if superres_base_override.ndim == 4 else superres_base_override
-            base = base_chw.permute(1, 2, 0).reshape(-1, base_chw.shape[0]).float()
-        y = (base + model(torch.cat([inp, base], dim=1)).float()).clamp(0.0, 1.0)
-    else:
-        y = model(inp).float()
-    hwc = torch.empty(H, W, y.shape[-1], device=device, dtype=torch.float32)
-    fr = rr.reshape(-1).to(device=device, dtype=torch.long)
-    fc = cc.reshape(-1).to(device=device, dtype=torch.long)
-    hwc[fr, fc, :] = y
+    step = max(1, int(inference_tile) or max(H, W))
+    hwc = None
+    for h0 in range(0, H, step):
+        h1 = min(h0 + step, H)
+        for w0 in range(0, W, step):
+            w1 = min(w0 + step, W)
+            rr, cc = torch.meshgrid(torch.arange(h0, h1, device=device),
+                                    torch.arange(w0, w1, device=device), indexing="ij")
+            inp = torch.stack(((cc + 0.5) / W, (rr + 0.5) / H,
+                               torch.full_like(rr, mip_f)), dim=-1).reshape(-1, 3)
+            if getattr(model, "super_resolution_enable", False):
+                if superres_base_override is None:
+                    base_data = dataset.superres_base_cache[mip][h0:h1, w0:w1]
+                    base = dataset.expand_to_canonical(base_data.reshape(-1, dataset.num_channels)).float()
+                else:
+                    base_chw = superres_base_override[0] if superres_base_override.ndim == 4 else superres_base_override
+                    base = base_chw[:, h0:h1, w0:w1].permute(1, 2, 0).reshape(-1, base_chw.shape[0]).float()
+                y = (base + model(torch.cat([inp, base], dim=1)).float()).clamp(0.0, 1.0)
+            else:
+                y = model(inp).float()
+            if hwc is None:
+                hwc = torch.empty(H, W, y.shape[-1], device=device, dtype=torch.float32)
+            hwc[h0:h1, w0:w1] = y.reshape(h1-h0, w1-w0, -1)
     if getattr(model, "direct_diffuse_enabled", False) and hasattr(model, "render_direct_diffuse_mip"):
         direct = model.render_direct_diffuse_mip(mip, H, W)
         hwc[:, :, :3] = direct.squeeze(0).permute(1, 2, 0).to(hwc.dtype)
@@ -836,6 +841,7 @@ def run_astc_comparison_pipeline(
     curr_iter: Optional[int] = None,
     ref_astc_resolution: Optional[int] = None,
     eval_weights=None,
+    inference_tile: int = 512,
 ) -> Dict[str, Dict[str, Tuple[float, float, float]]]:
     block_tag = astc_codec.astc_block.lower()
     fntc_astc_name = f"fntc_astc_{astc_codec.astc_block}"
@@ -862,7 +868,8 @@ def run_astc_comparison_pipeline(
     quant_model = copy.deepcopy(model)
     quant_model.simulate_quantize()
     quant_model.eval()
-    pred_fntc = _render_model_mip0(quant_model, dataset, texture_height, texture_width, num_mips, device)
+    pred_fntc = _render_model_mip0(quant_model, dataset, texture_height, texture_width, num_mips, device,
+                                  inference_tile=inference_tile)
 
     astc_grid_model = copy.deepcopy(quant_model)
     apply_astc_to_feature_grids(astc_grid_model, astc_codec.roundtrip_rgba)
@@ -877,6 +884,7 @@ def run_astc_comparison_pipeline(
     pred_fntc_grid_astc = _render_model_mip0(
         astc_grid_model, dataset, texture_height, texture_width, num_mips, device,
         superres_base_override=astc_base,
+        inference_tile=inference_tile,
     )
 
     pred_traditional_astc = _traditional_baseline_resampled(

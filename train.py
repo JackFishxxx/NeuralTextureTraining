@@ -6,6 +6,7 @@ import datetime
 import argparse
 import json
 import copy
+import math
 from typing import List, Optional, Tuple
 from torchmetrics.image import (
     LearnedPerceptualImagePatchSimilarity,
@@ -36,6 +37,59 @@ from Comparison_ASTC import (
 )
 from Comparison_PBRScene import save_pbr_comparison
 from Core.ASTC_Aware.trainer import ASTCAwareTrainer
+
+
+class PhaseTrainingControl:
+    def __init__(self, phase, start, threshold=0.01):
+        self.phase, self.start = phase, start
+        self.threshold = threshold
+        self.best_score = -math.inf
+        self.best_iteration = None
+        self.best_state = None
+        self.previous_score = None
+        self.bad_windows = 0
+        self.lr_reductions = 0
+
+    def observe(self, model, score, iteration, allow_stop=True, adjust_lr=True):
+        if not math.isfinite(score):
+            raise ValueError(f"Nonfinite {self.phase} validation score: {score}")
+        if score > self.best_score:
+            self.best_score, self.best_iteration = score, iteration
+            self.best_state = {key: value.detach().cpu().clone()
+                               for key, value in model.state_dict().items()}
+        if not adjust_lr:
+            return False
+        previous = self.previous_score
+        self.previous_score = score
+        if previous is None or score - previous >= self.threshold:
+            self.bad_windows = 0
+            return False
+        if self.phase == "decoder":
+            group = model.optimizer.param_groups[0]
+            reduced = min(group["lr"], max(0.0001, group["lr"] * 0.25))
+            if reduced < group["lr"] * (1 - 1e-8):
+                group["lr"] = reduced
+                self.lr_reductions += 1
+                self.bad_windows = 0
+                print(f"[Decoder LR] iter {iteration}: lr={reduced:.7g}", flush=True)
+                return False
+        self.bad_windows += 1
+        return allow_stop and self.bad_windows >= 2
+
+    def restore(self, model):
+        if self.best_state is None:
+            return False
+        model.load_state_dict(self.best_state)
+        model._qat_param_cache.clear()
+        print(f"[Best Model] {self.phase}: restored iter {self.best_iteration}, "
+              f"PSNR={self.best_score:.6f}", flush=True)
+        return True
+
+    def summary(self):
+        return {"phase": self.phase, "start_iteration": self.start,
+                "best_iteration": self.best_iteration,
+                "best_psnr": self.best_score if self.best_iteration is not None else None,
+                "lr_reductions": self.lr_reductions}
 
 
 class Trainer(ASTCAwareTrainer):
@@ -123,10 +177,9 @@ class Trainer(ASTCAwareTrainer):
         self.early_stop = configs.early_stop
         self.early_stop_interval = configs.early_stop_interval
         self.early_stop_psnr_threshold = configs.early_stop_psnr_threshold
-        self._early_stop_eval_count = 0
-        self._early_stop_avg_psnr = 0
-        self._early_stop_prev_psnr = 0   # PSNR of the previous segment
         self._early_stop_phase_start_iter = 0
+        self._phase_control = None
+        self.last_training_stats = {}
 
         self.configs = configs
         self.model = model
@@ -336,12 +389,72 @@ class Trainer(ASTCAwareTrainer):
         return loss
 
 
+    def _reset_training_phase(self, phase, start):
+        self._phase_control = PhaseTrainingControl(
+            phase, start,
+            threshold=self.early_stop_psnr_threshold,
+        )
+        self._early_stop_phase_start_iter = start
+
+    def _validation_score(self, curr_iter, eval_psnr):
+        if not self.enable_astc_compare:
+            return float(eval_psnr)
+        metrics = self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path)
+        average = metrics.get(f"fntc_astc_{self.astc_block}", {}).get("average")
+        if average is None:
+            raise ValueError("Compressed validation metrics are required for best-model selection")
+        score = float(average[0])
+        self.writer.add_scalar('EarlyStop/compressed_PSNR', score, curr_iter)
+        return score
+
+    def _observe_training_score(self, score, iteration, **kwargs):
+        previous_best = self._phase_control.best_score
+        stop = self._phase_control.observe(self.model, score, iteration, **kwargs)
+        if self._phase_control.best_score > previous_best:
+            # Persist the raw best state atomically as well as retaining its CPU
+            # copy. Final exported checkpoints still use the standard save path.
+            filename = f"best_{self._phase_control.phase}.pth"
+            path = os.path.join(self.model_path, filename)
+            torch.save(self._phase_control.best_state, path + ".tmp")
+            os.replace(path + ".tmp", path)
+        return stop
+
+    def _complete_training_phase(self):
+        last_iter = self.model.current_iter
+        # Include the final updated model even when its iteration is not a check point.
+        score = self._validation_score(last_iter, self.eval(last_iter))
+        self._observe_training_score(score, last_iter, allow_stop=False, adjust_lr=False)
+        final_lr = self.model.optimizer.param_groups[0]["lr"]
+        restored_earlier = self._phase_control.best_iteration != last_iter
+        self._phase_control.restore(self.model)
+        self._astc_block_optimizer = None
+        self.last_training_stats = dict(self._phase_control.summary(),
+                                        completed_iteration=last_iter, final_decoder_lr=final_lr)
+        # Refresh terminal media and metrics after best-state restoration.
+        if restored_earlier:
+            self._validation_score(last_iter, self.eval(last_iter))
+        if self.enable_pbr_compare:
+            self.run_pbr_comparison(curr_iter=last_iter, output_root=self.media_path)
+        self.model.save(last_iter, self.model_path)
+        self._log_checkpoint_interval(last_iter)
+        self._log_total_training_time()
+
     def train(self) -> None:
 
         loss_weights = torch.tensor(self.output_loss_weights, device=self.device, dtype=torch.float32)
+        if self.model._decoder_adaptation_features is None:
+            codec_start = int(self.max_iter * self.astc_codec_start_frac)
+            phase = ("warmup" if self.configs.astc_codec_in_loop_enable and self.trained_iter < codec_start
+                     else "codec" if self.configs.astc_codec_in_loop_enable else "feature")
+            self._reset_training_phase(phase, self.trained_iter)
         for curr_iter in range(self.trained_iter, self.max_iter):
 
             codec_due = self._begin_astc_step(curr_iter)
+            if codec_due and self._phase_control.phase == "warmup":
+                self._reset_training_phase("codec", curr_iter)
+                # Reset plateau history when the input distribution changes.
+                self.model.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    self.model.optimizer, factor=0.85, patience=2000)
             self.model.optimizer.zero_grad()
 
             # update model's current iteration for noise annealing
@@ -403,7 +516,8 @@ class Trainer(ASTCAwareTrainer):
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self._step_astc_parameters(codec_due)
             self.model.optimizer.step()
-            self.model.scheduler.step(metrics=loss_value)
+            if self.model.scheduler is not None:
+                self.model.scheduler.step(metrics=loss_value)
 
             # print(self.model.optimizer.param_groups[0]['lr'], self.model.optimizer.param_groups[1]['lr'])
 
@@ -418,48 +532,20 @@ class Trainer(ASTCAwareTrainer):
             if (curr_iter - self._early_stop_phase_start_iter) % self.eval_interval == 0:
                 eval_psnr = self.eval(curr_iter)
 
-                # early stopping check (PSNR-based, evaluated at early_stop_interval)
-                if self.early_stop:
-                    self._early_stop_avg_psnr += eval_psnr
-                    self._early_stop_eval_count += 1
-                    if (curr_iter > self._early_stop_phase_start_iter
-                            and (curr_iter - self._early_stop_phase_start_iter) % self.early_stop_interval == 0):
-                        if self.enable_astc_compare:
-                            # Use fntc_astc_{block} average PSNR as early stopping metric
-                            astc_metrics = self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path)
-                            _astc_already_ran = True
-                            fntc_astc_name = f"fntc_astc_{self.astc_block}"
-                            fntc_astc_avg = astc_metrics.get(fntc_astc_name, {}).get("average")
-                            if fntc_astc_avg is not None:
-                                current_psnr = fntc_astc_avg[0]  # (psnr, ssim, lpips)
-                                self.writer.add_scalar(f'EarlyStop/{fntc_astc_name}_avg_PSNR', current_psnr, curr_iter)
-                            else:
-                                # Fallback to eval PSNR if ASTC metrics unavailable
-                                current_psnr = self._early_stop_avg_psnr / self._early_stop_eval_count
-                            psnr_improvement = current_psnr - self._early_stop_prev_psnr
-                        else:
-                            self._early_stop_avg_psnr /= self._early_stop_eval_count
-                            current_psnr = self._early_stop_avg_psnr
-                            psnr_improvement = current_psnr - self._early_stop_prev_psnr
-                        if self.enable_pbr_compare:
-                            self.run_pbr_comparison(curr_iter=curr_iter, output_root=self.media_path)
-                            _pbr_already_ran = True
-                        label = f"{fntc_astc_name} avg PSNR" if self.enable_astc_compare else "PSNR"
-                        print(f"[EarlyStopCheck] Iter {curr_iter}: {label} = {current_psnr:.4f} dB, "
-                              f"improvement = {psnr_improvement:.4f} dB, threshold = {self.early_stop_psnr_threshold:.4f} dB")
-                        if psnr_improvement < self.early_stop_psnr_threshold:
-                            print(f"[EarlyStopCheck] PSNR improvement ({psnr_improvement:.4f} dB) < threshold "
-                                  f"({self.early_stop_psnr_threshold:.4f} dB). Stopping training at iter {curr_iter}.")
-                            # save model after all terminal comparisons
-                            self.model.save(curr_iter, self.model_path)
-                            self._log_checkpoint_interval(curr_iter)
-                            # When enable_astc_compare is True, ASTC comparison was already run above for the metric check.
-                            self._log_total_training_time()
-                            return
-                        else:
-                            self._early_stop_prev_psnr = current_psnr
-                            self._early_stop_avg_psnr = 0
-                            self._early_stop_eval_count = 0
+                if (curr_iter > self._early_stop_phase_start_iter
+                        and (curr_iter - self._early_stop_phase_start_iter) % self.early_stop_interval == 0):
+                    current_psnr = self._validation_score(curr_iter, eval_psnr)
+                    _astc_already_ran = self.enable_astc_compare
+                    self.writer.add_scalar('LR/decoder', self.model.optimizer.param_groups[0]["lr"], curr_iter)
+                    stop = self._observe_training_score(
+                        current_psnr, curr_iter,
+                        allow_stop=self.early_stop and self._phase_control.phase != "warmup",
+                    )
+                    print(f"[EarlyStopCheck] {self._phase_control.phase} iter {curr_iter}: "
+                          f"PSNR={current_psnr:.4f}, stagnant_windows={self._phase_control.bad_windows}")
+                    if stop:
+                        self._complete_training_phase()
+                        return
 
 
                 # print(self.model.optimizer.param_groups[0]['lr'], self.model.optimizer.param_groups[1]['lr'])
@@ -481,7 +567,7 @@ class Trainer(ASTCAwareTrainer):
                 torch.cuda.empty_cache()
                 tcnn.free_temporary_memory()
 
-        self._log_total_training_time()
+        self._complete_training_phase()
 
     def _cuda_trim_eval_mem(self, synchronize: bool = False) -> None:
         if self.device != "cuda":

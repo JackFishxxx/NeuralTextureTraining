@@ -249,11 +249,17 @@ diffuse(3) | normal(3 或 2) | roughness(1) | occlusion(1) | metallic(1) | specu
 
 | 参数 | 默认值 | 说明 |
 |------|:------:|------|
-| `--early_stop` | `False` | 是否启用早停 |
+| `--early_stop` | `True` | 是否启用早停，可用 `--no-early_stop` 关闭 |
 | `--early_stop_interval` | `5000` | 计算 PSNR 提升的迭代间隔 |
 | `--early_stop_psnr_threshold` | `0.01` | 最小 PSNR 提升阈值（dB） |
 
-双阶段训练默认启用（`two_stage_finetune_enable`）：第一阶段以 0 隐藏层、无 positional encoding 的网络联合训练 feature texture 和 decoder；第二阶段保留第一阶段 feature texture，固定其量化及 ASTC 压缩解压后的 feature，重新初始化由 `n_hidden_layers`、`n_neurons`、`n_frequencies` 指定的 decoder，仅训练网络。第二阶段最多执行 `two_stage_finetune_max_steps` 步，学习率倍率由 `two_stage_finetune_lr_multiplier` 指定。两阶段复用 `early_stop`、`early_stop_interval` 和 `early_stop_psnr_threshold`，第二阶段重新统计早停窗口；关闭早停时，两阶段分别运行至步数上限。
+双阶段训练默认启用（`two_stage_finetune_enable`）：第一阶段使用 0 隐藏层、无 PE/feature 差分的 decoder 学习表示；第二阶段冻结 ASTC 码流和压缩 base，随机初始化配置指定的 decoder，仅训练网络。
+
+warmup 不早停，codec 启动后重置验证窗口。第二阶段平台期先将学习率乘 0.25，最低降至 0.0001；达到下限后，连续两个停滞窗口才停止。关闭早停仍执行 LR 调整并跑满步数。阶段结束恢复压缩验证 PSNR 最佳的模型；最终导出编号表示实际完成迭代，最佳权重来源记录在已有 `two_stage_finetune.json` 的 `baseline_validation` 和 `adaptation.validation` 中。
+
+训练行为回归并入现有测试：`python -m unittest discover -s tests -v`（原生 codec 检查需 CUDA）。
+
+每次验证刷新最佳分数时原子写入 `models/best_<phase>.pth`；常规最终导出仍在 `models/train_result_<完成迭代>/`，包含恢复后的最佳权重。
 
 ### 量化感知训练（QAT）
 

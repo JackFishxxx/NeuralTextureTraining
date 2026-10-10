@@ -247,11 +247,17 @@ Training supports **automatic PSNR-based early stopping** to avoid wasting time 
 
 | Argument | Default | Description |
 |----------|:-------:|-------------|
-| `--early_stop` | `False` | Enable early stopping |
+| `--early_stop` | `True` | Enable early stopping; disable with `--no-early_stop` |
 | `--early_stop_interval` | `5000` | Iterations per PSNR evaluation segment |
 | `--early_stop_psnr_threshold` | `0.01` | Minimum PSNR improvement threshold (dB) |
 
-Two-stage training is enabled by default (`two_stage_finetune_enable`). Stage one jointly trains feature textures and a decoder with zero hidden layers and no positional encoding. Stage two preserves the feature textures, uses their fixed quantized ASTC round-trip features, and trains a newly initialized decoder configured by `n_hidden_layers`, `n_neurons`, and `n_frequencies`. Its step limit and learning-rate multiplier are `two_stage_finetune_max_steps` and `two_stage_finetune_lr_multiplier`. Both stages share `early_stop`, `early_stop_interval`, and `early_stop_psnr_threshold`, with a fresh early-stop window for stage two. With early stopping disabled, both stages run to their respective step limits.
+Two-stage training is enabled by default. Stage one uses an affine decoder without PE or feature differences. Stage two freezes the ASTC bitstream and compressed base, then fits a randomly initialized decoder with the configured architecture.
+
+Warmup cannot stop early; codec activation resets the validation window. A decoder plateau multiplies LR by 0.25 down to 0.0001, then two stagnant windows stop training. Disabling early stopping still adjusts LR and runs the complete budget. Each phase restores the best compressed-validation PSNR state. Final checkpoint iterations denote completed training; `baseline_validation` and `adaptation.validation` in the existing `two_stage_finetune.json` identify the selected weights.
+
+Run `python -m unittest discover -s tests -v` for the behavior checks (native codec tests require CUDA).
+
+Each new validation best is saved atomically to `models/best_<phase>.pth`; standard final exports under `models/train_result_<completed_iteration>/` contain the restored best weights.
 
 ### Quantization-Aware Training (QAT)
 

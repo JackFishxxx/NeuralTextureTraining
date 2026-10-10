@@ -486,7 +486,7 @@ def get_args():
                         help='YAML mapping of per-texture loss/eval weights')
 
     ### ---------- early stopping configs ---------- ###
-    parser.add_argument('--early_stop', action='store_true', default=True,
+    parser.add_argument('--early_stop', action=argparse.BooleanOptionalAction, default=True,
                         help='enable early stopping when PSNR improvement is below threshold (default: enabled)')
     parser.add_argument('--early_stop_interval', type=int, default=5000,
                         help='number of iterations per segment for early stopping PSNR evaluation')

@@ -10,7 +10,6 @@ import json
 import os
 import math
 import time
-from types import SimpleNamespace
 
 import torch
 
@@ -43,9 +42,8 @@ def finetune_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5
     fixed = [grid.params.detach().clone() for grid in decoded.feature_grids]
     del decoded
     fields = ("trained_iter", "max_iter", "eval_interval", "save_interval", "early_stop",
-              "_early_stop_phase_start_iter", "_early_stop_eval_count",
-              "_early_stop_avg_psnr", "_early_stop_prev_psnr",
-              "enable_astc_compare", "enable_pbr_compare")
+              "_early_stop_phase_start_iter",
+              "enable_astc_compare", "enable_pbr_compare", "_phase_control")
     previous = {name: getattr(trainer, name) for name in fields}
     old_scheduler = model.scheduler
     old_codec = trainer.configs.astc_codec_in_loop_enable
@@ -65,21 +63,13 @@ def finetune_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5
                 for name in trainer.dataset.available_textures
             ], dim=-1)
         trainer.configs.astc_codec_in_loop_enable = False
-        # Use a fixed learning rate for the newly initialized decoder.
         model.optimizer.param_groups[0]["lr"] *= lr_multiplier
-        model.scheduler = SimpleNamespace(step=lambda **kwargs: None)
+        # Validation-window LR reductions replace the per-batch scheduler.
+        model.scheduler = None
         trainer.trained_iter = model.current_iter + 1
         trainer.max_iter = trainer.trained_iter + steps
-        trainer._early_stop_phase_start_iter = trainer.trained_iter
-        if early_stop:
-            trainer._early_stop_eval_count = 0
-            trainer._early_stop_avg_psnr = 0.0
-            trainer._early_stop_prev_psnr = 0.0
-            trainer.early_stop = True
-            trainer.enable_astc_compare = True
-            trainer.enable_pbr_compare = True
-        else:
-            trainer.early_stop = False
+        trainer._reset_training_phase("decoder", trainer.trained_iter)
+        trainer.early_stop = early_stop
         model.train()
         trainer.train()
         torch.cuda.synchronize()
@@ -93,7 +83,8 @@ def finetune_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5
         return {"steps": completed_steps, "max_steps": steps,
                 "early_stopped": completed_steps < steps,
                 "lr_multiplier": lr_multiplier,
-                "seconds": time.perf_counter() - started, "frozen_latent_verified": True}
+                "seconds": time.perf_counter() - started, "frozen_latent_verified": True,
+                "validation": trainer.last_training_stats}
     finally:
         model._decoder_adaptation_features = None
         model.scheduler = old_scheduler
@@ -132,6 +123,7 @@ def train_two_stage(params, config=None):
         print("[Two Stage] feature stage: 0 hidden layers, no PE or feature gradients", flush=True)
         trainer.train()
         baseline_iteration = int(trainer.model.current_iter)
+        baseline_validation = trainer.last_training_stats
         trainer.model.save(baseline_iteration, trainer.model_path)
         baseline_astc = trainer.run_astc_comparison(curr_iter=baseline_iteration)
         baseline_pbr = trainer.run_pbr_comparison(curr_iter=baseline_iteration) \
@@ -170,6 +162,7 @@ def train_two_stage(params, config=None):
             if trainer.enable_pbr_compare else None
         results = {
             "baseline_iteration": baseline_iteration,
+            "baseline_validation": baseline_validation,
             "adapted_iteration": final_iteration,
             "stage_one": {"hidden_layers": 0, "pe_frequencies": 0, "feature_gradient_count": 0},
             "stage_two": {"hidden_layers": target.n_hidden_layers,

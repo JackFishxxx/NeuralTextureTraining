@@ -378,6 +378,8 @@ for the output layer.
 
 ### Neural Texture Super-Resolution
 
+Base upsampling and continuous queries in both stages use texel-centered bilinear repeat addressing, including opposite-edge texels when interpolating across a seam. ASTC comparisons and material projection follow the same convention. The existing upsampled base cache, decoder input size and texture query counts are retained.
+
 Set `super_resolution_enable: true` and configure `super_resolution_base_resolution` to train
 residual super-resolution. The source mip at that resolution is bilinearly upsampled and provided
 alongside the feature-grid samples; the network predicts `GT - bilinear_base`. Training, inference,

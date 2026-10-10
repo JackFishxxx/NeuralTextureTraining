@@ -368,6 +368,8 @@ bias，并增加 `decoder_output_bias` 作为输出层 bias。这样不依赖 ti
 
 ### 神经纹理超分
 
+base 上采样及两阶段连续查询均使用 texel-center bilinear＋wrap/repeat，跨边界插值使用另一侧纹素。ASTC 比较和材质投影遵循同一约定；保留现有上采样 base cache，不增加网络输入或纹理查询数量。
+
 在 `config.yaml` 中设置 `super_resolution_enable: true` 并指定
 `super_resolution_base_resolution` 可启用超分残差训练。该分辨率的原始纹理 mip 作为 base，
 经双线性上采样后与 feature grid 特征拼接，网络拟合 `GT - bilinear_base`。评测、推理和 ASTC

@@ -4,6 +4,7 @@ import math
 import torch
 import torch.nn.functional as F
 from Comparison_ASTC import ASTCCodec, roundtrip_feature_blocks, _astc_roundtrip_superres_base_mip0
+from dataset import bilinear_repeat, resize_bilinear_repeat
 
 
 class ASTCAwareTrainer:
@@ -332,21 +333,7 @@ class ASTCAwareTrainer:
         clean_base = self.dataset.expand_to_canonical(
             self.dataset.get_superres_base_continuous(sample_xy, mips)
         ).to(torch.float16)
-        astc_base = self.astc_superres_base_mip0.permute(2, 0, 1)[None].float()
-        sample_grid = (uvs * 2.0 - 1.0).view(1, -1, 1, 2)
-        codec_base = (
-            F.grid_sample(
-                astc_base,
-                sample_grid,
-                mode="bilinear",
-                padding_mode="border",
-                align_corners=False,
-            )
-            .squeeze(0)
-            .squeeze(-1)
-            .transpose(0, 1)
-            .to(torch.float16)
-        )
+        codec_base = self._astc_base_at_uv(uvs)
         return (
             uvs,
             gt,
@@ -359,12 +346,9 @@ class ASTCAwareTrainer:
         if not self.super_resolution_enable:
             return None
         return (
-            F.grid_sample(
+            bilinear_repeat(
                 self.astc_superres_base_mip0.permute(2, 0, 1)[None].float(),
-                (uv * 2 - 1).view(1, -1, 1, 2),
-                mode="bilinear",
-                padding_mode="border",
-                align_corners=False,
+                uv.view(1, -1, 1, 2),
             )
             .squeeze(0)
             .squeeze(-1)
@@ -425,8 +409,7 @@ class ASTCAwareTrainer:
         if target_image.shape[-2:] != (resolution, resolution):
             target_image = F.interpolate(target_image, size=(resolution, resolution),
                                          mode="bilinear", align_corners=False)
-            base_image = F.interpolate(base_image, size=(resolution, resolution),
-                                       mode="bilinear", align_corners=False)
+            base_image = resize_bilinear_repeat(base_image, (resolution, resolution))
         target = self.dataset.expand_to_canonical(
             target_image[0].permute(1, 2, 0).reshape(-1, self.dataset.num_channels)
         ).float()

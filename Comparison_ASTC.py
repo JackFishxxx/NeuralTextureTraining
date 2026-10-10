@@ -25,6 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 import torchvision.transforms.functional as TF
 from feature_grid import feature_tensor_to_int, int_to_feature_tensor, quantize_feature_tensor
 from normal_encoding import decode_normal, normal_angular_psnr
+from dataset import resize_bilinear_repeat
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +237,7 @@ def _astc_roundtrip_superres_base_mip0(dataset, roundtrip_rgba, base_resolution:
         roundtrip_rgba,
     )
     if compressed.shape[-2:] != (h0, w0):
-        compressed = F.interpolate(compressed, size=(h0, w0), mode="bilinear", align_corners=False)
+        compressed = resize_bilinear_repeat(compressed, (h0, w0))
     return compressed.clamp(0.0, 1.0)
 
 

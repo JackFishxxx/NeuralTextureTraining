@@ -251,9 +251,10 @@ Training supports **automatic PSNR-based early stopping** to avoid wasting time 
 | `--early_stop_interval` | `5000` | Iterations per PSNR evaluation segment |
 | `--early_stop_psnr_threshold` | `0.01` | Minimum PSNR improvement threshold (dB) |
 
-Two-stage training is enabled by default. Stage one uses an affine decoder without PE or feature differences. Stage two freezes the ASTC bitstream and compressed base, then fits a randomly initialized decoder with the configured architecture.
+Multi-stage training (`multi_stage_training_enable`, on by default; entry: `python -m Core.Multi_Stage_Training.multi_stage_training`) runs named stages: `representation` learns affine-decoded ASTC features; `decoder` fits the configured network on frozen features (`multi_stage_training_decoder_steps`, `multi_stage_training_decoder_lr_multiplier`); `layout_refit` refines the representation with that decoder fixed.
+`multi_stage_training_layout_refit_steps` (default 1000; 0 skips refinement) checks legal ASTC block layouts every 100 steps and at the final step, retaining non-regressing material/enabled-PBR PSNR/SSIM/LPIPS results without changing inference; `multi_stage_training.json` stores an extensible `stages` list, per-stage metrics/checkpoints and `final_metrics`.
 
-Warmup cannot stop early; codec activation resets the validation window. A decoder plateau multiplies LR by 0.25 down to 0.0001, then two stagnant windows stop training. Disabling early stopping still adjusts LR and runs the complete budget. Each phase restores the best compressed-validation PSNR state. Final checkpoint iterations denote completed training; `baseline_validation` and `adaptation.validation` in the existing `two_stage_finetune.json` identify the selected weights.
+Warmup cannot stop early; codec activation resets the validation window. A decoder plateau multiplies LR by 0.25 down to 0.0001, then two stagnant windows stop training. Disabling early stopping still adjusts LR and runs the complete budget. Each phase restores the best compressed-validation PSNR state. Final checkpoint iterations denote completed work; each named stage in `multi_stage_training.json` records its validation or refinement details and selected checkpoint.
 
 Run `python -m unittest discover -s tests -v` for the behavior checks (native codec tests require CUDA).
 
@@ -321,7 +322,7 @@ difference to the decoder input. The differences do not add feature bitstream by
 but they increase decoder input size and sampling cost. Checkpoints and
 `network_data.npz` record the direction count; inference must use the same value.
 
-The two-stage entry disables gradient inputs during representation learning and
+The multi-stage training entry disables gradient inputs during representation learning and
 enables the configured count during decoder adaptation. In single-stage training,
 gradients participate in representation learning directly; set
 `astc_decoder_projection_interval: 0` because pointwise material projection does

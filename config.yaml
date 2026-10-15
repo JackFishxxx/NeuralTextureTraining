@@ -53,11 +53,13 @@ astc_codec_in_loop_interval: 100  # astcenc only; CUDA runs every iteration
 astc_codec_update_latent: false  # astcenc identity STE; CUDA learns codec parameters
 
 # ---------- trainer configs ----------
-# Stage1 training inputs: feature grid + super resolution base + mip level + bias
-# Stage2 training inputs: feature grid + feature gradients + positional encoding + SR base + mip level + bias
-two_stage_finetune_enable: true
-two_stage_finetune_max_steps: 50000
-two_stage_finetune_lr_multiplier: 1.0
+# representation: feature grid + SR base + mip + bias
+# decoder: frozen ASTC features + feature differences + optional PE + SR base + mip + bias
+# layout_refit: frozen decoder, offline latent/layout optimization
+multi_stage_training_enable: true
+multi_stage_training_decoder_steps: 50000
+multi_stage_training_decoder_lr_multiplier: 1.0
+multi_stage_training_layout_refit_steps: 1000  # offline latent/layout pass; 0 disables
 
 # ---------- PBR scene comparison configs ----------
 enable_pbr_compare: true

@@ -1,8 +1,7 @@
-"""Train a zero-layer feature representation, then a new decoder on fixed ASTC features.
+"""Multi-stage training for ASTC: representation learning, decoder fitting and layout refitting.
 
-Stage two uses n_neurons, n_hidden_layers and positional encoding from the
-resolved config. Both stages honor early stopping. Run with the same options
-as train.py, for example: python two_stage_finetune.py --data_dir data/test
+Run as a module or through train.py with the same CLI/YAML options:
+    python -m Core.Multi_Stage_Training.multi_stage_training --data_dir data/test
 """
 
 import copy
@@ -18,8 +17,8 @@ from model import TCNNModel
 from train import Trainer
 
 
-def finetune_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5,
-                          early_stop: bool = False):
+def fit_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5,
+                     early_stop: bool = False):
     """Keep source latents intact while fitting their fixed ASTC-decoded inputs."""
     from Comparison_ASTC import apply_astc_to_feature_grids
 
@@ -102,80 +101,87 @@ def finetune_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5
         model._qat_param_cache_iter = -1
 
 
-def train_two_stage(params, config=None):
+def _record_stage(trainer, stages, name, start_iteration, details):
+    """Save one named stage using a common checkpoint and metric schema."""
+    model = trainer.model
+    iteration = int(model.current_iter)
+    model.save(iteration, trainer.model_path)
+    astc = trainer.run_astc_comparison(curr_iter=iteration)
+    pbr = (trainer.run_pbr_comparison(curr_iter=iteration, return_metrics=True)[1]
+           if trainer.enable_pbr_compare else None)
+    record = {
+        "name": name, "status": "completed",
+        "start_iteration": start_iteration, "end_iteration": iteration,
+        "checkpoint": os.path.join(trainer.model_path, f"train_result_{iteration}", "model.pth"),
+        "model": {"hidden_layers": model.n_hidden_layers, "neurons": model.n_neurons,
+                  "pe_frequencies": model.n_frequencies,
+                  "feature_gradient_count": model.feature_gradient_count},
+        "metrics": {"astc": astc, "pbr": pbr}, "details": details,
+    }
+    stages.append(record)
+    return record
+
+
+def run_multi_stage_training(params, config=None):
+    """Run representation, decoder and optional layout stages without numeric stage names."""
     target = config if config is not None else Config(params)
     if not target.mip0_only or target.direct_diffuse_infer_mode != "disable":
-        raise ValueError("Two-stage ASTC training requires Mip0 and direct diffuse disabled")
-    if target.n_hidden_layers < 0 or target.two_stage_finetune_max_steps < 1:
-        raise ValueError("Stage two requires nonnegative hidden layers and positive fine-tune steps")
+        raise ValueError("Multi-stage ASTC training requires Mip0 and direct diffuse disabled")
+    if target.n_hidden_layers < 0 or target.multi_stage_training_decoder_steps < 1:
+        raise ValueError("Decoder stage requires nonnegative hidden layers and positive fitting steps")
     if target.early_stop and (target.early_stop_interval <= 0
                               or target.early_stop_interval % target.eval_interval != 0):
         raise ValueError("early_stop_interval must be positive and a multiple of eval_interval")
 
-    first = copy.deepcopy(target)
-    first.n_hidden_layers = 0
-    first.n_frequencies = 0
-    # Learn the ASTC representation with the established pointwise projection;
-    # neighborhood differences belong to the configured decoder adaptation.
-    first.feature_gradient_count = 0
-    trainer = Trainer(params, config_override=first)
+    representation_config = copy.deepcopy(target)
+    representation_config.n_hidden_layers = 0
+    representation_config.n_frequencies = 0
+    representation_config.feature_gradient_count = 0
+    trainer = Trainer(params, config_override=representation_config)
+    stages = []
     try:
-        print("[Two Stage] feature stage: 0 hidden layers, no PE or feature gradients", flush=True)
+        print("[Multi Stage Training] representation: affine decoder, no PE or feature differences", flush=True)
+        start = trainer.trained_iter
         trainer.train()
-        baseline_iteration = int(trainer.model.current_iter)
-        baseline_validation = trainer.last_training_stats
-        trainer.model.save(baseline_iteration, trainer.model_path)
-        baseline_astc = trainer.run_astc_comparison(curr_iter=baseline_iteration)
-        baseline_pbr = trainer.run_pbr_comparison(curr_iter=baseline_iteration) \
-            if trainer.enable_pbr_compare else None
+        representation = _record_stage(trainer, stages, "representation", start,
+                                       {"validation": trainer.last_training_stats})
+        os.replace(os.path.join(trainer.save_path, "resolved_config.json"),
+                   os.path.join(trainer.save_path, "representation_config.json"))
 
         source = trainer.model
-        target.num_mips = first.num_mips
-        target.num_channels = first.num_channels
-        target.pos_encoding_reference_edge = first.pos_encoding_reference_edge
-        second = TCNNModel(target)
-        second.astc_proxy = copy.deepcopy(source.astc_proxy)
-        for parameter in second.astc_proxy.parameters():
-            parameter.requires_grad_(False)
+        target.num_mips = representation_config.num_mips
+        target.num_channels = representation_config.num_channels
+        target.pos_encoding_reference_edge = representation_config.pos_encoding_reference_edge
+        decoder = TCNNModel(target)
+        decoder.astc_proxy = copy.deepcopy(source.astc_proxy)
+        decoder.astc_proxy.requires_grad_(False)
         with torch.no_grad():
-            for old_grid, new_grid in zip(source.feature_grids, second.feature_grids):
+            for old_grid, new_grid in zip(source.feature_grids, decoder.feature_grids):
                 new_grid.params.copy_(old_grid.params)
-        second.current_iter = baseline_iteration
-        trainer.model = second
-        trainer.configs = target
-        print(
-            f"[Two Stage] decoder stage: {target.n_hidden_layers} hidden layers, "
-            f"width {target.n_neurons}, {target.n_frequencies} PE frequencies; "
-            f"{target.feature_gradient_count} feature gradients; "
-            f"source latent frozen at iter {baseline_iteration}", flush=True,
-        )
-        stats = finetune_astc_decoder(
-            trainer,
-            steps=target.two_stage_finetune_max_steps,
-            lr_multiplier=target.two_stage_finetune_lr_multiplier,
-            early_stop=target.early_stop,
-        )
-        final_iteration = int(second.current_iter)
-        second.save(final_iteration, trainer.model_path)
-        adapted_astc = trainer.run_astc_comparison(curr_iter=final_iteration)
-        adapted_pbr = trainer.run_pbr_comparison(curr_iter=final_iteration) \
-            if trainer.enable_pbr_compare else None
-        results = {
-            "baseline_iteration": baseline_iteration,
-            "baseline_validation": baseline_validation,
-            "adapted_iteration": final_iteration,
-            "stage_one": {"hidden_layers": 0, "pe_frequencies": 0, "feature_gradient_count": 0},
-            "stage_two": {"hidden_layers": target.n_hidden_layers,
-                          "neurons": target.n_neurons,
-                          "pe_frequencies": target.n_frequencies,
-                          "feature_gradient_count": target.feature_gradient_count},
-            "baseline": baseline_astc,
-            "baseline_pbr": baseline_pbr,
-            "adapted": adapted_astc,
-            "adapted_pbr": adapted_pbr,
-            "adaptation": stats,
-        }
-        with open(os.path.join(trainer.save_path, "two_stage_finetune.json"), "w", encoding="utf-8") as output:
+        decoder.current_iter = representation["end_iteration"]
+        trainer.model, trainer.configs = decoder, target
+        trainer._write_resolved_config(target)
+        print(f"[Multi Stage Training] decoder: {target.n_hidden_layers} hidden layers, width {target.n_neurons}, "
+              f"{target.n_frequencies} PE frequencies, {target.feature_gradient_count} feature differences", flush=True)
+        start = decoder.current_iter + 1
+        details = fit_astc_decoder(trainer, steps=target.multi_stage_training_decoder_steps,
+                                   lr_multiplier=target.multi_stage_training_decoder_lr_multiplier,
+                                   early_stop=target.early_stop)
+        fitted = _record_stage(trainer, stages, "decoder", start, details)
+
+        from .layout import refit_layout
+        print("[Multi Stage Training] layout_refit", flush=True)
+        details = refit_layout(trainer, target.multi_stage_training_layout_refit_steps)
+        if details['applied']:
+            start = decoder.current_iter + 1
+            decoder.current_iter += details['steps']
+            final = _record_stage(trainer, stages, "layout_refit", start, details)
+        else:
+            stages.append({"name": "layout_refit", "status": "skipped", "details": details})
+            final = fitted
+        results = {"stages": stages, "final_iteration": final["end_iteration"],
+                   "final_checkpoint": final["checkpoint"], "final_metrics": final["metrics"]}
+        with open(os.path.join(trainer.save_path, "multi_stage_training.json"), "w", encoding="utf-8") as output:
             json.dump(results, output, indent=2)
         return results
     finally:
@@ -183,4 +189,4 @@ def train_two_stage(params, config=None):
 
 
 if __name__ == "__main__":
-    train_two_stage(get_args())
+    run_multi_stage_training(get_args())

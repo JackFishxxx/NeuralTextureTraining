@@ -906,7 +906,8 @@ class Trainer(ASTCAwareTrainer):
         )
 
     @torch.no_grad()
-    def run_pbr_comparison(self, curr_iter: int = None, output_root: str = None) -> str:
+    def run_pbr_comparison(self, curr_iter: int = None, output_root: str = None,
+                           return_metrics: bool = False):
         """Render the inferred and source Mip0 texture sets in one fixed PBR scene."""
         if output_root is None:
             output_root = self.infer_path if hasattr(self, "infer_path") else self.media_path
@@ -979,7 +980,7 @@ class Trainer(ASTCAwareTrainer):
                 f"PSNR={astc_metrics[0]:.4f}, SSIM={astc_metrics[1]:.4f}, LPIPS={astc_metrics[2]:.4f}; "
                 f"output={path}"
             )
-            return path
+            return (path, metrics) if return_metrics else path
         finally:
             self.model.train(was_training)
 
@@ -1013,9 +1014,9 @@ if __name__ == "__main__":
 
     configs = Config(params)
 
-    if configs.two_stage_finetune_enable and params.mode == "train" and not configs.groups_batching:
-        from two_stage_finetune import train_two_stage
-        train_two_stage(params, configs)
+    if configs.multi_stage_training_enable and params.mode == "train" and not configs.groups_batching:
+        from Core.Multi_Stage_Training.multi_stage_training import run_multi_stage_training
+        run_multi_stage_training(params, configs)
         sys.exit(0)
 
     if configs.groups_batching:
@@ -1028,9 +1029,9 @@ if __name__ == "__main__":
             print(f"{'='*60}")
             group_cfg = configs.make_group_config(group_name)
             try:
-                if params.mode == "train" and group_cfg.two_stage_finetune_enable:
-                    from two_stage_finetune import train_two_stage
-                    train_two_stage(params, group_cfg)
+                if params.mode == "train" and group_cfg.multi_stage_training_enable:
+                    from Core.Multi_Stage_Training.multi_stage_training import run_multi_stage_training
+                    run_multi_stage_training(params, group_cfg)
                 else:
                     trainer = Trainer(params, config_override=group_cfg)
                     if params.mode == "train":

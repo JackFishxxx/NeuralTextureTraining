@@ -161,7 +161,7 @@ class Config():
         self.astc_codec_update_latent = (
             bool(params.astc_codec_update_latent) if backend == "astcenc" else False
         )
-        # The two-stage trainer temporarily disables codec updates during adaptation.
+        # Multi-stage decoder fitting temporarily disables codec updates.
         self.astc_codec_in_loop_enable = self.astc_aware_enable and params.mode == "train"
         self.astc_codec_in_loop_interval = 1 if backend == "astc_differentiable_proxy" else interval
         self.astc_decoder_projection_interval = projection
@@ -172,11 +172,16 @@ class Config():
             raise ValueError("feature_gradient_count must be 0, 2, 4, 8 or 24")
 
         ### ---------- trainer configs ---------- ###
-        self.two_stage_finetune_enable = bool(getattr(params, "two_stage_finetune_enable", True))
-        self.two_stage_finetune_max_steps = int(getattr(params, "two_stage_finetune_max_steps", 5000))
-        self.two_stage_finetune_lr_multiplier = float(
-            getattr(params, "two_stage_finetune_lr_multiplier", 1.0)
+        self.multi_stage_training_enable = bool(params.multi_stage_training_enable)
+        self.multi_stage_training_decoder_steps = int(params.multi_stage_training_decoder_steps)
+        self.multi_stage_training_decoder_lr_multiplier = float(
+            params.multi_stage_training_decoder_lr_multiplier
         )
+        self.multi_stage_training_layout_refit_steps = int(params.multi_stage_training_layout_refit_steps)
+        if self.multi_stage_training_decoder_steps < 1 or self.multi_stage_training_layout_refit_steps < 0:
+            raise ValueError("Decoder steps must be positive and layout refit steps nonnegative")
+        if not math.isfinite(self.multi_stage_training_decoder_lr_multiplier) or self.multi_stage_training_decoder_lr_multiplier <= 0:
+            raise ValueError("Decoder learning-rate multiplier must be finite and positive")
 
         self.max_iter = params.max_iter
         self.batch_size = params.batch_size
@@ -444,15 +449,17 @@ def get_args():
     group = parser.add_argument_group("feature gradient configs")
     group.add_argument('--feature_gradient_count', type=int, choices=[0, 2, 4, 8, 24], default=0,
                        help='feature differences: 0 off, 2 right/down, 4 axial, 8 3x3, 24 5x5; '
-                            'two-stage training applies them only in stage two')
+                            'multi-stage training applies them during decoder fitting')
 
     ### ---------- trainer configs ---------- ###
-    parser.add_argument('--two_stage_finetune_enable', action=argparse.BooleanOptionalAction, default=True,
-                        help='train zero-layer features first, then a new decoder on frozen ASTC features')
-    parser.add_argument('--two_stage_finetune_max_steps', type=int, default=5000,
-                        help='maximum ASTC decoder-only steps after the zero-layer baseline stops')
-    parser.add_argument('--two_stage_finetune_lr_multiplier', type=float, default=1.0,
-                        help='learning-rate multiplier for the newly initialized second-stage decoder')
+    parser.add_argument('--multi_stage_training_enable', action=argparse.BooleanOptionalAction, default=True,
+                        help='run representation learning, decoder fitting and optional layout refinement')
+    parser.add_argument('--multi_stage_training_decoder_steps', type=int, default=5000,
+                        help='maximum decoder-fitting steps with the learned ASTC representation frozen')
+    parser.add_argument('--multi_stage_training_decoder_lr_multiplier', type=float, default=1.0,
+                        help='learning-rate multiplier for the newly initialized decoder stage')
+    parser.add_argument('--multi_stage_training_layout_refit_steps', type=int, default=1000,
+                        help='offline latent refit and block layout selection after decoder fitting; 0 disables')
 
     parser.add_argument('--max_iter', type=int, default=100000,
                         help='maximum training iteration')

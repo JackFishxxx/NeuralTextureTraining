@@ -253,9 +253,10 @@ diffuse(3) | normal(3 或 2) | roughness(1) | occlusion(1) | metallic(1) | specu
 | `--early_stop_interval` | `5000` | 计算 PSNR 提升的迭代间隔 |
 | `--early_stop_psnr_threshold` | `0.01` | 最小 PSNR 提升阈值（dB） |
 
-双阶段训练默认启用（`two_stage_finetune_enable`）：第一阶段使用 0 隐藏层、无 PE/feature 差分的 decoder 学习表示；第二阶段冻结 ASTC 码流和压缩 base，随机初始化配置指定的 decoder，仅训练网络。
+多阶段训练（`multi_stage_training_enable`，默认开启，入口 `python -m Core.Multi_Stage_Training.multi_stage_training`）按职责命名：`representation` 用线性 decoder 学习 ASTC 表示；`decoder` 固定表示拟合配置指定的网络（`multi_stage_training_decoder_steps`、`multi_stage_training_decoder_lr_multiplier`）；`layout_refit` 固定最终 decoder 精修表示。
+`multi_stage_training_layout_refit_steps`（默认 1000，设为 0 跳过精修）每 100 步及末步验证合法 ASTC 布局，保留材质及已启用 PBR 的 PSNR/SSIM/LPIPS 均不退化的最佳码流，推理不变；`multi_stage_training.json` 用可扩展的 `stages` 列表记录各阶段指标、checkpoint 及 `final_metrics`。
 
-warmup 不早停，codec 启动后重置验证窗口。第二阶段平台期先将学习率乘 0.25，最低降至 0.0001；达到下限后，连续两个停滞窗口才停止。关闭早停仍执行 LR 调整并跑满步数。阶段结束恢复压缩验证 PSNR 最佳的模型；最终导出编号表示实际完成迭代，最佳权重来源记录在已有 `two_stage_finetune.json` 的 `baseline_validation` 和 `adaptation.validation` 中。
+warmup 不早停，codec 启动后重置验证窗口。decoder 阶段平台期先将学习率乘 0.25，最低降至 0.0001；达到下限后，连续两个停滞窗口才停止。关闭早停仍执行 LR 调整并跑满步数。阶段结束恢复压缩验证 PSNR 最佳的模型；最终导出编号表示实际完成工作量，`multi_stage_training.json` 的具名阶段记录验证、精修详情和所选 checkpoint。
 
 训练行为回归并入现有测试：`python -m unittest discover -s tests -v`（原生 codec 检查需 CUDA）。
 
@@ -317,7 +318,7 @@ feature_gradient_count: 4  # 0 关闭 | 2 右/下 | 4 四轴 | 8 3x3 | 24 5x5
 feature 码流，但会增加 decoder 输入和采样开销。checkpoint 和 `network_data.npz`
 会记录梯度方向数，推理必须使用相同配置。
 
-两阶段入口第一阶段关闭梯度输入，第二阶段按配置启用；单阶段训练时梯度直接
+多阶段入口在 representation 阶段关闭梯度输入，decoder 阶段按配置启用；单阶段训练时梯度直接
 参与表示学习。由于逐纹素材质投影不支持空间差分输入，单阶段使用梯度时应将
 `astc_decoder_projection_interval` 设为 `0`。
 
@@ -368,7 +369,7 @@ bias，并增加 `decoder_output_bias` 作为输出层 bias。这样不依赖 ti
 
 ### 神经纹理超分
 
-base 上采样及两阶段连续查询均使用 texel-center bilinear＋wrap/repeat，跨边界插值使用另一侧纹素。ASTC 比较和材质投影遵循同一约定；保留现有上采样 base cache，不增加网络输入或纹理查询数量。
+base 上采样及多阶段连续查询均使用 texel-center bilinear＋wrap/repeat，跨边界插值使用另一侧纹素。ASTC 比较和材质投影遵循同一约定；保留现有上采样 base cache，不增加网络输入或纹理查询数量。
 
 在 `config.yaml` 中设置 `super_resolution_enable: true` 并指定
 `super_resolution_base_resolution` 可启用超分残差训练。该分辨率的原始纹理 mip 作为 base，

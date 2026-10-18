@@ -371,10 +371,12 @@ bias，并增加 `decoder_output_bias` 作为输出层 bias。这样不依赖 ti
 
 ### 神经纹理超分
 
-base 上采样及多阶段连续查询均使用 texel-center bilinear＋wrap/repeat，跨边界插值使用另一侧纹素。ASTC 比较和材质投影遵循同一约定；保留现有上采样 base cache，不增加网络输入或纹理查询数量。
+材质重建采用最大 latent 分辨率（不超过 GT，保持宽高比）。1K latent＋512 SR base 对齐 2K GT 时，FNTC 先解码并 clamp 得到 1K 材质；FNTC 和默认 1K ASTC 基线再使用相同的 texel-center bilinear-repeat 放大到 2K。训练通过邻近四个**材质预测**可微插值，直接监督最终 2K 结果，不再在 2K 坐标直接调用 decoder。base 从原始低分辨率 mip 直接采样到 1K，避免 512→2K→1K 的重复插值。
+
+warmup、codec 目标及候选验收、冻结 decoder 拟合、布局重拟合、普通推理和 ASTC/PBR 评测复用同一重建路径。布局选择覆盖整倍数比例（如 1K→2K）下所有受影响的 GT 像素。跨分辨率训练当前要求 `mip0_only: true`；`ref_astc_resolution` 默认跟随 FNTC 材质边长，显式设置可覆盖基线尺寸。日志及 `reconstruction.json` 区分材质/GT 分辨率和原生 decoder 查询数。ASTC 输入及材质投影候选共用材质专用 mip 预滤波，包含法线向量处理。
 
 在 `config.yaml` 中设置 `super_resolution_enable: true` 并指定
 `super_resolution_base_resolution` 可启用超分残差训练。该分辨率的原始纹理 mip 作为 base，
 经双线性上采样后与 feature grid 特征拼接，网络拟合 `GT - bilinear_base`。评测、推理和 ASTC
-对比均使用 `clamp(bilinear_base + predicted_residual, 0, 1)` 与 GT 计算指标。更低 Mip 使用
+对比均先在原生材质中心计算 `clamp(bilinear_base + predicted_residual, 0, 1)`，再统一放大后与 GT 计算指标。更低 Mip 使用
 相同的纹理层级偏移。启用后会自动关闭与残差输出语义冲突的 direct diffuse 模式。

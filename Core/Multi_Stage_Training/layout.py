@@ -6,6 +6,7 @@ import torch
 from Core.Feature_Gradient.sampling import gradient_directions
 from feature_grid import feature_to_unorm, unorm_to_feature
 from Core.ASTC_Aware.differentiable_proxy import ASTCProxyGrid, encode_seed
+from dataset import material_size
 
 
 def _axis_colors(length, halo):
@@ -29,8 +30,12 @@ def _select(trainer, proposal):
     model, grid = trainer.model, trainer.model.astc_proxy[0]
     height, width = grid._image_shape
     halo = 1 + max(max(abs(x), abs(y)) for x, y in gradient_directions(model.feature_gradient_count))
-    y, x = torch.meshgrid(torch.arange(-halo, 6 + halo, device=model.device),
-                          torch.arange(-halo, 6 + halo, device=model.device), indexing='ij')
+    scale_y, scale_x = trainer.texture_height // height, trainer.texture_width // width
+    # Output interpolation expands each block's influence by another native texel.
+    if (scale_y, scale_x) != (1, 1):
+        halo += 1
+    y, x = torch.meshgrid(torch.arange(-halo * scale_y, (6 + halo) * scale_y, device=model.device),
+                          torch.arange(-halo * scale_x, (6 + halo) * scale_x, device=model.device), indexing='ij')
     local = torch.stack((y.flatten(), x.flatten()), 1).float()
     centers = len(local)
     subpixel = trainer.subpixel_sampling_enable and trainer.subpixel_sampling_ratio > 0
@@ -49,16 +54,18 @@ def _select(trainer, proposal):
     for group in groups.values():
         for start in range(0, len(group), 64):
             rows = torch.tensor(group[start:start + 64], device=model.device)
-            origin = torch.stack((rows // blocks_x * 6, rows % blocks_x * 6), 1)
-            xy = (origin[:, None] + local).remainder(local.new_tensor((height, width)))
-            uv = torch.stack(((xy[..., 1] + .5) / width, (xy[..., 0] + .5) / height), -1).reshape(-1, 2)
-            target = trainer.dataset.expand_to_canonical(trainer.dataset.sample_continuous(xy.reshape(-1, 2), 0)).half()
+            origin = torch.stack((rows // blocks_x * 6 * scale_y, rows % blocks_x * 6 * scale_x), 1)
+            xy = (origin[:, None] + local).remainder(local.new_tensor((trainer.texture_height, trainer.texture_width)))
+            uv = torch.stack(((xy[..., 1] + .5) / trainer.texture_width,
+                              (xy[..., 0] + .5) / trainer.texture_height), -1).reshape(-1, 2)
+            target = trainer.dataset.expand_to_canonical(trainer.dataset.sample_continuous(xy.reshape(-1, 2), 0)).to(
+                torch.float32 if (scale_y, scale_x) != (1, 1) else torch.float16)
             base = trainer._astc_base_at_uv(uv)
             inputs = torch.cat((uv, torch.zeros(len(uv), 1, device=model.device), base), 1)
 
             def losses():
                 model._qat_param_cache.clear()
-                residual = model(inputs).float()
+                residual = trainer._predict_material(inputs).float()
                 errors = ((residual - (target - base).float()).square() * weights).sum(1).reshape(len(rows), -1)
                 value = errors[:, :centers].mean(1)
                 if subpixel:
@@ -99,8 +106,10 @@ def refit_layout(trainer, steps):
             or model.feature_grid_specs[0].n_features_per_level != 4
             or not model.feature_gradient_count or model._decoder_adaptation_features is not None
             or not trainer.super_resolution_enable or trainer.astc_superres_base_mip0 is None
-            or model.astc_proxy[0]._image_shape != (trainer.texture_height, trainer.texture_width)):
-        return {'applied': False, 'reason': 'requires one gradient SR codec at GT resolution'}
+            or model.astc_proxy[0]._image_shape != material_size(model, trainer.texture_height, trainer.texture_width)
+            or trainer.texture_height % model.astc_proxy[0]._image_shape[0]
+            or trainer.texture_width % model.astc_proxy[0]._image_shape[1]):
+        return {'applied': False, 'reason': 'requires one gradient SR codec at native material resolution and integer GT scale'}
     grid, spec = model.astc_proxy[0], model.feature_grid_specs[0]
     source = model.feature_grids[0].params
     saved_source = source.detach().clone()
@@ -134,9 +143,10 @@ def refit_layout(trainer, steps):
 
         def reconstruction(ids):
             uv = torch.stack(((ids % width + .5) / width, (ids // width + .5) / height), 1)
-            target = trainer.dataset.expand_to_canonical(trainer.dataset.mip_cache[0][ids // width, ids % width]).half()
+            target = trainer.dataset.expand_to_canonical(trainer.dataset.mip_cache[0][ids // width, ids % width]).to(
+                torch.float32 if material_size(model, height, width) != (height, width) else torch.float16)
             base = trainer._astc_base_at_uv(uv)
-            residual = model(torch.cat((uv, torch.zeros(len(uv), 1, device=model.device), base), 1))
+            residual = trainer._predict_material(torch.cat((uv, torch.zeros(len(uv), 1, device=model.device), base), 1))
             loss = trainer._compute_astc_reconstruction_loss(target, residual, base, weights)
             if trainer.pbr_loss_enable and trainer.pbr_loss_weight > 0:
                 loss += trainer.pbr_loss_weight * trainer._compute_pbr_render_loss(target.float(), (base.float() + residual.float()).clamp(0, 1))
@@ -182,7 +192,7 @@ def refit_layout(trainer, steps):
                 loss = reconstruction(ids)
                 if trainer.subpixel_sampling_enable and trainer.subpixel_sampling_ratio > 0:
                     inputs, target, base = trainer._sample_astc_subpixel_batch(proxy=True)
-                    loss += trainer.subpixel_sampling_ratio * trainer._compute_astc_reconstruction_loss(target, model(inputs), base, weights)
+                    loss += trainer.subpixel_sampling_ratio * trainer._compute_astc_reconstruction_loss(target, trainer._predict_material(inputs), base, weights)
                 loss.backward()
                 if not torch.isfinite(loss) or not torch.isfinite(field.grad).all():
                     raise ValueError('Nonfinite latent refit loss or gradient')

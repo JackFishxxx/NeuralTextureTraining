@@ -36,6 +36,7 @@ from Comparison_ASTC import (
     run_astc_comparison_pipeline,
 )
 from Comparison_PBRScene import save_pbr_comparison
+from dataset import material_size
 from Core.ASTC_Aware.trainer import ASTCAwareTrainer
 
 
@@ -104,10 +105,11 @@ class Trainer(ASTCAwareTrainer):
         dataset = TextureDataset(configs)
         print(f"[NormalEncoding] mode={dataset.normal_encoding}")
         configs.num_mips = dataset.num_mips
-        # Real texture edge so pos_encoding_tile_size (texels) maps correctly to UV space.
-        configs.pos_encoding_reference_edge = max(dataset.texture_height, dataset.texture_width)
+        # Tile size is measured in decoder/material texels, independent of GT resolution.
+        configs.pos_encoding_reference_edge = max(dataset.material_reconstruction_size)
         model = TCNNModel(configs)
         model.configure_direct_diffuse_from_dataset(dataset)
+        configs.material_reconstruction_size = list(material_size(model, dataset.texture_height, dataset.texture_width))
         # Network output is fixed to 11 channels (aligned with diffuse->displacement); missing filled by dataset with 0
         configs.num_channels = model.num_channels
 
@@ -146,6 +148,9 @@ class Trainer(ASTCAwareTrainer):
         self.texture_height = dataset.texture_height
         self.texture_width = dataset.texture_width
         self.mip0_only = bool(getattr(configs, "mip0_only", False))
+        native_h, native_w = configs.material_reconstruction_size
+        print(f'[Material Reconstruction] decoder={native_w}x{native_h}, GT={self.texture_width}x{self.texture_height}, '
+              'upsampler=bilinear_repeat, texel_centers=True')
         self.subpixel_sampling_enable = bool(getattr(configs, "subpixel_sampling_enable", True))
         self.subpixel_sampling_ratio = float(getattr(configs, "subpixel_sampling_ratio", 0.25))
         self.subpixel_jitter = float(getattr(configs, "subpixel_jitter", 0.5))
@@ -476,7 +481,8 @@ class Trainer(ASTCAwareTrainer):
             # Get data; expand to canonical 11 channels, missing texture positions filled with 0
             gt_texture = (self.dataset.mip_cache[0][ys[:, 0], xs[:, 0]]
                           if self.mip0_only else self.dataset(batch_index))
-            gt_texture = self.dataset.expand_to_canonical(gt_texture).to(torch.float16)
+            gt_texture = self.dataset.expand_to_canonical(gt_texture).to(
+                torch.float32 if self.native_reconstruction else torch.float16)
             superres_base = None
             if self.super_resolution_enable:
                 superres_base = self.dataset.expand_to_canonical(
@@ -601,6 +607,12 @@ class Trainer(ASTCAwareTrainer):
     @torch.no_grad()
     def _fill_predicted_mip(self, mip: int, mip_height: int, mip_width: int) -> torch.Tensor:
         """Tiled full-plane forward (caps tcnn batch size; scatter by row/col to avoid layout bugs)."""
+        if mip == 0 and material_size(self.model, mip_height, mip_width) != (mip_height, mip_width):
+            base = (self.astc_superres_base_mip0.permute(2, 0, 1)[None]
+                    if self.super_resolution_enable and self.model._decoder_adaptation_features is not None else None)
+            return _render_model_mip0(self.model, self.dataset, mip_height, mip_width, self.num_mips,
+                                     self.device, superres_base_override=base,
+                                     inference_tile=self.eval_inference_tile)[0].permute(1, 2, 0)
         device = self.device
         c = self.model.num_channels
         out = torch.empty(mip_height, mip_width, c, device=device, dtype=torch.float32)
@@ -927,6 +939,7 @@ class Trainer(ASTCAwareTrainer):
                     self.dataset,
                     self.astc_codec.roundtrip_rgba,
                     int(self.configs.super_resolution_base_resolution),
+                    output_size=material_size(fntc_astc_model, self.texture_height, self.texture_width),
                 )
             fntc_astc = _render_model_mip0(
                 fntc_astc_model,
@@ -939,7 +952,7 @@ class Trainer(ASTCAwareTrainer):
                 inference_tile=self.eval_inference_tile,
             )
             ref_h, ref_w = _ref_astc_hw_from_side(
-                self.ref_astc_resolution,
+                self.ref_astc_resolution or max(material_size(self.model, self.texture_height, self.texture_width)),
                 self.texture_height,
                 self.texture_width,
             )

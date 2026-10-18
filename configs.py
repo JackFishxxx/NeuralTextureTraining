@@ -515,8 +515,8 @@ def get_args():
                         help='astcenc quality preset for ASTC comparison')
     parser.add_argument('--astc_block', type=str, default='6x6',
                         help='ASTC block size, e.g. 4x4 / 6x6 / 8x8')
-    parser.add_argument('--ref_astc_resolution', type=int, default=1024,
-                        help='Traditional ref_astc_* baseline: square edge length (H=W) before astcenc; omit for Mip0 size')
+    parser.add_argument('--ref_astc_resolution', type=int, default=None,
+                        help='Traditional ASTC source max edge before astcenc; omit to match FNTC native material size')
 
     ### ---------- PBR scene comparison configs ---------- ###
     parser.add_argument('--enable_pbr_compare', action=argparse.BooleanOptionalAction, default=False,

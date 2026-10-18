@@ -55,7 +55,7 @@ def fit_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5,
         model._decoder_adaptation_features = fixed
         for grid in model.feature_grids:
             grid.params.requires_grad_(False)
-        if trainer.super_resolution_enable:
+        if trainer.super_resolution_enable and tuple(trainer.astc_superres_base_mip0.shape[:2]) == tuple(trainer.dataset.superres_base_cache[0].shape[:2]):
             slices = trainer.dataset.canonical_channel_slices
             trainer.dataset.superres_base_cache[0] = torch.cat([
                 trainer.astc_superres_base_mip0[..., slices[name][0]:slices[name][1]]
@@ -152,6 +152,8 @@ def run_multi_stage_training(params, config=None):
         target.num_mips = representation_config.num_mips
         target.num_channels = representation_config.num_channels
         target.pos_encoding_reference_edge = representation_config.pos_encoding_reference_edge
+        if hasattr(representation_config, 'material_reconstruction_size'):
+            target.material_reconstruction_size = representation_config.material_reconstruction_size
         decoder = TCNNModel(target)
         decoder.astc_proxy = copy.deepcopy(source.astc_proxy)
         decoder.astc_proxy.requires_grad_(False)

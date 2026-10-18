@@ -2,13 +2,18 @@
 
 import math
 import torch
-import torch.nn.functional as F
 from Comparison_ASTC import ASTCCodec, roundtrip_feature_blocks, _astc_roundtrip_superres_base_mip0
-from dataset import bilinear_repeat, resize_bilinear_repeat
+from dataset import bilinear_repeat, resize_bilinear_repeat, material_size, clean_base_image, native_query_uv, prefiltered_material, sample_material
 
 
 class ASTCAwareTrainer:
     def _initialize_astc_aware(self, dataset, configs):
+        self.material_size = material_size(self.model, self.texture_height, self.texture_width)
+        self.native_reconstruction = self.material_size != (self.texture_height, self.texture_width)
+        if self.native_reconstruction and not self.mip0_only:
+            raise ValueError('Native material reconstruction below GT resolution currently requires mip0_only')
+        self.native_clean_base = (clean_base_image(dataset, self.material_size)
+                                  if self.native_reconstruction and self.super_resolution_enable else None)
         self.astc_codec_backend = configs.astc_codec_backend
         self.astc_codec_start_frac = configs.astc_codec_start_frac
         self.astc_codec = ASTCCodec(self.astcenc_path, self.astcenc_quality, self.astc_block)
@@ -42,9 +47,23 @@ class ASTCAwareTrainer:
         self.astc_superres_base_mip0 = None
         if configs.astc_codec_in_loop_enable and self.super_resolution_enable:
             decoded = _astc_roundtrip_superres_base_mip0(
-                dataset, self.astc_codec.roundtrip_rgba, configs.super_resolution_base_resolution
+                dataset, self.astc_codec.roundtrip_rgba, configs.super_resolution_base_resolution,
+                output_size=self.material_size
             )
             self.astc_superres_base_mip0 = decoded[0].permute(1, 2, 0).contiguous()
+
+    def _predict_material(self, inputs):
+        """Keep the residual API while supervising the deployed native-raster upsampler."""
+        size = material_size(self.model, self.texture_height, self.texture_width)
+        if size == (self.texture_height, self.texture_width):
+            return self.model(inputs)
+        codec = self.model.astc_codec_branch_enabled or self.model._decoder_adaptation_features is not None
+        base_image = None
+        if self.super_resolution_enable:
+            base_image = (self.astc_superres_base_mip0.permute(2, 0, 1)[None].float()
+                          if codec else self.native_clean_base)
+        prediction = sample_material(self.model, inputs[:, :2], size, base_image)
+        return prediction - inputs[:, 3:].float() if self.super_resolution_enable else prediction
 
     def _begin_astc_step(self, curr_iter):
         if self._astc_block_optimizer is not None:
@@ -82,7 +101,7 @@ class ASTCAwareTrainer:
         # Warmup, ordinary CPU steps and frozen decoder adaptation share the
         # existing reconstruction path. CPU codec steps replace only primary
         # reconstruction/PBR, retaining the original clean subpixel supervision.
-        prediction = self.model(inputs)
+        prediction = self._predict_material(inputs)
         primary = self._compute_astc_reconstruction_loss(
             target, prediction, base, weights, curr_iter
         )
@@ -92,7 +111,7 @@ class ASTCAwareTrainer:
         if self.subpixel_sampling_enable and self.subpixel_sampling_ratio > 0:
             subinput, subtarget, subbase = self._sample_astc_subpixel_batch(proxy=False)
             subpixel = self._compute_astc_reconstruction_loss(
-                subtarget, self.model(subinput), subbase, weights
+                subtarget, self._predict_material(subinput), subbase, weights
             )
         pbr_codec = None
         if codec_due:
@@ -100,7 +119,7 @@ class ASTCAwareTrainer:
             self._prepare_astc_codec_patches(uv, curr_iter)
             self.model.astc_codec_branch_enabled = True
             try:
-                decoded = self.model(codec_input)
+                decoded = self._predict_material(codec_input)
             finally:
                 self.model.astc_codec_branch_enabled = False
                 self.model._astc_codec_patches.clear()
@@ -158,8 +177,7 @@ class ASTCAwareTrainer:
         xy += (torch.rand_like(xy) * 2 - 1) * self.subpixel_jitter
         sample_mips = 0 if proxy or self.mip0_only else mips
         target = self.dataset.expand_to_canonical(self.dataset.sample_continuous(xy, sample_mips)).to(
-            torch.float16
-        )
+            torch.float32 if getattr(self, 'native_reconstruction', False) else torch.float16)
         uv = torch.stack(
             ((xy[:, 1] + 0.5) / self.texture_width, (xy[:, 0] + 0.5) / self.texture_height), 1
         )
@@ -198,7 +216,7 @@ class ASTCAwareTrainer:
         self._astc_proxy_loss_weights = weights
         self.model.astc_codec_branch_enabled = True
         try:
-            prediction = self.model(inputs)
+            prediction = self._predict_material(inputs)
             primary = self._compute_astc_reconstruction_loss(
                 target, prediction, base, weights, curr_iter
             )
@@ -212,7 +230,7 @@ class ASTCAwareTrainer:
                     (subinput, subtarget, subbase, self.subpixel_sampling_ratio, False)
                 )
                 subloss = self._compute_astc_reconstruction_loss(
-                    subtarget, self.model(subinput), subbase, weights
+                    subtarget, self._predict_material(subinput), subbase, weights
                 )
                 total = total + self.subpixel_sampling_ratio * subloss
             self.writer.add_scalar("Loss/astc_codec", primary.item(), curr_iter)
@@ -228,7 +246,7 @@ class ASTCAwareTrainer:
         try:
             total = 0
             for inputs, target, base, weight, use_pbr in self._astc_proxy_batches:
-                prediction = self.model(inputs)
+                prediction = self._predict_material(inputs)
                 loss = self._compute_astc_reconstruction_loss(
                     target, prediction, base, self._astc_proxy_loss_weights
                 )
@@ -246,6 +264,9 @@ class ASTCAwareTrainer:
         from Core.Feature_Gradient.sampling import bilinear_texel_corners, gradient_directions
 
         block_size = uv.new_tensor(self.configs.astc_aware_block, dtype=torch.long)
+        size = material_size(self.model, self.texture_height, self.texture_width)
+        if size != (self.texture_height, self.texture_width):
+            uv = native_query_uv(uv, size)[0]
         self.model._astc_codec_patches.clear()
         for index, spec in enumerate(self.model.feature_grid_specs):
             resolution = spec.highest_level_slice()[2]
@@ -298,6 +319,8 @@ class ASTCAwareTrainer:
     def _compute_astc_reconstruction_loss(self, gt, prediction, base, loss_weights, curr_iter=None):
         if base is None:
             return self._compute_reconstruction_loss(gt, prediction, loss_weights, curr_iter)
+        if getattr(self, 'native_reconstruction', False):
+            return self._compute_superres_residual_loss(gt.float(), prediction.float() + base.float(), loss_weights, curr_iter)
         return self._compute_superres_residual_loss(gt - base, prediction, loss_weights, curr_iter)
 
     @torch.no_grad()
@@ -319,13 +342,24 @@ class ASTCAwareTrainer:
         ys = block_y[:, None, None] * block_h + local_y
         valid = (xs < resolution) & (ys < resolution)
         uvs = torch.stack(((xs[valid] + 0.5) / resolution, (ys[valid] + 0.5) / resolution), dim=1)
+        if getattr(self, 'native_reconstruction', False):
+            # CPU codec steps supervise every GT phase covered by selected native
+            # cells, rather than only the interpolated GT at latent centers.
+            scale_y, scale_x = self.texture_height // resolution, self.texture_width // resolution
+            if self.texture_height % resolution or self.texture_width % resolution:
+                raise ValueError('CPU codec batches below GT resolution require an integer GT/latent scale')
+            dy, dx = torch.meshgrid(torch.arange(scale_y, device=self.device),
+                                    torch.arange(scale_x, device=self.device), indexing='ij')
+            output_x = xs[valid, None] * scale_x + dx.flatten()[None]
+            output_y = ys[valid, None] * scale_y + dy.flatten()[None]
+            uvs = torch.stack(((output_x.flatten() + .5) / self.texture_width,
+                              (output_y.flatten() + .5) / self.texture_height), 1)
         sample_xy = torch.stack(
             (uvs[:, 1] * self.texture_height - 0.5, uvs[:, 0] * self.texture_width - 0.5), dim=1
         )
         mips = torch.zeros(len(uvs), device=self.device, dtype=torch.long)
         gt = self.dataset.expand_to_canonical(self.dataset.sample_continuous(sample_xy, mips)).to(
-            torch.float16
-        )
+            torch.float32 if getattr(self, 'native_reconstruction', False) else torch.float16)
         model_uv = torch.cat((uvs, torch.zeros((len(uvs), 1), device=self.device)), dim=1)
         if not self.super_resolution_enable:
             return uvs, gt, model_uv, model_uv, None
@@ -404,15 +438,11 @@ class ASTCAwareTrainer:
         # Solve at feature texel centers. Bilinear resizing samples the same UVs
         # from GT and the deployment SR base when their dimensions differ from
         # the grid (e.g. 2K textures with the default 1K feature grid).
-        target_image = self.dataset.mip_cache[0].permute(2, 0, 1)[None].float()
+        target_image = prefiltered_material(self.dataset, (resolution, resolution))
         base_image = self.astc_superres_base_mip0.permute(2, 0, 1)[None].float()
-        if target_image.shape[-2:] != (resolution, resolution):
-            target_image = F.interpolate(target_image, size=(resolution, resolution),
-                                         mode="bilinear", align_corners=False)
+        if base_image.shape[-2:] != (resolution, resolution):
             base_image = resize_bilinear_repeat(base_image, (resolution, resolution))
-        target = self.dataset.expand_to_canonical(
-            target_image[0].permute(1, 2, 0).reshape(-1, self.dataset.num_channels)
-        ).float()
+        target = target_image[0].permute(1, 2, 0).reshape(-1, channels)
         base = base_image[0].permute(1, 2, 0).reshape(-1, channels)
         projected = []
         for begin in range(0, len(base), 65536):
@@ -481,8 +511,9 @@ class ASTCAwareTrainer:
             raise ValueError("Refinement steps, block count and learning rate must be positive")
         grid = model.astc_proxy[0]
         height, width = grid._image_shape
-        if (height, width) != (self.texture_height, self.texture_width):
-            raise ValueError("Codec refinement currently requires feature and target resolutions to match")
+        if (height, width) != material_size(model, self.texture_height, self.texture_width) or self.texture_height % height or self.texture_width % width:
+            raise ValueError("Codec refinement requires native material resolution and an integer GT scale")
+        scale_y, scale_x = self.texture_height // height, self.texture_width // width
         if self.super_resolution_enable and self.astc_superres_base_mip0 is None:
             raise ValueError("Codec refinement requires the deployment ASTC base")
         blocks_x, blocks_y = (width + 5) // 6, (height + 5) // 6
@@ -490,8 +521,10 @@ class ASTCAwareTrainer:
                                   quantization_aware=True, packed_pair_search=True)
         loss_weights = torch.tensor(self.output_loss_weights, device=self.device)
         halo = 1 + max(max(abs(dx), abs(dy)) for dx, dy in gradient_directions(model.feature_gradient_count))
-        ly, lx = torch.meshgrid(torch.arange(-halo, 6 + halo, device=self.device),
-                               torch.arange(-halo, 6 + halo, device=self.device), indexing="ij")
+        if (scale_y, scale_x) != (1, 1):
+            halo += 1
+        ly, lx = torch.meshgrid(torch.arange(-halo*scale_y, (6+halo)*scale_y, device=self.device),
+                               torch.arange(-halo*scale_x, (6+halo)*scale_x, device=self.device), indexing="ij")
         parameter_flags = [(parameter, parameter.requires_grad) for parameter in model.parameters()]
         was_training, old_iteration = model.training, model.current_iter
         old_branch = model.astc_codec_branch_enabled
@@ -511,9 +544,9 @@ class ASTCAwareTrainer:
                 bx = torch.randint(0, blocks_x, (blocks_per_batch,), device=self.device)
                 by = torch.randint(0, blocks_y, (blocks_per_batch,), device=self.device)
                 ids = (by * blocks_x + bx).unique()
-                xs = (ids[:, None, None] % blocks_x * 6 + lx) % width
-                ys = (ids[:, None, None] // blocks_x * 6 + ly) % height
-                uv = torch.stack(((xs.flatten() + .5) / width, (ys.flatten() + .5) / height), 1)
+                xs = (ids[:, None, None] % blocks_x * 6 * scale_x + lx) % self.texture_width
+                ys = (ids[:, None, None] // blocks_x * 6 * scale_y + ly) % self.texture_height
+                uv = torch.stack(((xs.flatten() + .5) / self.texture_width, (ys.flatten() + .5) / self.texture_height), 1)
                 base = self._astc_base_at_uv(uv)
                 target = self.dataset.expand_to_canonical(
                     self.dataset.mip_cache[0][ys.flatten(), xs.flatten()]
@@ -525,7 +558,7 @@ class ASTCAwareTrainer:
                 model._qat_param_cache.clear()
                 optimizer.zero_grad()
                 model.astc_codec_branch_enabled = True
-                prediction = model(inputs)
+                prediction = self._predict_material(inputs)
                 loss = self._compute_astc_reconstruction_loss(target, prediction, base, loss_weights)
                 pbr = self._astc_pbr_loss(target, prediction, base)
                 if pbr is not None:

@@ -10,6 +10,7 @@ import numpy as np
 from PIL import Image
 import torchvision.transforms.functional as TF
 import torch.nn.functional as F
+from Core.Feature_Gradient.sampling import bilinear_texel_corners
 from normal_encoding import (
     decode_normal,
     encode_normal,
@@ -40,6 +41,71 @@ def resize_bilinear_repeat(image: torch.Tensor, size: Tuple[int, int]) -> torch.
     yy, xx = torch.meshgrid(y, x, indexing="ij")
     uv = torch.stack((xx, yy), -1)[None].expand(image.shape[0], -1, -1, -1)
     return bilinear_repeat(image, uv)
+
+
+def material_size(model, height, width):
+    """Decode at the largest latent edge, capped by the source texture size."""
+    if hasattr(model, 'feature_grid_specs'):
+        edge = max(spec.max_resolution for spec in model.feature_grid_specs)
+    else:
+        edge = max(spec['max_resolution'] for spec in model.feature_grid_configs)
+    scale = min(1., edge / max(height, width))
+    return max(1, round(height * scale)), max(1, round(width * scale))
+
+
+def prefiltered_material(dataset, size):
+    """Reuse the same material-aware mip for ASTC inputs and projection seeds."""
+    for level in dataset.mip_cache:
+        if tuple(level.shape[:2]) == tuple(size):
+            return dataset.expand_mip_to_canonical_level(level).permute(2, 0, 1)[None].float()
+    source = dataset.mip_cache[0]
+    result = source.new_zeros((*size, dataset.canonical_num_channels))
+    for name in dataset.available_textures:
+        start, end = dataset.channel_slices[name]
+        a, b = dataset.canonical_channel_slices[name]
+        result[..., a:b] = dataset._resize_texture_for_mip(
+            name, source[..., start:end].permute(2, 0, 1), *size).permute(1, 2, 0)
+    return result.permute(2, 0, 1)[None].float()
+
+
+def clean_base_image(dataset, size):
+    """Sample the actual low-resolution SR source directly onto the native raster."""
+    ratio = max(dataset.texture_height, dataset.texture_width) / dataset.super_resolution_base_resolution
+    level = min(max(0, round(math.log2(ratio))) if ratio > 1 else 0, dataset.num_mips - 1)
+    image = dataset.expand_mip_to_canonical_level(dataset.mip_cache[level]).permute(2, 0, 1)[None].float()
+    return resize_bilinear_repeat(image, size) if tuple(image.shape[-2:]) != tuple(size) else image
+
+
+def sample_image(image, uv):
+    return bilinear_repeat(image, uv[None, :, None]).squeeze(0).squeeze(-1).T
+
+
+def native_query_uv(uv, size):
+    """Return wrapped native raster corner centers and their interpolation weights."""
+    height, width = size
+    corners, weights = bilinear_texel_corners(uv, uv.new_tensor((width, height)))
+    ids = corners[..., 1] * width + corners[..., 0]
+    unique, inverse = ids.flatten().unique(return_inverse=True)
+    centers = torch.stack(((unique % width + .5) / width, (unique // width + .5) / height), 1)
+    return centers, inverse, weights
+
+
+def sample_material(model, uv, size, base_image=None):
+    """Differentiate through U(clamp(base_native + decoder_native)) at arbitrary UVs.
+
+    Only native raster centers reach the decoder. Repeated centers share one
+    prediction; the four output values, rather than latent features, interpolate.
+    """
+    centers, inverse, weights = native_query_uv(uv, size)
+    inputs = torch.cat((centers, centers.new_zeros((len(centers), 1))), 1)
+    base = sample_image(base_image, centers) if base_image is not None else None
+    if base is not None:
+        inputs = torch.cat((inputs, base), 1)
+    values = model(inputs).float()
+    if base is not None:
+        values = values + base
+    values = values.clamp(0, 1)
+    return (values[inverse].reshape(len(uv), 4, -1) * weights[..., None]).sum(1)
 
 
 def get_texture_config(normal_encoding: str = "xyz") -> List[Dict]:
@@ -118,6 +184,7 @@ class TextureDataset(torch.nn.Module):
 
         self.textures = self.load_data()
         self.texture_height, self.texture_width, self.num_channels = self.textures.shape
+        self.material_reconstruction_size = material_size(config, self.texture_height, self.texture_width)
         
         self.num_mips = int(min(math.log2(self.texture_height), math.log2(self.texture_width))) + 1
 

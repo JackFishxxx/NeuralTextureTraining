@@ -381,11 +381,13 @@ for the output layer.
 
 ### Neural Texture Super-Resolution
 
-Base upsampling and continuous queries in both stages use texel-centered bilinear repeat addressing, including opposite-edge texels when interpolating across a seam. ASTC comparisons and material projection follow the same convention. The existing upsampled base cache, decoder input size and texture query counts are retained.
+Material reconstruction uses the largest latent resolution (capped by GT and preserving aspect ratio). For 1K latent + 512 SR base against 2K GT, FNTC first decodes/clamps a 1K material raster; both FNTC and the default 1K ASTC baseline then use the same texel-centered bilinear-repeat upsampler to 2K. Training differentiates through the four neighboring **material predictions**, rather than querying the decoder directly at 2K coordinates. The base is sampled directly from its source mip onto the 1K raster, avoiding a 512-to-2K-to-1K cascade.
+
+The same reconstruction is used by warmup, codec objectives/candidate checks, frozen decoder fitting, layout refitting, inference and ASTC/PBR evaluation. Layout selection includes all affected GT pixels at integer resolution scales such as 1K-to-2K. Cross-resolution training currently requires `mip0_only: true`. `ref_astc_resolution` defaults to the FNTC material edge; setting it explicitly overrides the baseline size. Logs and `reconstruction.json` distinguish material/GT sizes and native decoder query counts. Downsampling for the ASTC input and projection proposals shares the material-aware mip prefilter (including normal-vector handling).
 
 Set `super_resolution_enable: true` and configure `super_resolution_base_resolution` to train
 residual super-resolution. The source mip at that resolution is bilinearly upsampled and provided
 alongside the feature-grid samples; the network predicts `GT - bilinear_base`. Training, inference,
-and ASTC comparison reconstruct `clamp(bilinear_base + predicted_residual, 0, 1)`. The same mip-level
+and ASTC comparison reconstruct `clamp(bilinear_base + predicted_residual, 0, 1)` at native material centers before the shared final upsampling. The same mip-level
 offset is used for lower Mips. Enabling this mode automatically disables direct-diffuse inference,
 whose direct-output semantics conflict with residual prediction.

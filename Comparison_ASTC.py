@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import math
+import json
 import os
 import platform
 import shutil
@@ -25,7 +26,7 @@ from PIL import Image, ImageDraw, ImageFont
 import torchvision.transforms.functional as TF
 from feature_grid import feature_tensor_to_int, int_to_feature_tensor, quantize_feature_tensor
 from normal_encoding import decode_normal, normal_angular_psnr
-from dataset import resize_bilinear_repeat
+from dataset import resize_bilinear_repeat, material_size, prefiltered_material, clean_base_image, sample_image
 
 
 # ---------------------------------------------------------------------------
@@ -194,20 +195,7 @@ def _traditional_baseline_resampled(
 ) -> torch.Tensor:
     """Run traditional ASTC at (ref_h, ref_w), then resize to gt_mip0 spatial size for comparison."""
     h0, w0 = gt_mip0.shape[-2], gt_mip0.shape[-1]
-    src = gt_mip0
-    # Reuse the dataset's prefiltered mip when the requested ASTC source
-    # resolution corresponds to an actual mip level.
-    if hasattr(dataset, "mip_cache"):
-        for mip in range(int(getattr(dataset, "num_mips", 0))):
-            mh = dataset.texture_height // (2 ** mip)
-            mw = dataset.texture_width // (2 ** mip)
-            if (mh, mw) == (ref_h, ref_w):
-                cached = dataset.mip_cache[mip]
-                cached = dataset.expand_to_canonical(cached.reshape(-1, cached.shape[-1]))
-                src = cached.reshape(mh, mw, -1).permute(2, 0, 1)[None, ...]
-                break
-    if src is gt_mip0 and (ref_h, ref_w) != (h0, w0):
-        src = F.interpolate(gt_mip0, size=(ref_h, ref_w), mode="bilinear", align_corners=False)
+    src = prefiltered_material(dataset, (ref_h, ref_w))
     out = build_traditional_astc_prediction(
         gt_image=src,
         canonical_slices=dataset.canonical_channel_slices,
@@ -215,12 +203,12 @@ def _traditional_baseline_resampled(
         roundtrip_rgba=roundtrip_rgba,
     )
     if (ref_h, ref_w) != (h0, w0):
-        out = F.interpolate(out, size=(h0, w0), mode="bilinear", align_corners=False)
+        out = resize_bilinear_repeat(out, (h0, w0))
     return out
 
 
 @torch.no_grad()
-def _astc_roundtrip_superres_base_mip0(dataset, roundtrip_rgba, base_resolution: int) -> torch.Tensor:
+def _astc_roundtrip_superres_base_mip0(dataset, roundtrip_rgba, base_resolution: int, output_size=None) -> torch.Tensor:
     """Compress the reused low-resolution source mip before upsampling it."""
     h0, w0 = dataset.texture_height, dataset.texture_width
     ratio = max(h0, w0) / float(max(1, base_resolution))
@@ -236,8 +224,9 @@ def _astc_roundtrip_superres_base_mip0(dataset, roundtrip_rgba, base_resolution:
         dataset.available_textures,
         roundtrip_rgba,
     )
-    if compressed.shape[-2:] != (h0, w0):
-        compressed = resize_bilinear_repeat(compressed, (h0, w0))
+    output_size = getattr(dataset, 'material_reconstruction_size', (h0, w0)) if output_size is None else tuple(output_size)
+    if compressed.shape[-2:] != output_size:
+        compressed = resize_bilinear_repeat(compressed, output_size)
     return compressed.clamp(0.0, 1.0)
 
 
@@ -392,6 +381,14 @@ def _render_model_mip0(model, dataset, texture_height: int, texture_width: int, 
     mip = 0
     H = texture_height >> mip
     W = texture_width >> mip
+    target_size = (H, W)
+    H, W = material_size(model, H, W)
+    native_base = None
+    if getattr(model, 'super_resolution_enable', False) and (H, W) != target_size:
+        native_base = (clean_base_image(dataset, (H, W)) if superres_base_override is None
+                       else superres_base_override)
+        if tuple(native_base.shape[-2:]) != (H, W):
+            raise ValueError('Render the compressed SR base at native material size before passing superres_base_override')
     mip_f = float(mip) / max(1, num_mips - 1)
     step = max(1, int(inference_tile) or max(H, W))
     hwc = None
@@ -404,7 +401,9 @@ def _render_model_mip0(model, dataset, texture_height: int, texture_width: int, 
             inp = torch.stack(((cc + 0.5) / W, (rr + 0.5) / H,
                                torch.full_like(rr, mip_f)), dim=-1).reshape(-1, 3)
             if getattr(model, "super_resolution_enable", False):
-                if superres_base_override is None:
+                if native_base is not None:
+                    base = sample_image(native_base, inp[:, :2])
+                elif superres_base_override is None:
                     base_data = dataset.superres_base_cache[mip][h0:h1, w0:w1]
                     base = dataset.expand_to_canonical(base_data.reshape(-1, dataset.num_channels)).float()
                 else:
@@ -420,7 +419,8 @@ def _render_model_mip0(model, dataset, texture_height: int, texture_width: int, 
         direct = model.render_direct_diffuse_mip(mip, H, W)
         hwc[:, :, :3] = direct.squeeze(0).permute(1, 2, 0).to(hwc.dtype)
     hwc = torch.nan_to_num(hwc, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-    return hwc.permute(2, 0, 1)[None, ...]
+    image = hwc.permute(2, 0, 1)[None, ...]
+    return resize_bilinear_repeat(image, target_size) if (H, W) != target_size else image
 
 
 # ---------------------------------------------------------------------------
@@ -881,27 +881,32 @@ def run_astc_comparison_pipeline(
             feature_resolutions.append(int(spec.highest_level_slice()[2]))
         except (AttributeError, TypeError, ValueError):
             pass
-    effective_ref_resolution = ref_astc_resolution or (max(feature_resolutions) if feature_resolutions else None)
+    effective_ref_resolution = ref_astc_resolution or max(material_size(model, h0, w0))
     ref_h, ref_w = _ref_astc_hw_from_side(effective_ref_resolution, h0, w0)
+    native_h, native_w = material_size(model, h0, w0)
+    with open(os.path.join(compare_root, 'reconstruction.json'), 'w', encoding='utf-8') as output:
+        json.dump({'gt_size': [h0, w0], 'fntc_material_size': [native_h, native_w],
+                   'astc_material_size': [ref_h, ref_w], 'upsampler': 'bilinear_repeat',
+                   'texel_centers': True, 'decoder_queries': native_h * native_w}, output, indent=2)
     if (ref_h, ref_w) != (h0, w0):
         print(f"[ASTC Test] {ref_astc_name} encode/decode at {ref_h}x{ref_w}, aligned to Mip0 {h0}x{w0} for metrics")
 
     quant_model = copy.deepcopy(model)
     quant_model.simulate_quantize()
     quant_model.eval()
+    astc_base = None
+    if getattr(quant_model, "super_resolution_enable", False):
+        astc_base = _astc_roundtrip_superres_base_mip0(
+            dataset, astc_codec.roundtrip_rgba,
+            int(getattr(dataset, "super_resolution_base_resolution", dataset.superres_input_max_edge)),
+            output_size=material_size(quant_model, texture_height, texture_width))
     pred_fntc = _render_model_mip0(quant_model, dataset, texture_height, texture_width, num_mips, device,
+                                  superres_base_override=astc_base if quant_model._decoder_adaptation_features is not None else None,
                                   inference_tile=inference_tile)
 
     astc_grid_model = copy.deepcopy(quant_model)
     apply_astc_to_feature_grids(astc_grid_model, astc_codec.roundtrip_rgba)
     astc_grid_model.eval()
-    astc_base = None
-    if getattr(astc_grid_model, "super_resolution_enable", False):
-        astc_base = _astc_roundtrip_superres_base_mip0(
-            dataset,
-            astc_codec.roundtrip_rgba,
-            int(getattr(dataset, "super_resolution_base_resolution", dataset.superres_input_max_edge)),
-        )
     pred_fntc_grid_astc = _render_model_mip0(
         astc_grid_model, dataset, texture_height, texture_width, num_mips, device,
         superres_base_override=astc_base,
@@ -954,7 +959,7 @@ def run_astc_comparison_pipeline(
             display_name = method_name
             source_text = "unknown"
         if method_name != ref_astc_name:
-            source_text = f"{max(feature_resolutions)}x{max(feature_resolutions)}" if feature_resolutions else "unknown"
+            source_text = f"material={native_w}x{native_h},GT={w0}x{h0}"
         display_labels[method_name] = f"{display_name}[{source_text}]"
     _print_comparison_metrics(metrics, display_labels)
 

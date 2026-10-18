@@ -17,7 +17,7 @@ import tempfile
 import urllib.request
 import zipfile
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -132,10 +132,12 @@ def channels_to_rgba_u8(image_chw: torch.Tensor) -> np.ndarray:
     image_np = image_chw.detach().cpu().numpy()
     image_np = np.clip(np.round(image_np * 255.0), 0, 255).astype(np.uint8)
     c, h, w = image_np.shape
+    if not 1 <= c <= 4:
+        raise ValueError(f'An RGBA texture requires 1–4 channels, got {c}')
     # Use opaque alpha for partially populated RGBA groups. This avoids making
     # the ASTC endpoint fit depend on an artificial transparent channel.
     rgba = np.full((h, w, 4), 255, dtype=np.uint8)
-    for idx in range(min(4, c)):
+    for idx in range(c):
         rgba[:, :, idx] = image_np[idx, :, :]
     return rgba
 
@@ -144,43 +146,18 @@ def channels_to_rgba_u8(image_chw: torch.Tensor) -> np.ndarray:
 def build_traditional_astc_prediction(
     gt_image: torch.Tensor,
     canonical_slices: Dict[str, Tuple[int, int]],
-    available_textures: Iterable[str],
+    texture_packing: Dict[str, list],
     roundtrip_rgba: Callable[[np.ndarray], np.ndarray],
 ) -> torch.Tensor:
-    """ASTC round-trip on canonical PBR: RGBA groups + packed scalar quad."""
-    available_set = set(available_textures)
-    astc_pred = gt_image.clone()
-
-    for tex_type in ("diffuse", "normal", "specular"):
-        if tex_type not in available_set:
-            continue
-        s, e = canonical_slices[tex_type]
-        tex = gt_image[0, s:e, :, :]
+    """Execute dataset packing, one codec round-trip per declared texture."""
+    astc_pred = torch.zeros_like(gt_image)
+    for names in texture_packing.values():
+        channels = [index for name in names for index in range(*canonical_slices[name])]
+        tex = gt_image[0, channels]
         rgba_rt = roundtrip_rgba(channels_to_rgba_u8(tex))
-        restored_np = np.ascontiguousarray(rgba_rt[:, :, : (e - s)]).copy()
+        restored_np = np.ascontiguousarray(rgba_rt[:, :, :len(channels)]).copy()
         restored = torch.from_numpy(restored_np).permute(2, 0, 1).to(gt_image.device).float() / 255.0
-        astc_pred[0, s:e, :, :] = torch.clamp(restored, 0.0, 1.0)
-
-    packed_types = ("roughness", "occlusion", "metallic", "displacement")
-    if any(t in available_set for t in packed_types):
-        h, w = gt_image.shape[-2], gt_image.shape[-1]
-        packed = np.full((h, w, 4), 255, dtype=np.uint8)
-        for channel_idx, tex_type in enumerate(packed_types):
-            if tex_type not in available_set:
-                continue
-            s, e = canonical_slices[tex_type]
-            single_ch = gt_image[0, s:e, :, :].squeeze(0).detach().cpu().numpy()
-            packed[:, :, channel_idx] = np.clip(np.round(single_ch * 255.0), 0, 255).astype(np.uint8)
-
-        packed_rt = roundtrip_rgba(packed)
-        for channel_idx, tex_type in enumerate(packed_types):
-            if tex_type not in available_set:
-                continue
-            s, e = canonical_slices[tex_type]
-            restored = torch.from_numpy(
-                np.ascontiguousarray(packed_rt[:, :, channel_idx]).copy()
-            ).to(gt_image.device).float() / 255.0
-            astc_pred[0, s:e, :, :] = restored.unsqueeze(0)
+        astc_pred[0, channels] = restored
 
     return torch.clamp(astc_pred, 0.0, 1.0)
 
@@ -199,7 +176,7 @@ def _traditional_baseline_resampled(
     out = build_traditional_astc_prediction(
         gt_image=src,
         canonical_slices=dataset.canonical_channel_slices,
-        available_textures=dataset.available_textures,
+        texture_packing=dataset.texture_packing,
         roundtrip_rgba=roundtrip_rgba,
     )
     if (ref_h, ref_w) != (h0, w0):
@@ -221,7 +198,7 @@ def _astc_roundtrip_superres_base_mip0(dataset, roundtrip_rgba, base_resolution:
     compressed = build_traditional_astc_prediction(
         source,
         dataset.canonical_channel_slices,
-        dataset.available_textures,
+        dataset.texture_packing,
         roundtrip_rgba,
     )
     output_size = getattr(dataset, 'material_reconstruction_size', (h0, w0)) if output_size is None else tuple(output_size)
@@ -500,21 +477,8 @@ def _compute_metrics_from_refs(
 
 def _metric_channel_groups(dataset) -> Dict[str, list]:
     canon = dataset.canonical_channel_slices
-    groups: Dict[str, list] = {}
-    if "diffuse" in dataset.available_textures:
-        ds, de = canon["diffuse"]
-        groups["diffuse"] = list(range(ds, de))
-    if "normal" in dataset.available_textures:
-        ns, ne = canon["normal"]
-        groups["normal"] = list(range(ns, ne))
-    romsd: list = []
-    for tex_type in ("roughness", "occlusion", "metallic", "specular", "displacement"):
-        if tex_type in dataset.available_textures:
-            s, e = canon[tex_type]
-            romsd.extend(range(s, e))
-    if romsd:
-        groups["romsd"] = romsd
-    return groups
+    return {group: [index for name in names for index in range(*canon[name])]
+            for group, names in dataset.texture_packing.items()}
 
 
 def _group_metric_weights(dataset, eval_weights=None) -> Dict[str, float]:
@@ -887,6 +851,7 @@ def run_astc_comparison_pipeline(
     with open(os.path.join(compare_root, 'reconstruction.json'), 'w', encoding='utf-8') as output:
         json.dump({'gt_size': [h0, w0], 'fntc_material_size': [native_h, native_w],
                    'astc_material_size': [ref_h, ref_w], 'upsampler': 'bilinear_repeat',
+                   'texture_packing': dataset.texture_packing,
                    'texel_centers': True, 'decoder_queries': native_h * native_w}, output, indent=2)
     if (ref_h, ref_w) != (h0, w0):
         print(f"[ASTC Test] {ref_astc_name} encode/decode at {ref_h}x{ref_w}, aligned to Mip0 {h0}x{w0} for metrics")

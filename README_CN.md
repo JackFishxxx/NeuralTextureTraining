@@ -241,6 +241,8 @@ diffuse(3) | normal(3 或 2) | roughness(1) | occlusion(1) | metallic(1) | specu
 
 默认 `normal_encoding: xy`，因此法线占 2 个网络通道，总规范布局为 10 通道（包含 specular）；
 实际仅加载 diffuse、normal、roughness、occlusion、metallic、displacement 时为 9 通道。
+
+数据集统一生成 `texture_packing`，描述 diffuse、normal 和一张 RGBA 标量纹理（按 R/O/M/S/D 顺序紧凑打包，空余分量填 1）；五类标量齐全时，从数据、loss 和指标中移除 displacement。ASTC 基线和压缩 SR base 按同一映射执行，映射及 canonical 通道范围导出到运行目录的 `texture_packing.json`；网络槽位保持固定，可视化仍逐通道输出。输入 `ROMS` 的 alpha 表示 specular，`ROMD` 的 alpha 表示 displacement。
 如果只提供部分纹理类型，对应的缺失通道将自动填零，不影响训练和推理。
 
 ### 基于 PSNR 的自动早停

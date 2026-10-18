@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple, Union
 from torchtyping import TensorType
 
 import torch
+import json
 import os
 import math
 import numpy as np
@@ -19,6 +20,19 @@ from normal_encoding import (
     normalize_normal_rgb,
     normal_to_rgb,
 )
+
+ROMSD_TYPES = ('roughness', 'occlusion', 'metallic', 'specular', 'displacement')
+
+
+def build_texture_packing(available_textures) -> Dict[str, List[str]]:
+    """Dataset storage policy; each list fills RGBA in order, with padding set to one."""
+    available = set(available_textures)
+    groups = {name: [name] for name in ('diffuse', 'normal') if name in available}
+    scalars = [name for name in ROMSD_TYPES if name in available]
+    if scalars:
+        # D is last: remove it only when all five scalar maps are present.
+        groups['romsd'] = scalars[:4]
+    return groups
 
 
 def bilinear_repeat(image: torch.Tensor, uv_grid: torch.Tensor) -> torch.Tensor:
@@ -320,6 +334,8 @@ class TextureDataset(torch.nn.Module):
             # used by the renderer and training target.
             rough_idx = 3 if tensor.shape[0] >= 4 else min(1, tensor.shape[0] - 1)
             channel_map = [("metallic", 0), ("roughness", rough_idx)]
+        elif 'roms' in name:
+            channel_map = [('roughness', 0), ('occlusion', 1), ('metallic', 2), ('specular', 3)]
         else:
             # Generic packed ROMD convention: R=roughness, G=occlusion, B=metallic, A=displacement.
             channel_map = [("roughness", 0), ("occlusion", 1), ("metallic", 2), ("displacement", 3)]
@@ -368,7 +384,7 @@ class TextureDataset(torch.nn.Module):
             tensor = self._load_texture_tensor(filepath, texture_type)
 
             if texture_type in {"roughness", "occlusion", "metallic", "displacement"} and tensor.shape[0] > 1:
-                if self._is_single_channel_content(tensor):
+                if self._is_single_channel_content(tensor) and 'rom' not in filename.lower():
                     tensor = tensor[:1]
                 else:
                     for packed_type, packed_tensor in self._split_packed_romd_channels(filename, tensor).items():
@@ -381,6 +397,14 @@ class TextureDataset(torch.nn.Module):
                 raise ValueError(f"Expected {expected_channels} channels for {texture_type}, got {tensor.shape[0]}")
 
             textures[texture_type] = tensor
+
+        self.texture_packing = build_texture_packing(textures)
+        active = {name for names in self.texture_packing.values() for name in names}
+        for name in list(textures):
+            if name not in active:
+                del textures[name]
+                print(f'[Texture Packing] dropping {name}: exceeds RGBA capacity')
+        print(f'[Texture Packing] {self.texture_packing}')
         
         # Determine target resolution from the first available texture
         # and resize any mismatched textures to ensure consistent spatial dimensions
@@ -431,6 +455,13 @@ class TextureDataset(torch.nn.Module):
         textures_ordered = torch.cat(textures_ordered, dim=0).permute(1, 2, 0).to(self.device)  # [C, H, W] -> [H, W, C]
 
         return textures_ordered
+
+    def save_texture_packing(self, path):
+        """Export the executed mapping without coupling it to network parameters."""
+        with open(path, 'w', encoding='utf-8') as output:
+            json.dump({'texture_packing': self.texture_packing,
+                       'canonical_channel_slices': self.canonical_channel_slices,
+                       'padding_value': 1.0}, output, indent=2)
     
     def _resize_texture_for_mip(self, texture_type: str, tex_chw: torch.Tensor, mip_height: int, mip_width: int) -> torch.Tensor:
         if texture_type == "normal":
@@ -593,7 +624,7 @@ class TextureDataset(torch.nn.Module):
 
     def identify_texture_type(self, filename: str) -> str:
         
-        if "ROM" in filename:
+        if "rom" in filename.lower():
             return "roughness"
 
         filename_lower = filename.lower()

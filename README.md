@@ -241,6 +241,8 @@ diffuse(3) | normal(3 or 2) | roughness(1) | occlusion(1) | metallic(1) | specul
 With the default `normal_encoding: xy`, the canonical layout has 10 channels; datasets that omit
 specular contain 9 active channels. Missing texture types are zero-filled automatically.
 
+The dataset defines `texture_packing` once for diffuse, normal and one RGBA scalar texture (R/O/M/S/D order, unused components set to one); when all five scalars exist, displacement is excluded from data, losses and metrics. ASTC references and the compressed SR base execute this same mapping, exported with canonical channel slices in the run's `texture_packing.json`; network slots stay fixed and visualizations remain separate per active channel. Packed `ROMS` inputs use alpha for specular; `ROMD` inputs use alpha for displacement.
+
 ### PSNR-Based Early Stopping
 
 Training supports **automatic PSNR-based early stopping** to avoid wasting time on diminishing returns. When the average PSNR improvement over a segment of `--early_stop_interval` iterations falls below the threshold, the model is saved and training stops.

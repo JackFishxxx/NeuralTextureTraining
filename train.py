@@ -139,6 +139,7 @@ class Trainer(ASTCAwareTrainer):
         os.makedirs(self.model_path, exist_ok=True)
         os.makedirs(self.media_path, exist_ok=True)
         self._write_resolved_config(configs)
+        dataset.save_texture_packing(os.path.join(self.save_path, 'texture_packing.json'))
         if configs.load_iter != 0:
             self.infer_path = os.path.join(configs.load_dir, "infer")
             os.makedirs(self.infer_path, exist_ok=True)
@@ -298,15 +299,10 @@ class Trainer(ASTCAwareTrainer):
         loss_weights: torch.Tensor,
         curr_iter: Optional[int] = None,
     ) -> torch.Tensor:
-        groups = {
-            "diffuse": ["diffuse"],
-            "normal": ["normal"],
-            "romsd": ["roughness", "occlusion", "metallic", "specular", "displacement"],
-        }
         total_loss = torch.tensor(0.0, device=gt_texture.device, dtype=torch.float32)
         stats = {}
 
-        for group, textures in groups.items():
+        for group, textures in self.dataset.texture_packing.items():
             idx = self._group_indices(textures, gt_texture.device)
             if idx.numel() == 0:
                 stats[group] = None
@@ -374,11 +370,7 @@ class Trainer(ASTCAwareTrainer):
         loss = (mse * loss_weights.float()).sum()
         if curr_iter is not None:
             group_losses = {}
-            for group, textures in {
-                "diffuse": ["diffuse"],
-                "normal": ["normal"],
-                "romsd": ["roughness", "occlusion", "metallic", "specular", "displacement"],
-            }.items():
+            for group, textures in self.dataset.texture_packing.items():
                 idx = self._group_indices(textures, target_residual.device)
                 if idx.numel() == 0:
                     continue

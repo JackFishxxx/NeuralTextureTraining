@@ -297,6 +297,8 @@ The codec interval and optional latent identity STE apply to the CPU backend. Se
 projection interval to 0 disables material projection. ASTC comparison uses the existing
 `astcenc_path`, `astcenc_quality` and `astc_block` settings.
 
+ASTC exports keep annotated comparison strips and save four labeled images per texture (`FNTC_uncompressed`, `FNTC_<block>`, `ASTC_<block>`, `GT`); unannotated strips are no longer generated. PBR exports keep the full-scene strip and add `<iteration>/full/` and `<iteration>/detail/` individual images, a detail strip and `metrics.json`. Detail views are rendered again with `pbr_detail_center` (normalized x/y in the original square raster) and `pbr_detail_zoom`; their metrics are computed separately from the full-scene training logs.
+
 The proxy requires CUDA-enabled PyTorch, a matching CUDA toolkit, a C++ compiler and ninja.
 It reuses `tools/astc_encoder_source/Source`, downloading the pinned encoder source there if absent.
 It currently supports quantized Mip0 with four-channel feature grids and direct diffuse disabled.

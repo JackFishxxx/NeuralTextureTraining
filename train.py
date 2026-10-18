@@ -963,6 +963,8 @@ class Trainer(ASTCAwareTrainer):
                 lpips_metric=self.lpips,
                 mip_lod_bias=self.pbr_mip_lod_bias,
                 lighting=self.pbr_lighting,
+                detail_center=self.configs.pbr_detail_center,
+                detail_zoom=self.configs.pbr_detail_zoom,
             )
             if curr_iter is not None:
                 for method, (psnr, ssim, lpips) in metrics.items():

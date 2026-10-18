@@ -629,13 +629,22 @@ def _make_annotated_tile(
     tile_pil = TF.to_pil_image(tile).convert("RGBA")
     w, h = tile_pil.size
 
+    if method_name == "fntc_quantized":
+        display_name = "FNTC_uncompressed"
+    elif method_name.startswith("fntc_astc_"):
+        display_name = "FNTC_" + method_name.removeprefix("fntc_astc_")
+    elif method_name.startswith("ref_astc_"):
+        display_name = "ASTC_" + method_name.removeprefix("ref_astc_")
+    else:
+        display_name = method_name.upper()
+
     if metric is None:
-        text = f"{method_name}\n{_format_metric_triplet(None, metric_group)}"
+        text = f"{display_name}\nReference" if method_name == "gt" else f"{display_name}\n{_format_metric_triplet(None, metric_group)}"
     else:
         selected_group = metric_group if metric_group in metric else "average"
         selected_metric = metric.get(selected_group)
         group_name = "NORMAL ANGULAR" if selected_group == "normal" else selected_group.upper()
-        text = f"{method_name} [{group_name}]\n{_format_metric_triplet(selected_metric, selected_group)}"
+        text = f"{display_name} [{group_name}]\n{_format_metric_triplet(selected_metric, selected_group)}"
 
     font_size = max(18, min(36, h // 40, w // 28))
     font = _load_overlay_font(font_size)
@@ -698,9 +707,6 @@ def _save_comparison_strip(
         img_fntc_astc = postprocess_for_vis(fntc_astc_chw[s:e, ...], vc["vis_mode"])
         img_traditional = postprocess_for_vis(traditional_chw[s:e, ...], vc["vis_mode"])
         img_gt = postprocess_for_vis(gt_chw[s:e, ...], vc["vis_mode"])
-        strip = torch.cat([img_fntc, img_fntc_astc, img_traditional, img_gt], dim=2)
-        TF.to_pil_image(strip).save(os.path.join(strip_dir, f"{vc['display_name']}.png"))
-
         metric_group = _resolve_metric_group_for_texture(vc["display_name"])
         tiles_meta = [
             (img_fntc, "fntc_quantized", metrics.get("fntc_quantized"), metric_group),
@@ -710,6 +716,12 @@ def _save_comparison_strip(
         ]
         annotated = [_make_annotated_tile(*m) for m in tiles_meta]
         _concat_pil_h(annotated).save(os.path.join(strip_dir, f"{vc['display_name']}_with_metrics.png"))
+        individual_dir = os.path.join(compare_root, vc['display_name'])
+        os.makedirs(individual_dir, exist_ok=True)
+        names = ("FNTC_uncompressed", f"FNTC_{fntc_astc_name.removeprefix('fntc_astc_')}",
+                 f"ASTC_{ref_astc_name.removeprefix('ref_astc_')}", "GT")
+        for name, tile in zip(names, annotated):
+            tile.save(os.path.join(individual_dir, name + '.png'))
 
 
 # ---------------------------------------------------------------------------

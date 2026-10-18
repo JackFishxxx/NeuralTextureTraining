@@ -295,6 +295,11 @@ class Config():
         self.enable_pbr_compare = bool(getattr(params, "enable_pbr_compare", False))
         self.pbr_compare_interval = int(getattr(params, "pbr_compare_interval", 5000))
         self.pbr_render_resolution = int(getattr(params, "pbr_render_resolution", 512))
+        self.pbr_detail_center = list(params.pbr_detail_center)
+        self.pbr_detail_zoom = float(params.pbr_detail_zoom)
+        if (len(self.pbr_detail_center) != 2 or any(not math.isfinite(v) or not 0 <= v <= 1 for v in self.pbr_detail_center)
+                or not math.isfinite(self.pbr_detail_zoom) or self.pbr_detail_zoom <= 1):
+            raise ValueError('PBR detail center must be two coordinates in [0,1] and zoom must be finite and > 1')
         self.pbr_mip_lod_bias = float(getattr(params, "pbr_mip_lod_bias", -1.0))
         self.pbr_loss_enable = bool(getattr(params, "pbr_loss_enable", False))
         self.pbr_loss_weight = float(getattr(params, "pbr_loss_weight", 0.1))
@@ -520,6 +525,10 @@ def get_args():
                         help='training iteration interval for PBR scene comparison images')
     parser.add_argument('--pbr_render_resolution', type=int, default=512,
                         help='final cropped scene height of each PBR comparison panel')
+    parser.add_argument('--pbr_detail_center', type=float, nargs=2, default=[0.5, 0.62],
+                        help='detail viewport center in the original square raster, normalized x/y from top-left')
+    parser.add_argument('--pbr_detail_zoom', type=float, default=4.0,
+                        help='PBR detail viewport magnification, rendered separately; must be > 1')
     parser.add_argument('--pbr_mip_lod_bias', type=float, default=-1.0,
                         help='PBR texture mip LOD bias; negative values select sharper mips')
     parser.add_argument('--pbr_loss_enable', action=argparse.BooleanOptionalAction, default=False,

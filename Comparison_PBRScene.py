@@ -7,6 +7,7 @@ runtime dependency to the training environment.
 
 import os
 import math
+import json
 from typing import Dict, Iterable, Tuple
 
 import numpy as np
@@ -171,8 +172,12 @@ def _material_maps(texture: torch.Tensor, slices: Dict[str, tuple], normal_encod
 
 def render_pbr_scene(texture: torch.Tensor, slices: Dict[str, tuple], normal_encoding: str,
                      resolution: int = 512, available_textures=None,
-                     mip_lod_bias: float = -1.0, lighting=None) -> np.ndarray:
-    """Rasterize the Cornell scene and return an sRGB uint8 image."""
+                     mip_lod_bias: float = -1.0, lighting=None,
+                     view_center=(0.5, 0.5), view_zoom: float = 1.0) -> np.ndarray:
+    """Rasterize float sRGB; an off-axis viewport re-renders a magnified scene region."""
+    if (not math.isfinite(view_zoom) or view_zoom < 1 or len(view_center) != 2
+            or any(not math.isfinite(v) or not 0 <= v <= 1 for v in view_center)):
+        raise ValueError('View zoom must be finite and >= 1; center must be two coordinates in [0,1]')
     maps = _material_maps(texture, slices, normal_encoding, available_textures)
     lighting = lighting or {}
     point_lights = lighting.get("point_lights", [
@@ -201,7 +206,11 @@ def render_pbr_scene(texture: torch.Tensor, slices: Dict[str, tuple], normal_enc
         z = rel @ forward
         x = (rel @ right) * focal / z
         y = (rel @ up) * focal / z
-        return np.stack([(x * 0.5 + 0.5) * (w - 1), (0.5 - y * 0.5) * (h - 1), z], axis=1)
+        if view_zoom == 1.0 and tuple(view_center) == (0.5, 0.5):
+            return np.stack([(x * 0.5 + 0.5) * (w - 1), (0.5 - y * 0.5) * (h - 1), z], axis=1)
+        screen_x = ((x * 0.5 + 0.5 - view_center[0]) * view_zoom + 0.5) * (w - 1)
+        screen_y = ((0.5 - y * 0.5 - view_center[1]) * view_zoom + 0.5) * (h - 1)
+        return np.stack([screen_x, screen_y, z], axis=1)
 
     for vertices, uvs, triangles in _cornell_meshes():
         projected = project(vertices)
@@ -378,16 +387,49 @@ def _resize_render_triplet_height(fntc: np.ndarray, astc: np.ndarray, gt: np.nda
     return resize(fntc), resize(astc), resize(gt)
 
 
+def _annotated_render(image, name, metric=None):
+    panel = Image.fromarray(np.clip(image * 255.0 + 0.5, 0, 255).astype(np.uint8)).convert('RGBA')
+    overlay = Image.new('RGBA', panel.size)
+    draw = ImageDraw.Draw(overlay)
+    label = (f'{name}\nPSNR {metric[0]:.3f}  SSIM {metric[1]:.4f}  LPIPS {metric[2]:.4f}'
+             if metric is not None else 'GT\nReference: PSNR inf  SSIM 1.0000  LPIPS 0.0000')
+    font = _load_overlay_font(panel.height)
+    # Keep annotations inside small diagnostic renders as well as 1K outputs.
+    while draw.multiline_textbbox((0, 0), label, font=font, spacing=3)[2] > panel.width - 44 and getattr(font, 'size', 10) > 10:
+        font = ImageFont.truetype(font.path, font.size - 1)
+    bbox = draw.multiline_textbbox((0, 0), label, font=font, spacing=3)
+    draw.rounded_rectangle((10, 10, 34 + bbox[2], 30 + bbox[3]), radius=6, fill=(0, 0, 0, 180))
+    draw.multiline_text((22, 20), label, fill=(245, 245, 245), font=font, spacing=3)
+    return Image.alpha_composite(panel, overlay).convert('RGB')
+
+
+def _save_render_panels(images, metrics, block, directory, comparison_path):
+    os.makedirs(directory, exist_ok=True)
+    names = (f'FNTC_{block}', f'ASTC_{block}', 'GT')
+    panels = [_annotated_render(image, name, metric) for image, name, metric in
+              zip(images, names, (metrics['fntc'], metrics['astc'], None))]
+    canvas = Image.new('RGB', (panels[0].width * 3, panels[0].height))
+    for index, (panel, name) in enumerate(zip(panels, names)):
+        panel.save(os.path.join(directory, name + '.png'))
+        canvas.paste(panel, (index * panel.width, 0))
+    canvas.save(comparison_path)
+
+
 @torch.no_grad()
 def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_texture: torch.Tensor,
                         gt_texture: torch.Tensor, dataset, output_root: str,
                         curr_iter: int = None, resolution: int = 512,
                         astc_block: str = "6x6", ssim_metric=None,
                         lpips_metric=None, mip_lod_bias: float = -1.0,
-                        lighting=None
+                        lighting=None, detail_center=(0.5, 0.62), detail_zoom: float = 4.0
                         ) -> Tuple[str, Dict[str, Tuple[float, float, float]]]:
     """Render FNTC-ASTC, traditional ASTC, and GT texture sets in one scene."""
     available = getattr(dataset, "available_textures", None)
+    if (not math.isfinite(detail_zoom) or detail_zoom <= 1 or len(detail_center) != 2
+            or any(not math.isfinite(v) or not 0 <= v <= 1 for v in detail_center)):
+        raise ValueError('Detail zoom must be finite and > 1; center must be two coordinates in [0,1]')
+    if ssim_metric is None or lpips_metric is None:
+        raise ValueError("ssim_metric and lpips_metric are required for PBR comparison metrics")
     # The Cornell box occupies about 56% of the square camera raster vertically.
     # Rasterize above the requested size so `resolution` describes the final,
     # cropped scene height rather than the temporary square framebuffer.
@@ -408,39 +450,34 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
     fntc_astc, traditional_astc, gt = _resize_render_triplet_height(
         fntc_astc, traditional_astc, gt, int(resolution)
     )
-    if ssim_metric is None or lpips_metric is None:
-        raise ValueError("ssim_metric and lpips_metric are required for PBR comparison metrics")
     metrics = {
         "fntc": _render_metrics(fntc_astc, gt, gt_texture.device, ssim_metric, lpips_metric),
         "astc": _render_metrics(traditional_astc, gt, gt_texture.device, ssim_metric, lpips_metric),
     }
-    panel_h, panel_w = gt.shape[:2]
-    canvas = Image.new("RGB", (panel_w * 3, panel_h), (20, 20, 20))
-    to_image = lambda image: Image.fromarray(np.clip(image * 255.0 + 0.5, 0, 255).astype(np.uint8))
-    canvas.paste(to_image(fntc_astc), (0, 0))
-    canvas.paste(to_image(traditional_astc), (panel_w, 0))
-    canvas.paste(to_image(gt), (panel_w * 2, 0))
-    draw = ImageDraw.Draw(canvas)
-    font = _load_overlay_font(panel_h)
-    block = str(astc_block).upper()
-    fp, fs, fl = metrics["fntc"]
-    ap, ass, al = metrics["astc"]
-    labels = (
-        f"FNTC{block}\nPSNR {fp:.3f}  SSIM {fs:.4f}  LPIPS {fl:.4f}",
-        f"ASTC{block}\nPSNR {ap:.3f}  SSIM {ass:.4f}  LPIPS {al:.4f}",
-        "GT\nReference",
-    )
-    for panel_idx, label in enumerate(labels):
-        x = panel_idx * panel_w
-        bbox = draw.multiline_textbbox((0, 0), label, font=font, spacing=3)
-        pad_x, pad_y = 12, 10
-        box_w, box_h = bbox[2] - bbox[0] + pad_x * 2, bbox[3] - bbox[1] + pad_y * 2
-        draw.rounded_rectangle((x + 10, 10, x + 10 + box_w, 10 + box_h), radius=6, fill=(0, 0, 0, 180))
-        draw.multiline_text((x + 10 + pad_x, 10 + pad_y), label,
-                            fill=(245, 245, 245), font=font, spacing=5)
     out_dir = os.path.join(output_root, "Compare_PBRScene")
     os.makedirs(out_dir, exist_ok=True)
-    filename = "comparison.png" if curr_iter is None else f"{curr_iter}.png"
-    path = os.path.join(out_dir, filename)
-    canvas.save(path)
+    stem = "comparison" if curr_iter is None else str(curr_iter)
+    path = os.path.join(out_dir, stem + ".png")
+    assets_dir = os.path.join(out_dir, stem)
+    _save_render_panels((fntc_astc, traditional_astc, gt), metrics, astc_block,
+                        os.path.join(assets_dir, 'full'), path)
+
+    # A fresh narrow viewport changes rasterization and UV derivatives/LOD.
+    # These are new samples and shading evaluations, never resized full-frame crops.
+    detail = [render_pbr_scene(texture, dataset.canonical_channel_slices, dataset.normal_encoding,
+                               int(resolution), available, mip_lod_bias, lighting,
+                               view_center=detail_center, view_zoom=detail_zoom)
+              for texture in (fntc_astc_texture, traditional_astc_texture, gt_texture)]
+    detail_metrics = {
+        'fntc': _render_metrics(detail[0], detail[2], gt_texture.device, ssim_metric, lpips_metric),
+        'astc': _render_metrics(detail[1], detail[2], gt_texture.device, ssim_metric, lpips_metric),
+    }
+    detail_dir = os.path.join(assets_dir, 'detail')
+    _save_render_panels(detail, detail_metrics, astc_block, detail_dir,
+                        os.path.join(assets_dir, 'detail_comparison.png'))
+    with open(os.path.join(assets_dir, 'metrics.json'), 'w', encoding='utf-8') as output:
+        json.dump({'full': metrics, 'detail': detail_metrics,
+                   'detail_view': {'center': list(detail_center), 'zoom': detail_zoom,
+                                   'resolution': int(resolution), 'rendered_separately': True}},
+                  output, indent=2)
     return path, metrics

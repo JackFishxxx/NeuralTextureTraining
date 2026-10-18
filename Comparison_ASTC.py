@@ -581,8 +581,17 @@ def _format_metric_triplet(
 ) -> str:
     psnr_label, ssim_label, lpips_label = _metric_labels(metric_group)
     if metric is None:
-        return f"{psnr_label}:-  {ssim_label}:-  {lpips_label}:-"
-    return f"{psnr_label}:{metric[0]:.3f}  {ssim_label}:{metric[1]:.4f}  {lpips_label}:{metric[2]:.4f}"
+        return f"{psnr_label}:{'-':>8}  {ssim_label}:{'-':>7}  {lpips_label}:{'-':>7}"
+    return f"{psnr_label}:{metric[0]:8.3f}  {ssim_label}:{metric[1]:7.4f}  {lpips_label}:{metric[2]:7.4f}"
+
+
+def _print_comparison_metrics(metrics, display_labels):
+    label_width = max(len(label) for label in display_labels.values())
+    for method, values in metrics.items():
+        print(f"[ASTC Test] {display_labels[method]:<{label_width}} Weighted {_format_metric_triplet(values.get('average'))} "
+              f"(Diffuse {_format_metric_triplet(values.get('diffuse'))}, "
+              f"NormalAngular {_format_metric_triplet(values.get('normal'))}, "
+              f"ROMSD {_format_metric_triplet(values.get('romsd'))})")
 
 
 def _resolve_metric_group_for_texture(texture_name: str) -> str:
@@ -693,8 +702,7 @@ def _save_comparison_strip(
     vis_configs,
     postprocess_for_vis: Callable[[torch.Tensor, str], torch.Tensor],
 ) -> None:
-    strip_dir = os.path.join(compare_root, "comparison_strip")
-    os.makedirs(strip_dir, exist_ok=True)
+    os.makedirs(compare_root, exist_ok=True)
 
     fntc_chw = pred_fntc.squeeze(0)
     fntc_astc_chw = pred_fntc_grid_astc.squeeze(0)
@@ -715,13 +723,13 @@ def _save_comparison_strip(
             (img_gt, "gt", None, metric_group),
         ]
         annotated = [_make_annotated_tile(*m) for m in tiles_meta]
-        _concat_pil_h(annotated).save(os.path.join(strip_dir, f"{vc['display_name']}_with_metrics.png"))
-        individual_dir = os.path.join(compare_root, vc['display_name'])
-        os.makedirs(individual_dir, exist_ok=True)
-        names = ("FNTC_uncompressed", f"FNTC_{fntc_astc_name.removeprefix('fntc_astc_')}",
+        _concat_pil_h(annotated[1:]).save(os.path.join(compare_root, f"comparison_strip_{vc['display_name']}.png"))
+        texture_type = vc.get('texture_type', vc['display_name'])
+        texture_prefix = 'Diffuse' if texture_type in ('rgb', 'diffuse') else texture_type.capitalize()
+        names = ("Uncompressed_FNTC", f"FNTC_{fntc_astc_name.removeprefix('fntc_astc_')}",
                  f"ASTC_{ref_astc_name.removeprefix('ref_astc_')}", "GT")
         for name, tile in zip(names, annotated):
-            tile.save(os.path.join(individual_dir, name + '.png'))
+            tile.save(os.path.join(compare_root, f"{texture_prefix}_{name}.png"))
 
 
 # ---------------------------------------------------------------------------
@@ -922,6 +930,7 @@ def run_astc_comparison_pipeline(
     metrics_path = os.path.join(compare_root, f"metrics_astc_{astc_codec.astc_block}.txt")
     with open(metrics_path, "w", encoding="utf-8") as f:
         group_order = ("diffuse", "normal", "romsd", "average")
+        method_width = max(len(name) for name in metrics)
         for method_name, method_metrics in metrics.items():
             for group_name in group_order:
                 if group_name not in method_metrics:
@@ -929,13 +938,11 @@ def run_astc_comparison_pipeline(
                 p, s, l = method_metrics[group_name]
                 metric_name = "normal_angular" if group_name == "normal" else group_name
                 labels = _metric_labels("normal" if group_name == "normal" else None)
-                f.write(f"{method_name} {metric_name} {labels[0]} {p:.6f} {labels[1]} {s:.6f} {labels[2]} {l:.6f}\n")
+                f.write(f"{method_name:<{method_width}} {metric_name:<14} {labels[0]:<12} {p:12.6f} "
+                        f"{labels[1]:<12} {s:10.6f} {labels[2]:<12} {l:10.6f}\n")
 
-    for method_name, method_metrics in metrics.items():
-        avg = method_metrics.get("average")
-        diff = method_metrics.get("diffuse")
-        norm = method_metrics.get("normal")
-        romsd = method_metrics.get("romsd")
+    display_labels = {}
+    for method_name in metrics:
         if method_name == "fntc_quantized":
             display_name = "FNTC_uncompressed"
         elif method_name == fntc_astc_name:
@@ -948,13 +955,8 @@ def run_astc_comparison_pipeline(
             source_text = "unknown"
         if method_name != ref_astc_name:
             source_text = f"{max(feature_resolutions)}x{max(feature_resolutions)}" if feature_resolutions else "unknown"
-        display_label = f"{display_name}[{source_text}]"
-        print(
-            f"[ASTC Test] {display_label:<42} Weighted {_format_metric_triplet(avg)} "
-            f"(Diffuse {_format_metric_triplet(diff)}, "
-            f"NormalAngular {_format_metric_triplet(norm)}, "
-            f"ROMSD {_format_metric_triplet(romsd)})"
-        )
+        display_labels[method_name] = f"{display_name}[{source_text}]"
+    _print_comparison_metrics(metrics, display_labels)
 
     _save_comparison_strip(
         pred_fntc=pred_fntc,

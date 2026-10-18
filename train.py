@@ -971,17 +971,14 @@ class Trainer(ASTCAwareTrainer):
                     self.writer.add_scalar(f"PBRCompare/{method}_PSNR", psnr, curr_iter)
                     self.writer.add_scalar(f"PBRCompare/{method}_SSIM", ssim, curr_iter)
                     self.writer.add_scalar(f"PBRCompare/{method}_LPIPS", lpips, curr_iter)
-            block_tag = self.astc_block.replace("x", "_").lower()
-            fntc_metrics = metrics.get("fntc", (0.0, 0.0, 0.0))
-            astc_metrics = metrics.get("astc", (0.0, 0.0, 0.0))
-            print(
-                f"[PBR Test] Iter {curr_iter}: "
-                f"FNTC_{block_tag}_compressed "
-                f"PSNR={fntc_metrics[0]:.4f}, SSIM={fntc_metrics[1]:.4f}, LPIPS={fntc_metrics[2]:.4f}; "
-                f"ASTC_{block_tag}_compressed "
-                f"PSNR={astc_metrics[0]:.4f}, SSIM={astc_metrics[1]:.4f}, LPIPS={astc_metrics[2]:.4f}; "
-                f"output={path}"
-            )
+            block_tag = self.astc_block.lower()
+            labels = (f"FNTC_{block_tag}", f"ASTC_{block_tag}")
+            label_width = max(map(len, labels))
+            for method, label in zip(("fntc", "astc"), labels):
+                psnr, ssim, lpips = metrics.get(method, (0.0, 0.0, 0.0))
+                suffix = f"  output={path}" if method == "astc" else ""
+                print(f"[PBR Test] Iter {curr_iter}: {label:<{label_width}} "
+                      f"PSNR={psnr:8.4f}  SSIM={ssim:7.4f}  LPIPS={lpips:7.4f}{suffix}")
             return (path, metrics) if return_metrics else path
         finally:
             self.model.train(was_training)

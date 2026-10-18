@@ -296,7 +296,7 @@ astc_decoder_projection_interval: 500
 codec 间隔和可选 latent 恒等 STE 仅用于 CPU 后端；投影间隔设为0可关闭材质投影。
 ASTC 对比继续复用项目已有的 `astcenc_path`、`astcenc_quality` 和 `astc_block`。
 
-ASTC 保留带指标拼图，并为每种纹理保存四张标注独立图（`FNTC_uncompressed`、`FNTC_<block>`、`ASTC_<block>`、`GT`），不再生成无指标拼图。PBR 保留全景拼图，增加 `<迭代>/full/`、`<迭代>/detail/` 独立图、特写拼图和 `metrics.json`；特写按 `pbr_detail_center`（原始正方形画面中的归一化 x/y）及 `pbr_detail_zoom` 重新渲染，单独计算指标，全景日志口径不变。
+ASTC 的 `comparison_strip_<纹理>.png` 仅包含 FNTC-ASTC、ASTC 和 GT；四张独立图命名为 `<Type>_Uncompressed_FNTC.png`、`<Type>_FNTC_<block>.png`、`<Type>_ASTC_<block>.png`、`<Type>_GT.png`。所有图片直接放在迭代目录，未压缩 FNTC 仍保留在日志和独立图中，不再生成无指标拼图。PBR 的所有图片及 `metrics.json` 统一放在 `Compare_PBRScene/iter_<迭代>/`：`comparison_strip.png`、`comparison_strip_detail.png`、全景独立图 `Scene_FNTC_<block>.png`/`Scene_ASTC_<block>.png`/`Scene_GT.png`，以及带 `detail_` 前缀的特写独立图；未提供迭代号时直接放在 `Compare_PBRScene/`。特写按 `pbr_detail_center`（原始正方形画面中的归一化 x/y）及 `pbr_detail_zoom` 重新渲染，单独计算指标，全景日志口径不变。
 
 代理需要 CUDA 版 PyTorch、匹配的 CUDA toolkit、C++ 编译器和 ninja。它复用
 `tools/astc_encoder_source/Source`，源码缺失时下载固定版本到该目录。目前支持量化 Mip0、

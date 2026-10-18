@@ -403,14 +403,14 @@ def _annotated_render(image, name, metric=None):
     return Image.alpha_composite(panel, overlay).convert('RGB')
 
 
-def _save_render_panels(images, metrics, block, directory, comparison_path):
+def _save_render_panels(images, metrics, block, directory, comparison_path, prefix=''):
     os.makedirs(directory, exist_ok=True)
     names = (f'FNTC_{block}', f'ASTC_{block}', 'GT')
     panels = [_annotated_render(image, name, metric) for image, name, metric in
               zip(images, names, (metrics['fntc'], metrics['astc'], None))]
     canvas = Image.new('RGB', (panels[0].width * 3, panels[0].height))
     for index, (panel, name) in enumerate(zip(panels, names)):
-        panel.save(os.path.join(directory, name + '.png'))
+        panel.save(os.path.join(directory, prefix + name + '.png'))
         canvas.paste(panel, (index * panel.width, 0))
     canvas.save(comparison_path)
 
@@ -455,12 +455,12 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
         "astc": _render_metrics(traditional_astc, gt, gt_texture.device, ssim_metric, lpips_metric),
     }
     out_dir = os.path.join(output_root, "Compare_PBRScene")
+    if curr_iter is not None:
+        out_dir = os.path.join(out_dir, f'iter_{curr_iter:08d}')
     os.makedirs(out_dir, exist_ok=True)
-    stem = "comparison" if curr_iter is None else str(curr_iter)
-    path = os.path.join(out_dir, stem + ".png")
-    assets_dir = os.path.join(out_dir, stem)
+    path = os.path.join(out_dir, 'comparison_strip.png')
     _save_render_panels((fntc_astc, traditional_astc, gt), metrics, astc_block,
-                        os.path.join(assets_dir, 'full'), path)
+                        out_dir, path, prefix='Scene_')
 
     # A fresh narrow viewport changes rasterization and UV derivatives/LOD.
     # These are new samples and shading evaluations, never resized full-frame crops.
@@ -472,10 +472,9 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
         'fntc': _render_metrics(detail[0], detail[2], gt_texture.device, ssim_metric, lpips_metric),
         'astc': _render_metrics(detail[1], detail[2], gt_texture.device, ssim_metric, lpips_metric),
     }
-    detail_dir = os.path.join(assets_dir, 'detail')
-    _save_render_panels(detail, detail_metrics, astc_block, detail_dir,
-                        os.path.join(assets_dir, 'detail_comparison.png'))
-    with open(os.path.join(assets_dir, 'metrics.json'), 'w', encoding='utf-8') as output:
+    _save_render_panels(detail, detail_metrics, astc_block, out_dir,
+                        os.path.join(out_dir, 'comparison_strip_detail.png'), prefix='detail_')
+    with open(os.path.join(out_dir, 'metrics.json'), 'w', encoding='utf-8') as output:
         json.dump({'full': metrics, 'detail': detail_metrics,
                    'detail_view': {'center': list(detail_center), 'zoom': detail_zoom,
                                    'resolution': int(resolution), 'rendered_separately': True}},

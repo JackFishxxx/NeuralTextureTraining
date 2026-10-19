@@ -67,7 +67,7 @@ pbr_compare_interval: 5000
 pbr_render_resolution: 1024  # final cropped Cornell-box height per panel
 pbr_detail_center: [0.5, 0.62]  # normalized x/y in the original square camera raster
 pbr_detail_zoom: 4.0  # separately render the focused viewport
-pbr_mip_lod_bias: -3.0  # use one sharper mip level
+pbr_mip_lod_bias: 0.0  # use one sharper mip level
 pbr_loss_enable: true
 pbr_loss_weight: 0.2
 pbr_directional_light_enable: true

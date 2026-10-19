@@ -22,6 +22,38 @@ def _normalize(x: np.ndarray) -> np.ndarray:
     return x / np.maximum(np.linalg.norm(x, axis=-1, keepdims=True), 1e-8)
 
 
+def _triangle_tangent_frame(xyz, uv):
+    """Orthonormal UV frame, preserving handedness for mirrored UVs."""
+    edge1, edge2 = xyz[1] - xyz[0], xyz[2] - xyz[0]
+    duv1, duv2 = uv[1] - uv[0], uv[2] - uv[0]
+    determinant = duv1[0] * duv2[1] - duv1[1] * duv2[0]
+    if abs(determinant) < 1e-8:
+        raise ValueError('PBR tangent frame requires nondegenerate UVs')
+    normal = _normalize(np.cross(edge1, edge2))
+    dpdu = (edge1 * duv2[1] - edge2 * duv1[1]) / determinant
+    dpdv = (edge2 * duv1[0] - edge1 * duv2[0]) / determinant
+    tangent = _normalize(dpdu - normal * np.dot(normal, dpdu))
+    bitangent = _normalize(np.cross(normal, tangent))
+    if np.dot(bitangent, dpdv) < 0:
+        bitangent = -bitangent
+    return normal, tangent, bitangent
+
+
+def _perspective_uv_derivatives(projected, uv, interpolated_uv, invz, denominator):
+    """Differentiate this triangle's perspective UV mapping in screen pixels.
+
+    Using the local triangle avoids sampling across occluders, UV seams or
+    framebuffer edges. Unwrapped UVs retain the correct repeated-texture scale.
+    """
+    x, y = projected[:, 0], projected[:, 1]
+    dbdx = np.asarray([y[1] - y[2], y[2] - y[0], y[0] - y[1]]) / denominator
+    dbdy = np.asarray([x[2] - x[1], x[0] - x[2], x[1] - x[0]]) / denominator
+    reciprocal_z = 1.0 / projected[:, 2]
+    uv_over_z = uv * reciprocal_z[:, None]
+    return tuple((db @ uv_over_z - interpolated_uv * (db @ reciprocal_z)) / invz[:, None]
+                 for db in (dbdx, dbdy))
+
+
 def _load_overlay_font(panel_height: int):
     # Pillow's default bitmap font is roughly 10-11 px. Use a 22 px TrueType
     # font at normal output sizes to make comparison metrics about twice as large.
@@ -192,6 +224,8 @@ def render_pbr_scene(texture: torch.Tensor, slices: Dict[str, tuple], normal_enc
     tangent = np.zeros((h, w, 3), np.float32)
     bitangent = np.zeros((h, w, 3), np.float32)
     uv_buffer = np.zeros((h, w, 2), np.float32)
+    uv_dx_buffer = np.zeros((h, w, 2), np.float32)
+    uv_dy_buffer = np.zeros((h, w, 2), np.float32)
     covered = np.zeros((h, w), bool)
 
     eye = np.asarray([0.0, 0.08, -4.25], np.float32)
@@ -236,12 +270,14 @@ def render_pbr_scene(texture: torch.Tensor, slices: Dict[str, tuple], normal_enc
             if not mask.any():
                 continue
             weights = np.stack([b0 / p[0, 2], b1 / p[1, 2], b2 / p[2, 2]], -1) * z[..., None]
-            face_n = _normalize(np.cross(xyz[1] - xyz[0], xyz[2] - xyz[0]))
-            face_t = _normalize(xyz[1] - xyz[0])
-            face_b = _normalize(np.cross(face_n, face_t))
+            face_n, face_t, face_b = _triangle_tangent_frame(xyz, tuv)
+            local_uv = (weights @ tuv)[mask]
+            uv_dx, uv_dy = _perspective_uv_derivatives(p, tuv, local_uv, invz[mask], den)
             region[mask] = z[mask]
             world[ymin:ymax + 1, xmin:xmax + 1][mask] = (weights @ xyz)[mask]
-            uv_buffer[ymin:ymax + 1, xmin:xmax + 1][mask] = (weights @ tuv)[mask]
+            uv_buffer[ymin:ymax + 1, xmin:xmax + 1][mask] = local_uv
+            uv_dx_buffer[ymin:ymax + 1, xmin:xmax + 1][mask] = uv_dx
+            uv_dy_buffer[ymin:ymax + 1, xmin:xmax + 1][mask] = uv_dy
             normal[ymin:ymax + 1, xmin:xmax + 1][mask] = face_n
             tangent[ymin:ymax + 1, xmin:xmax + 1][mask] = face_t
             bitangent[ymin:ymax + 1, xmin:xmax + 1][mask] = face_b
@@ -249,18 +285,7 @@ def render_pbr_scene(texture: torch.Tensor, slices: Dict[str, tuple], normal_enc
 
     idx = np.where(covered)
     uv, pos = uv_buffer[idx], world[idx]
-    uv_right = np.roll(uv_buffer, -1, axis=1)
-    uv_down = np.roll(uv_buffer, -1, axis=0)
-    uv_dx_full = np.mod(uv_right - uv_buffer + 0.5, 1.0) - 0.5
-    uv_dy_full = np.mod(uv_down - uv_buffer + 0.5, 1.0) - 0.5
-    # Do not derive LOD across geometry silhouettes or the image wrap edge.
-    valid_x = covered & np.roll(covered, -1, axis=1)
-    valid_y = covered & np.roll(covered, -1, axis=0)
-    valid_x[:, -1] = False
-    valid_y[-1, :] = False
-    uv_dx_full[~valid_x] = 0.0
-    uv_dy_full[~valid_y] = 0.0
-    uv_dx, uv_dy = uv_dx_full[idx], uv_dy_full[idx]
+    uv_dx, uv_dy = uv_dx_buffer[idx], uv_dy_buffer[idx]
     albedo = _sample(
         maps.get("diffuse", np.full((3, 1, 1), 0.65, np.float32)), uv, uv_dx, uv_dy, mip_lod_bias
     )

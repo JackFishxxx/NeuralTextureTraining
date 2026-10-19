@@ -2,7 +2,7 @@
 
 import math
 import torch
-from Comparison_ASTC import ASTCCodec, _astc_roundtrip_superres_base_mip0
+from Comparison_ASTC import ASTCCodec, cached_astc_base
 from .differentiable_proxy import roundtrip_feature_blocks
 from Core.Feature_Grid.sampling import bilinear_repeat, resize_bilinear_repeat
 from dataset import material_size, clean_base_image, native_query_uv, prefiltered_material, sample_material
@@ -48,8 +48,8 @@ class ASTCAwareTrainer:
             self.astc_codec.ensure_executable()
         self.astc_superres_base_mip0 = None
         if configs.astc_codec_in_loop_enable and self.super_resolution_enable:
-            decoded = _astc_roundtrip_superres_base_mip0(
-                dataset, self.astc_codec.roundtrip_rgba, configs.super_resolution_base_resolution,
+            decoded = cached_astc_base(
+                dataset, self.astc_codec, configs.super_resolution_base_resolution,
                 output_size=self.material_size
             )
             self.astc_superres_base_mip0 = decoded[0].permute(1, 2, 0).contiguous()

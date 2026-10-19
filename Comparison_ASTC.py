@@ -212,6 +212,41 @@ def _astc_roundtrip_superres_base_mip0(dataset, roundtrip_rgba, base_resolution:
 # Mip0 rendering
 # ---------------------------------------------------------------------------
 
+def _reference_cache(dataset, codec):
+    """One cache per dataset/codec recipe; retain fixed images on CPU."""
+    source = tuple((id(level), level._version, tuple(level.shape)) for level in dataset.mip_cache)
+    key = (source, dataset.normal_encoding,
+           tuple((name, tuple(bounds)) for name, bounds in dataset.canonical_channel_slices.items()),
+           tuple((name, tuple(channels)) for name, channels in dataset.texture_packing.items()),
+           getattr(codec, 'astcenc_path', None), getattr(codec, 'astcenc_quality', None), codec.astc_block)
+    previous = getattr(dataset, '_comparison_reference_cache', None)
+    if previous is None or previous[0] != key:
+        dataset._comparison_reference_cache = (key, {})
+    return dataset._comparison_reference_cache[1]
+
+
+@torch.no_grad()
+def comparison_reference(dataset, codec, ref_h, ref_w):
+    cache = _reference_cache(dataset, codec)
+    size = (ref_h, ref_w)
+    if cache.get('material_size') != size:
+        gt = _render_gt_mip0(dataset, dataset.texture_height, dataset.texture_width)
+        astc = _traditional_baseline_resampled(gt, dataset, codec.roundtrip_rgba, ref_h, ref_w)
+        cache['material_size'] = size
+        cache['material'] = {'gt': gt.cpu(), 'astc': astc.cpu(), 'metrics': {}, 'pbr': {}}
+    return cache['material']
+
+
+@torch.no_grad()
+def cached_astc_base(dataset, codec, base_resolution, output_size):
+    cache = _reference_cache(dataset, codec)
+    key = (base_resolution, tuple(output_size))
+    if cache.get('base_size') != key:
+        image = _astc_roundtrip_superres_base_mip0(dataset, codec.roundtrip_rgba, base_resolution, output_size)
+        cache['base_size'], cache['base'] = key, image.cpu()
+    return cache['base'].to(dataset.mip_cache[0].device)
+
+
 @torch.no_grad()
 def _render_gt_mip0(dataset, texture_height: int, texture_width: int) -> torch.Tensor:
     mip = 0
@@ -707,8 +742,7 @@ def run_astc_comparison_pipeline(
         compare_root = os.path.join(compare_root, f"iter_{curr_iter:08d}")
     os.makedirs(compare_root, exist_ok=True)
 
-    gt_image = _render_gt_mip0(dataset, texture_height, texture_width)
-    h0, w0 = gt_image.shape[-2], gt_image.shape[-1]
+    h0, w0 = texture_height, texture_width
     feature_resolutions = []
     for spec in getattr(model, "feature_grid_specs", []):
         try:
@@ -717,6 +751,8 @@ def run_astc_comparison_pipeline(
             pass
     effective_ref_resolution = ref_astc_resolution or max(material_size(model, h0, w0))
     ref_h, ref_w = _ref_astc_hw_from_side(effective_ref_resolution, h0, w0)
+    reference = comparison_reference(dataset, astc_codec, ref_h, ref_w)
+    gt_image = reference['gt'].to(device)
     native_h, native_w = material_size(model, h0, w0)
     with open(os.path.join(compare_root, 'reconstruction.json'), 'w', encoding='utf-8') as output:
         json.dump({'gt_size': [h0, w0], 'fntc_material_size': [native_h, native_w],
@@ -731,8 +767,8 @@ def run_astc_comparison_pipeline(
     quant_model.eval()
     astc_base = None
     if getattr(quant_model, "super_resolution_enable", False):
-        astc_base = _astc_roundtrip_superres_base_mip0(
-            dataset, astc_codec.roundtrip_rgba,
+        astc_base = cached_astc_base(
+            dataset, astc_codec,
             int(getattr(dataset, "super_resolution_base_resolution", dataset.superres_input_max_edge)),
             output_size=material_size(quant_model, texture_height, texture_width))
     pred_fntc = _render_model_mip0(quant_model, dataset, texture_height, texture_width, num_mips, device,
@@ -748,13 +784,12 @@ def run_astc_comparison_pipeline(
         inference_tile=inference_tile,
     )
 
-    pred_traditional_astc = _traditional_baseline_resampled(
-        gt_mip0=gt_image,
-        dataset=dataset,
-        roundtrip_rgba=astc_codec.roundtrip_rgba,
-        ref_h=ref_h,
-        ref_w=ref_w,
-    )
+    pred_traditional_astc = reference['astc'].to(device)
+    metric_key = (id(psnr_metric), id(ssim_metric), id(lpips_metric),
+                  None if eval_weights is None else tuple(torch.as_tensor(eval_weights).flatten().tolist()))
+    if metric_key not in reference['metrics']:
+        reference['metrics'][metric_key] = _compute_group_metrics(
+            pred_traditional_astc, gt_image, dataset, psnr_metric, ssim_metric, lpips_metric, eval_weights=eval_weights)
 
     metrics = {
         "fntc_quantized": _compute_group_metrics(
@@ -763,9 +798,7 @@ def run_astc_comparison_pipeline(
         fntc_astc_name: _compute_group_metrics(
             pred_fntc_grid_astc, gt_image, dataset, psnr_metric, ssim_metric, lpips_metric, eval_weights=eval_weights
         ),
-        ref_astc_name: _compute_group_metrics(
-            pred_traditional_astc, gt_image, dataset, psnr_metric, ssim_metric, lpips_metric, eval_weights=eval_weights
-        ),
+        ref_astc_name: copy.deepcopy(reference['metrics'][metric_key]),
     }
     metrics_path = os.path.join(compare_root, f"metrics_astc_{astc_codec.astc_block}.txt")
     with open(metrics_path, "w", encoding="utf-8") as f:

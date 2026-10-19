@@ -359,15 +359,20 @@ def _render_metrics(pred: np.ndarray, gt: np.ndarray, device: torch.device,
     return tuple(0.0 if not math.isfinite(v) else v for v in (psnr, ssim, lpips))
 
 
-def _crop_render_triplet(fntc: np.ndarray, astc: np.ndarray, gt: np.ndarray):
-    """Remove the deterministic clear-color border using one shared GT crop."""
+def _render_crop_bounds(gt):
     clear = gt[0, 0]
     mask = np.max(np.abs(gt - clear[None, None, :]), axis=2) > (2.0 / 255.0)
     rows, cols = np.where(mask)
     if rows.size == 0 or cols.size == 0:
-        return fntc, astc, gt
+        return 0, gt.shape[0], 0, gt.shape[1]
     y0, y1 = int(rows.min()), int(rows.max()) + 1
     x0, x1 = int(cols.min()), int(cols.max()) + 1
+    return y0, y1, x0, x1
+
+
+def _crop_render_triplet(fntc: np.ndarray, astc: np.ndarray, gt: np.ndarray):
+    """Remove the deterministic clear-color border using one shared GT crop."""
+    y0, y1, x0, x1 = _render_crop_bounds(gt)
     return fntc[y0:y1, x0:x1], astc[y0:y1, x0:x1], gt[y0:y1, x0:x1]
 
 
@@ -421,7 +426,8 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
                         curr_iter: int = None, resolution: int = 512,
                         astc_block: str = "6x6", ssim_metric=None,
                         lpips_metric=None, mip_lod_bias: float = -1.0,
-                        lighting=None, detail_center=(0.5, 0.62), detail_zoom: float = 4.0
+                        lighting=None, detail_center=(0.5, 0.62), detail_zoom: float = 4.0,
+                        reference_cache=None,
                         ) -> Tuple[str, Dict[str, Tuple[float, float, float]]]:
     """Render FNTC-ASTC, traditional ASTC, and GT texture sets in one scene."""
     available = getattr(dataset, "available_textures", None)
@@ -434,25 +440,47 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
     # Rasterize above the requested size so `resolution` describes the final,
     # cropped scene height rather than the temporary square framebuffer.
     raster_resolution = int(math.ceil(int(resolution) / 0.56))
+    cache = {} if reference_cache is None else reference_cache
+    sources = (gt_texture, traditional_astc_texture)
+    key = (tuple((id(t), t._version, tuple(t.shape)) for t in sources),
+           tuple((name, tuple(bounds)) for name, bounds in dataset.canonical_channel_slices.items()),
+           dataset.normal_encoding, None if available is None else tuple(available),
+           resolution, mip_lod_bias, json.dumps(lighting, sort_keys=True), tuple(detail_center), detail_zoom)
+    if cache.get('key') != key:
+        cache.clear()
+        cache.update(key=key, sources=sources, metrics={})
     fntc_astc = render_pbr_scene(
         fntc_astc_texture, dataset.canonical_channel_slices, dataset.normal_encoding,
         raster_resolution, available, mip_lod_bias, lighting
     )
-    traditional_astc = render_pbr_scene(
-        traditional_astc_texture, dataset.canonical_channel_slices, dataset.normal_encoding,
-        raster_resolution, available, mip_lod_bias, lighting
-    )
-    gt = render_pbr_scene(
-        gt_texture, dataset.canonical_channel_slices, dataset.normal_encoding,
-        raster_resolution, available, mip_lod_bias, lighting
-    )
-    fntc_astc, traditional_astc, gt = _crop_render_triplet(fntc_astc, traditional_astc, gt)
-    fntc_astc, traditional_astc, gt = _resize_render_triplet_height(
-        fntc_astc, traditional_astc, gt, int(resolution)
-    )
+    if 'full' not in cache:
+        traditional_astc, gt = [render_pbr_scene(
+            texture, dataset.canonical_channel_slices, dataset.normal_encoding,
+            raster_resolution, available, mip_lod_bias, lighting
+        ) for texture in (traditional_astc_texture, gt_texture)]
+        cache['crop'] = _render_crop_bounds(gt)
+        _, traditional_astc, gt = _resize_render_triplet_height(
+            *_crop_render_triplet(traditional_astc, traditional_astc, gt), int(resolution))
+        cache['full'] = (traditional_astc, gt)
+    traditional_astc, gt = cache['full']
+    y0, y1, x0, x1 = cache['crop']
+    # The baseline crop is fixed by GT, and only the current FNTC image is resized.
+    crop = fntc_astc[y0:y1, x0:x1]
+    if crop.shape[0] != int(resolution):
+        h, w = crop.shape[:2]
+        tensor = torch.from_numpy(crop).permute(2, 0, 1)[None]
+        crop = F.interpolate(tensor, size=(int(resolution), max(1, round(w * resolution / h))),
+                             mode='area')[0].permute(1, 2, 0).numpy()
+    fntc_astc = crop
+    metric_key = (id(ssim_metric), id(lpips_metric), str(fntc_astc_texture.device))
+    if metric_key not in cache['metrics']:
+        cache['metrics'][metric_key] = {}
+    fixed_metrics = cache['metrics'][metric_key]
+    if 'full' not in fixed_metrics:
+        fixed_metrics['full'] = _render_metrics(traditional_astc, gt, fntc_astc_texture.device, ssim_metric, lpips_metric)
     metrics = {
-        "fntc": _render_metrics(fntc_astc, gt, gt_texture.device, ssim_metric, lpips_metric),
-        "astc": _render_metrics(traditional_astc, gt, gt_texture.device, ssim_metric, lpips_metric),
+        "fntc": _render_metrics(fntc_astc, gt, fntc_astc_texture.device, ssim_metric, lpips_metric),
+        "astc": fixed_metrics['full'],
     }
     out_dir = os.path.join(output_root, "Compare_PBRScene")
     if curr_iter is not None:
@@ -464,13 +492,20 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
 
     # A fresh narrow viewport changes rasterization and UV derivatives/LOD.
     # These are new samples and shading evaluations, never resized full-frame crops.
-    detail = [render_pbr_scene(texture, dataset.canonical_channel_slices, dataset.normal_encoding,
-                               int(resolution), available, mip_lod_bias, lighting,
-                               view_center=detail_center, view_zoom=detail_zoom)
-              for texture in (fntc_astc_texture, traditional_astc_texture, gt_texture)]
+    detail_fntc = render_pbr_scene(fntc_astc_texture, dataset.canonical_channel_slices, dataset.normal_encoding,
+                                 int(resolution), available, mip_lod_bias, lighting,
+                                 view_center=detail_center, view_zoom=detail_zoom)
+    if 'detail' not in cache:
+        cache['detail'] = [render_pbr_scene(texture, dataset.canonical_channel_slices, dataset.normal_encoding,
+                                          int(resolution), available, mip_lod_bias, lighting,
+                                          view_center=detail_center, view_zoom=detail_zoom)
+                           for texture in (traditional_astc_texture, gt_texture)]
+    detail = [detail_fntc, *cache['detail']]
+    if 'detail' not in fixed_metrics:
+        fixed_metrics['detail'] = _render_metrics(detail[1], detail[2], fntc_astc_texture.device, ssim_metric, lpips_metric)
     detail_metrics = {
-        'fntc': _render_metrics(detail[0], detail[2], gt_texture.device, ssim_metric, lpips_metric),
-        'astc': _render_metrics(detail[1], detail[2], gt_texture.device, ssim_metric, lpips_metric),
+        'fntc': _render_metrics(detail[0], detail[2], fntc_astc_texture.device, ssim_metric, lpips_metric),
+        'astc': fixed_metrics['detail'],
     }
     _save_render_panels(detail, detail_metrics, astc_block, out_dir,
                         os.path.join(out_dir, 'comparison_strip_detail.png'), prefix='detail_')

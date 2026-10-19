@@ -26,11 +26,10 @@ from Core.Material_Encoding.normal_encoding import decode_normal, normal_angular
 from configs import Config
 from Comparison_ASTC import (
     ASTCENC_DEFAULT_PATH,
-    _astc_roundtrip_superres_base_mip0,
-    _render_gt_mip0,
+    cached_astc_base,
+    comparison_reference,
     _render_model_mip0,
     _ref_astc_hw_from_side,
-    _traditional_baseline_resampled,
     _compute_group_metrics,
     run_astc_comparison_pipeline,
 )
@@ -918,7 +917,11 @@ class Trainer(ASTCAwareTrainer):
         was_training = self.model.training
         self.model.eval()
         try:
-            gt = _render_gt_mip0(self.dataset, self.texture_height, self.texture_width)
+            ref_h, ref_w = _ref_astc_hw_from_side(
+                self.ref_astc_resolution or max(material_size(self.model, self.texture_height, self.texture_width)),
+                self.texture_height, self.texture_width)
+            reference = comparison_reference(self.dataset, self.astc_codec, ref_h, ref_w)
+            gt = reference['gt']
             quant_model = copy.deepcopy(self.model)
             quant_model.simulate_quantize()
             quant_model.eval()
@@ -927,9 +930,9 @@ class Trainer(ASTCAwareTrainer):
             fntc_astc_model.eval()
             astc_base = None
             if self.super_resolution_enable:
-                astc_base = _astc_roundtrip_superres_base_mip0(
+                astc_base = cached_astc_base(
                     self.dataset,
-                    self.astc_codec.roundtrip_rgba,
+                    self.astc_codec,
                     int(self.configs.super_resolution_base_resolution),
                     output_size=material_size(fntc_astc_model, self.texture_height, self.texture_width),
                 )
@@ -943,18 +946,7 @@ class Trainer(ASTCAwareTrainer):
                 superres_base_override=astc_base,
                 inference_tile=self.eval_inference_tile,
             )
-            ref_h, ref_w = _ref_astc_hw_from_side(
-                self.ref_astc_resolution or max(material_size(self.model, self.texture_height, self.texture_width)),
-                self.texture_height,
-                self.texture_width,
-            )
-            traditional_astc = _traditional_baseline_resampled(
-                gt_mip0=gt,
-                dataset=self.dataset,
-                roundtrip_rgba=self.astc_codec.roundtrip_rgba,
-                ref_h=ref_h,
-                ref_w=ref_w,
-            )
+            traditional_astc = reference['astc']
             path, metrics = save_pbr_comparison(
                 fntc_astc_texture=fntc_astc,
                 traditional_astc_texture=traditional_astc,
@@ -970,6 +962,7 @@ class Trainer(ASTCAwareTrainer):
                 lighting=self.pbr_lighting,
                 detail_center=self.configs.pbr_detail_center,
                 detail_zoom=self.configs.pbr_detail_zoom,
+                reference_cache=reference['pbr'],
             )
             if curr_iter is not None:
                 for method, (psnr, ssim, lpips) in metrics.items():

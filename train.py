@@ -592,7 +592,7 @@ class Trainer(ASTCAwareTrainer):
             torch.arange(w0, w1, device=device),
             indexing="ij",
         )
-        z = torch.full_like(rr, mip_f)
+        z = torch.full_like(rr, mip_f, dtype=torch.float32)
         inp = torch.stack(((cc + 0.5) / plane_w, (rr + 0.5) / plane_h, z), dim=-1).reshape(-1, 3)
         return inp, rr.reshape(-1).long(), cc.reshape(-1).long()
 

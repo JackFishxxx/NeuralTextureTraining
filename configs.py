@@ -431,7 +431,7 @@ class Config():
 
                 processed.append({
                     "max_resolution": spec.max_resolution,
-                    "n_levels": spec.n_levels,
+                    "n_levels": 1 if self.mip0_only else spec.n_levels,
                     "quantize_bits": spec.quantize_bits,
                     "save_bits": spec.save_bits,
                     "learning_rate": spec.learning_rate,

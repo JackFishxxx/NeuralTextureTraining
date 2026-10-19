@@ -17,7 +17,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from utils import write_dds_r8g8b8a8
 from Core.Feature_Grid.feature_grid import (
-    FeatureGridSpec, enforce_wrap_boundary_constraint_inplace, feature_tensor_to_int,
+    FeatureGridSpec, compact_mip0_features, enforce_wrap_boundary_constraint_inplace, feature_tensor_to_int,
     feature_to_unorm, qat_noise_multiplier, quantize_feature_ste, quantize_feature_tensor,
     unorm_to_feature,
 )
@@ -72,6 +72,7 @@ class TCNNModel(torch.nn.Module):
         self.current_iter = 0
 
         self.num_mips = config.num_mips
+        self.mip0_only = bool(getattr(config, 'mip0_only', False))
         self.n_frequencies = config.n_frequencies
         self.n_neurons = config.n_neurons
         self.n_hidden_layers = config.n_hidden_layers
@@ -147,6 +148,8 @@ class TCNNModel(torch.nn.Module):
 
         for grid_idx, grid_cfg in enumerate(config.feature_grid_configs):
             spec = FeatureGridSpec.from_config(grid_cfg, self.quantize_bits, self.save_bits, config.learning_rate)
+            if self.mip0_only:
+                spec = FeatureGridSpec(**{**spec.__dict__, 'n_levels': 1, 'base_resolution': spec.max_resolution})
             if self.direct_diffuse_enabled:
                 spec = FeatureGridSpec(**{**spec.__dict__, "interpolation": "Linear"})
             self.feature_grid_specs.append(spec)
@@ -546,6 +549,13 @@ class TCNNModel(torch.nn.Module):
         return info
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
+        state_dict = copy.copy(state_dict)
+        for index, spec in enumerate(self.feature_grid_specs):
+            key = f'feature_grids.{index}.params'
+            if self.mip0_only and spec.n_levels == 1 and key in state_dict:
+                expected = self.feature_grids[index].params.numel()
+                if state_dict[key].numel() != expected:
+                    state_dict[key] = compact_mip0_features(state_dict[key], spec)
         saved_count = state_dict.get("_feature_gradient_count")
         if saved_count is not None and int(saved_count) != self.feature_gradient_count:
             raise ValueError("Checkpoint feature_gradient_count does not match the model configuration")

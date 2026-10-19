@@ -99,6 +99,25 @@ class FeatureGridSpec:
         return 2 ** int(self.quantize_bits)
 
 
+def compact_mip0_features(params: torch.Tensor, spec: FeatureGridSpec) -> torch.Tensor:
+    """Read the highest level of a legacy dense pyramid into a single-level grid."""
+    count = spec.max_resolution ** 2 * spec.n_features_per_level
+    if params.numel() == count:
+        return params
+    for levels in range(2, spec.max_resolution.bit_length() + 1):
+        base = spec.max_resolution >> (levels - 1)
+        prefix = sum((base << level) ** 2 * spec.n_features_per_level for level in range(levels - 1))
+        # TCNN pads each allocation to eight texels; legacy sampling/export
+        # uses FeatureGridSpec's logical offsets, which must remain unchanged.
+        padded = sum(((base << level) ** 2 + 7) // 8 * 8 * spec.n_features_per_level
+                     for level in range(levels))
+        if params.numel() in (prefix + count, padded):
+            result = params.new_zeros(((spec.max_resolution ** 2 + 7) // 8) * 8 * spec.n_features_per_level)
+            result[:count] = params[prefix:prefix + count]
+            return result
+    raise ValueError('Checkpoint feature count does not match a dense pyramid at the configured resolution')
+
+
 def quantize_feature_tensor(params: torch.Tensor, spec: FeatureGridSpec) -> torch.Tensor:
     """Quantize feature values to the configured uniform grid and return floats."""
     n = spec.quant_step_count

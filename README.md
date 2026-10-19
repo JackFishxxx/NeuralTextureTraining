@@ -355,7 +355,7 @@ The model supports **heterogeneous feature grids** through the `feature_grid_con
 | Field | Description |
 |-------|-------------|
 | `max_resolution` | Maximum resolution of the grid |
-| `n_levels` | Number of Mip levels |
+| `n_levels` | Number of grid levels; fixed to 1 when `mip0_only` is enabled |
 | `quantize_bits` | Quantization precision (2 / 4 / 8 bits) |
 | `save_bits` | Feature bits per texel (8 / 16 / 32 bits; at most 4 channels) |
 | `learning_rate` | Per-grid learning rate |

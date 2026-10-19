@@ -339,7 +339,7 @@ ASTC 阶段的 feature-gradient 采样使用同一份可微解码 feature；第�
 | 字段 | 说明 |
 |------|------|
 | `max_resolution` | 最大分辨率 |
-| `n_levels` | Mip 层级数 |
+| `n_levels` | 网格层级数；启用 `mip0_only` 时固定为 1 |
 | `quantize_bits` | 量化精度（2/4/8 位） |
 | `save_bits` | 每像素特征位数（8/16/32 位，最多 4 通道） |
 | `learning_rate` | 独立学习率 |

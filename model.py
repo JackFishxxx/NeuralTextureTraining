@@ -1,5 +1,4 @@
 import os
-import math
 import torch
 import copy
 import numpy as np
@@ -9,14 +8,20 @@ from torch.func import functional_call
 from torchtyping import TensorType
 
 from configs import Config
-from Core.Feature_Gradient.sampling import sample_feature_inputs
+from Core.Positional_Encoding.positional_encoding import TiledPositionalEncoding
+from Core.Feature_Grid.feature_gradients import sample_feature_inputs
+from Core.Feature_Grid.sampling import nearest_grid_uv
 
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 
 from utils import write_dds_r8g8b8a8
-from feature_grid import FeatureGridSpec, feature_tensor_to_int, feature_to_unorm, quantize_feature_ste, quantize_feature_tensor, unorm_to_feature
-from normal_encoding import normal_encoding_channels
+from Core.Feature_Grid.feature_grid import (
+    FeatureGridSpec, enforce_wrap_boundary_constraint_inplace, feature_tensor_to_int,
+    feature_to_unorm, qat_noise_multiplier, quantize_feature_ste, quantize_feature_tensor,
+    unorm_to_feature,
+)
+from Core.Material_Encoding.normal_encoding import normal_encoding_channels
 
 # Fixed channel order aligned with: diffuse, normal, roughness, occlusion, metallic, specular, displacement
 # Fixed texture order; normal can be 3 channels (xyz) or 2 channels (xy/hemi_oct).
@@ -29,44 +34,6 @@ def canonical_channel_counts(normal_encoding: str = "xyz"):
 
 def canonical_num_channels(normal_encoding: str = "xyz") -> int:
     return sum(canonical_channel_counts(normal_encoding))
-
-
-class TiledPositionalEncoding(torch.nn.Module):
-    """NeRF-style tiled sin/cos positional encoding with a configurable tile size.
-
-    Frequencies are integer harmonics of the fundamental 2*pi / tile_uv, i.e.
-    omega_k = 2*pi * 2^k / tile_uv. Every component therefore completes an integer
-    number of cycles per tile, so the whole encoding is exactly periodic with the
-    tile and tiles seamlessly (C^inf across tile borders).
-
-    Output dims = 2 (u/v) * 2 (sin/cos) * n_frequencies = 4 * n_frequencies.
-    n_frequencies = 0 -> zero output dims (encoding disabled).
-    """
-
-    def __init__(self, n_frequencies: int, tile_uv: float, device: str = "cuda"):
-        super().__init__()
-        self.n_frequencies = int(n_frequencies)
-        self.tile_uv = float(max(tile_uv, 1e-9))
-        n = int(n_frequencies)
-        if n > 0:
-            freqs = (2.0 * math.pi / self.tile_uv) * (
-                2.0 ** torch.arange(n, dtype=torch.float32, device=device)
-            )
-        else:
-            freqs = torch.zeros(0, dtype=torch.float32, device=device)
-        # Non-persistent: deterministic from config, so old checkpoints still load.
-        self.register_buffer("freqs", freqs, persistent=False)
-        self.n_output_dims = 4 * self.n_frequencies
-
-    def forward(self, uv: torch.Tensor) -> torch.Tensor:
-        if self.n_frequencies == 0:
-            return uv.new_zeros(uv.shape[0], 0)
-        f = self.freqs  # [N]
-        su = torch.sin(uv[:, 0:1] * f)  # [B, 1] x [N] -> [B, N]
-        cu = torch.cos(uv[:, 0:1] * f)
-        sv = torch.sin(uv[:, 1:2] * f)
-        cv = torch.cos(uv[:, 1:2] * f)
-        return torch.cat([su, cu, sv, cv], dim=1)  # [B, 4N]
 
 
 class TCNNModel(torch.nn.Module):
@@ -290,17 +257,10 @@ class TCNNModel(torch.nn.Module):
         )
 
     def _qat_noise_multiplier(self) -> float:
-        """Scales uniform additive noise in fake-quant forward; eval / non-quant unchanged."""
-        if self._qat_noise_schedule == "none":
-            return 1.0
-        T = max(1, self.max_iter - 1)
-        t = min(max(int(self.current_iter), 0), T)
-        w = int(self._qat_noise_warmup_frac * T)
-        if t <= w:
-            return self._qat_noise_mult_start
-        p = (t - w) / max(1, T - w)
-        c = 0.5 * (1.0 + math.cos(math.pi * p))
-        return self._qat_noise_mult_end + (self._qat_noise_mult_start - self._qat_noise_mult_end) * c
+        return qat_noise_multiplier(
+            self._qat_noise_schedule, self.current_iter, self.max_iter,
+            self._qat_noise_warmup_frac, self._qat_noise_mult_start, self._qat_noise_mult_end,
+        )
 
     def _get_qat_grid_params(self, grid_idx: int, feature_grid: torch.nn.Module) -> torch.Tensor:
         """Build one quantized grid per iteration/branch and reuse it across forwards."""
@@ -333,7 +293,6 @@ class TCNNModel(torch.nn.Module):
         quantized = quantize_feature_ste(noisy_params, self.feature_grid_specs[grid_idx])
         self._qat_param_cache[key] = (params._version, quantized)
         return quantized
-
 
     def load_ckpt(self, config: Config) -> None:
         ckpt_iter = config.load_iter
@@ -440,39 +399,6 @@ class TCNNModel(torch.nn.Module):
             tex = resize_fn(tex, size=(int(out_h), int(out_w)))
         return tex.clamp(0, 1)
 
-    def _texel_aligned_grid_uv(self, uvs: torch.Tensor, selected_level, base_res: int) -> torch.Tensor:
-        """Map texel-center UVs to tiny-cuda-nn dense-grid point coordinates."""
-        if not torch.is_tensor(selected_level):
-            selected_level = torch.full((uvs.shape[0], 1), float(selected_level), device=uvs.device, dtype=uvs.dtype)
-        level_int = torch.round(selected_level).to(torch.int64)
-        res = int(base_res) * torch.pow(
-            torch.full_like(selected_level, 2.0),
-            level_int.to(dtype=selected_level.dtype),
-        )
-        if bool(torch.all(res <= 1)):
-            return torch.zeros_like(uvs)
-        scale = torch.clamp(res - 1.0, min=1.0)
-        # tiny-cuda-nn evaluates grid position = input * (resolution-1) + .5.
-        # Cancel its .5 offset so a texture center samples its stored texel.
-        # The first texel intentionally uses a small negative encoding input;
-        # its resulting grid position is zero, not a wrapped negative index.
-        return ((uvs * res - 0.5).clamp(min=0.0).minimum(res - 1.0) - 0.5) / scale
-
-    def _nearest_grid_uv(self, uvs: torch.Tensor, selected_level, base_res: int) -> torch.Tensor:
-        """Nearest texel center in tiny-cuda-nn grid coordinates."""
-        if not torch.is_tensor(selected_level):
-            selected_level = torch.full((uvs.shape[0], 1), float(selected_level), device=uvs.device, dtype=uvs.dtype)
-        level_int = torch.round(selected_level).to(torch.int64)
-        res = int(base_res) * torch.pow(
-            torch.full_like(selected_level, 2.0),
-            level_int.to(dtype=selected_level.dtype),
-        )
-        if bool(torch.all(res <= 1)):
-            return torch.zeros_like(uvs)
-        texel = torch.floor(uvs * res).clamp(min=0.0)
-        texel = torch.minimum(texel, torch.clamp(res - 1.0, min=0.0))
-        return (texel - 0.5) / torch.clamp(res - 1.0, min=1.0)
-
     def forward(self, x: torch.Tensor) -> TensorType["batch_size", "num_channels"]:
 
         expected_dims = 3 + (self.num_channels if self.super_resolution_enable else 0)
@@ -519,7 +445,7 @@ class TCNNModel(torch.nn.Module):
                 sampled_features = sampled_features.detach()
 
             if self.direct_diffuse_enabled and idx == 0:
-                nearest_uvs = self._nearest_grid_uv(uvs, selected_level_f, self.feature_grid_base_res[idx])
+                nearest_uvs = nearest_grid_uv(uvs, selected_level_f, self.feature_grid_base_res[idx])
                 nearest_all = (functional_call(feature_grid, {"params": active_params}, (nearest_uvs,))
                                if active_params is not None else feature_grid(nearest_uvs))
                 cols = selected_level_f * grid_fpl + torch.arange(grid_fpl, device=self.device)
@@ -577,7 +503,7 @@ class TCNNModel(torch.nn.Module):
                 params.clamp_(min=min_q, max=max_q)
 
                 if apply_wrap:
-                    self._enforce_wrap_boundary_constraint_inplace(
+                    enforce_wrap_boundary_constraint_inplace(
                         params,
                         base_res=int(self.feature_grid_base_res[idx]),
                         n_levels=int(self.feature_grid_n_levels[idx]),
@@ -593,67 +519,6 @@ class TCNNModel(torch.nn.Module):
             if name == 'params':
                 return p
         return next(feature_grid.parameters())
-
-    def _enforce_wrap_boundary_constraint_inplace(
-        self,
-        flat_params: torch.Tensor,
-        base_res: int,
-        n_levels: int,
-        n_features_per_level: int,
-        strength: float = 1.0,
-        highest_k_levels: int = 1,
-    ) -> None:
-        """Tie opposite borders of each dense grid level for seamless repeat sampling.
-
-        This makes left/right and top/bottom borders consistent, which removes
-        visible seams when feature textures are sampled with wrap mode at runtime.
-        """
-        strength = float(max(0.0, min(1.0, strength)))
-        if strength <= 0.0:
-            return
-
-        highest_k_levels = max(1, int(highest_k_levels))
-        start_level = max(0, n_levels - highest_k_levels)
-
-        offset = 0
-        one_minus = 1.0 - strength
-
-        for level in range(n_levels):
-            res = base_res * (2 ** level)
-            level_count = res * res * n_features_per_level
-            if level < start_level:
-                offset += level_count
-                continue
-
-            level_flat = flat_params[offset: offset + level_count]
-            level_tex = level_flat.view(res, res, n_features_per_level)
-
-            # Match left/right edges
-            left = level_tex[:, 0, :].clone()
-            right = level_tex[:, -1, :].clone()
-            lr_avg = 0.5 * (left + right)
-            level_tex[:, 0, :] = left * one_minus + lr_avg * strength
-            level_tex[:, -1, :] = right * one_minus + lr_avg * strength
-
-            # Match top/bottom edges
-            top = level_tex[0, :, :].clone()
-            bottom = level_tex[-1, :, :].clone()
-            tb_avg = 0.5 * (top + bottom)
-            level_tex[0, :, :] = top * one_minus + tb_avg * strength
-            level_tex[-1, :, :] = bottom * one_minus + tb_avg * strength
-
-            # Keep four corners fully consistent to avoid corner pinching.
-            c00 = level_tex[0, 0, :].clone()
-            c01 = level_tex[0, -1, :].clone()
-            c10 = level_tex[-1, 0, :].clone()
-            c11 = level_tex[-1, -1, :].clone()
-            corner_avg = 0.25 * (c00 + c01 + c10 + c11)
-            level_tex[0, 0, :] = c00 * one_minus + corner_avg * strength
-            level_tex[0, -1, :] = c01 * one_minus + corner_avg * strength
-            level_tex[-1, 0, :] = c10 * one_minus + corner_avg * strength
-            level_tex[-1, -1, :] = c11 * one_minus + corner_avg * strength
-
-            offset += level_count
 
     def get_model_info(self) -> np.array:
 

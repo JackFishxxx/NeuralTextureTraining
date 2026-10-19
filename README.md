@@ -1,6 +1,6 @@
 # NeuralTexture Training Code
 
-This project is used to train Neural Texture (NTC) models. The code is implemented with [PyTorch](https://pytorch.org/get-started/locally/) and [tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn), supporting optional quantization-aware training and model export. A pure PyTorch version is also provided, which does not require tiny-cuda-nn.
+This project trains FNTC neural texture models with [PyTorch](https://pytorch.org/get-started/locally/) and [tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn), including quantization-aware training and model export. The current FNTC entry requires tiny-cuda-nn and an NVIDIA GPU; this checkout does not include a standalone CPU training implementation.
 
 ## What is Neural Texture?
 
@@ -34,6 +34,18 @@ In February 2025, NVIDIA open-sourced the [RTXNTC SDK](https://github.com/NVIDIA
 
 ---
 
+## Core Modules
+
+`model.py` assembles the feature and encoding modules with the decoder; `train.py` coordinates training with the ASTC-aware and multi-stage modules:
+
+| Directory | Responsibility |
+|---|---|
+| `Core/Feature_Grid/` | Grid layout, quantization/QAT noise, boundary constraints, shared sampling and feature gradients |
+| `Core/Positional_Encoding/` | Periodic UV sin/cos encoding |
+| `Core/Material_Encoding/` | Normal encoding, decoding and angular errors |
+| `Core/ASTC_Aware/` | Compression-aware training, latent ASTC round-trips and differentiable ASTC |
+| `Core/Multi_Stage_Training/` | Representation training, decoder fitting and layout refitting |
+
 ## Installation
 
 This project is implemented in Python. Please install Python first (we recommend using [Anaconda](https://www.anaconda.com/download/success) for environment setup). Refer to existing tutorials online if necessary.
@@ -42,23 +54,12 @@ This project is implemented in Python. Please install Python first (we recommend
 
 - Python 3.9+
 - PyTorch (matching your local CUDA version)
-- tiny-cuda-nn (optional but strongly recommended)
-- Others: `numpy`, `Pillow`, `torchvision`, `torchmetrics`, `torchtyping`, `tensorboardX`
+- tiny-cuda-nn (required by the current FNTC model)
+- Others: `numpy`, `Pillow`, `torchvision`, `torchmetrics`, `torchtyping`, `tensorboardX`, `PyYAML`, `ninja`
 
 ### Hardware Requirements
 
-Neural Texture training and inference itself does not strictly require special hardware, but tiny-cuda-nn is used for acceleration, which requires an NVIDIA GPU. Recommended requirements:
-
-- An NVIDIA GPU (Tensor Cores improve performance if available).
-- A C++14-capable compiler. Recommended and tested:
-  - **Windows**: Visual Studio 2019 or 2022
-  - **Linux**: GCC/G++ 8 or higher
-- A recent CUDA version. Recommended and tested:
-  - **Windows**: CUDA 11.5 or higher
-  - **Linux**: CUDA 10.2 or higher
-- CMake v3.21 or higher.
-
-Additionally, this project can theoretically be run on Linux for large-scale offline texture compression. The resulting compressed Neural Texture files can then be imported into UE5 for use.
+The current FNTC training/inference entry uses an NVIDIA GPU, CUDA-enabled PyTorch and tiny-cuda-nn. The default differentiable ASTC backend also needs a CUDA toolkit compatible with the installed PyTorch, a supported C++ compiler and ninja. On Windows, install the Visual Studio C++ build tools; on Linux, use a compiler supported by your PyTorch/CUDA versions. Building tiny-cuda-nn from source also requires CMake.
 
 ### Environment Setup
 
@@ -78,7 +79,7 @@ pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/to
 Install remaining dependencies:
 
 ```bash
-pip install numpy Pillow torchvision torchmetrics torchtyping tensorboardX
+pip install numpy Pillow torchvision torchmetrics torchtyping tensorboardX PyYAML ninja
 ```
 
 ---
@@ -107,14 +108,14 @@ Place your textures in the corresponding folder. The code **automatically identi
 | Texture Type | Channels | Keywords |
 |-------------|:--------:|---------|
 | diffuse (albedo/color) | 3 | `diffuse`, `albedo`, `color`, `diff` |
-| normal | 3 | `normal`, `nor_gl` |
+| normal | 2 (`xy`/`hemi_oct`) or 3 (`xyz`) | `normal`, `nor_gl` |
 | roughness | 1 | `roughness`, `rough` |
 | occlusion (AO) | 1 | `occlusion`, `ao`, `ambient` |
 | metallic | 1 | `metallic`, `metalness` |
 | specular | 1 | `specular` |
-| displacement | 1 | `displacement`, `disp` |
+| displacement | 1 | `displacement`, `disp`, `height` |
 
-> **Note**: The model output is fixed at **11 channels** (diffuse×3 + normal×3 + roughness×1 + occlusion×1 + metallic×1 + specular×1 + displacement×1). Channels for missing texture types are automatically filled with zeros — you do not need to provide all types. Textures with mismatched resolutions are automatically resized to match the first loaded texture.
+> **Note**: The model has 10 canonical output channels with `xy`/`hemi_oct` normals, or 11 with `xyz`. Missing material slots are zero-filled in targets and excluded from losses/metrics. Mismatched texture resolutions follow the first available type in canonical order (diffuse, normal, R/O/M/S/D).
 
 For detailed naming conventions, keyword matching, and channel counts, refer to `get_texture_config()` in `dataset.py`.
 
@@ -122,7 +123,7 @@ For detailed naming conventions, keyword matching, and channel counts, refer to 
 
 ## Running
 
-All configurable variables and their descriptions can be found in `configs.py`.
+Run commands from the project root. `configs.py` automatically loads `config.yaml`; `--config path/to/recipe.yaml` selects another YAML, and CLI arguments override its values. The default recipe enables Mip0, XY normals, residual SR, four feature gradients and multi-stage training. Per-grid entries in `feature_grid_configs` specify their own quantization/export precision.
 
 ### Training
 
@@ -130,24 +131,24 @@ Run training with the following command:
 
 ```bash
 python train.py \
+    --config config.yaml \
     --mode train \
     --data_dir ./data/test \
-    --save_dir ./outputs \
-    --quantize_bits 4 \
-    --save_bits 16
+    --save_dir ./outputs
 ```
 
-To resume training from a checkpoint, use `--load_iter` and `--load_dir`:
+To start single-stage training from a completed run's final checkpoint, reuse the YAML/CLI architecture that produced it and disable material projection. This loads model weights and starts new optimizer/scheduler state; it does not resume the multi-stage workflow or restore optimizer/RNG state:
 
 ```bash
 python train.py \
+    --config config.yaml \
     --mode train \
     --data_dir ./data/test \
     --save_dir ./outputs \
-    --quantize_bits 4 \
-    --save_bits 16 \
-    --load_iter 50000 \
-    --load_dir outputs/yyyy-mm-dd-hh-mm-ss
+    --no-multi_stage_training_enable \
+    --astc_decoder_projection_interval 0 \
+    --load_iter -1 \
+    --load_dir outputs/yy_mm_dd_HH_MM_SS
 ```
 
 ### Batch Training (GroupsBatching Mode)
@@ -183,27 +184,22 @@ Available GroupsBatching parameters:
 | `--groups_batching` | `False` | Enable GroupsBatching mode |
 | `--groups_batch_dir` | `data_batch` | Root directory containing texture group subdirectories |
 | `--groups_save_dir` | `save_batch` | Root directory for saving per-group results |
-| `--groups_max_workers` | `1` | Number of concurrent training workers (1 = sequential) |
-| `--groups_verbose` | `False` | Print per-group training details |
+| `--groups_max_workers` | `1` | Reserved; currently only sequential execution (`1`) is supported |
+| `--groups_verbose` | `False` | Reserved option; the current entry prints per-group logs directly |
 
 ### Evaluation
 
-During training, evaluation metrics are automatically logged. To run inference on a previously trained model:
+During training, evaluation metrics are automatically logged. For inference, reuse the architecture and material settings of the selected checkpoint; `--load_dir` is the run directory containing `models/`, and `--load_iter -1` selects its latest completed checkpoint:
 
 ```bash
 python train.py \
+    --config config.yaml \
     --mode infer \
     --data_dir ./data/test \
     --save_dir ./outputs \
-    --quantize_bits 4 \
-    --save_bits 16 \
-    --load_iter 50000 \
-    --load_dir outputs/yyyy-mm-dd-hh-mm-ss
+    --load_iter -1 \
+    --load_dir outputs/yy_mm_dd_HH_MM_SS
 ```
-
-### VS Code Launch Configuration
-
-A `launch.json` file for VS Code is provided for convenient debugging and running.
 
 ---
 
@@ -211,10 +207,10 @@ A `launch.json` file for VS Code is provided for convenient debugging and runnin
 
 ### TensorBoard
 
-Launch TensorBoard to monitor convergence and model quality:
+Each run writes events under `<save_dir>/<timestamp>/tensorboard/`. Monitor all runs under the output root:
 
 ```bash
-tensorboard --logdir ./outputs/tensorboard
+tensorboard --logdir ./outputs
 ```
 
 The following metrics are logged automatically during training:
@@ -224,7 +220,7 @@ The following metrics are logged automatically during training:
 
 Set `mip0_only: true` in `config.yaml` (or pass `--mip0_only`) to restrict training samples and
 loss, inference metrics and visualizations, and comparison inputs to the full-resolution Mip0.
-The default is `false`, which preserves multi-Mip training and inference.
+The bundled `config.yaml` sets this to `true`. Multi-Mip training requires `--no-mip0_only --no-multi_stage_training_enable --no-astc_aware_enable`; native reconstruction below GT resolution additionally requires Mip0.
 
 ---
 
@@ -245,7 +241,7 @@ The dataset defines `texture_packing` once for diffuse, normal and one RGBA scal
 
 ### PSNR-Based Early Stopping
 
-Training supports **automatic PSNR-based early stopping** to avoid wasting time on diminishing returns. When the average PSNR improvement over a segment of `--early_stop_interval` iterations falls below the threshold, the model is saved and training stops.
+Training compares validation PSNR at `--early_stop_interval` checkpoints, using compressed FNTC PSNR when ASTC comparison is enabled. Two consecutive improvements below the threshold stop an eligible phase; the decoder phase first reduces its learning rate as described below.
 
 | Argument | Default | Description |
 |----------|:-------:|-------------|
@@ -253,14 +249,19 @@ Training supports **automatic PSNR-based early stopping** to avoid wasting time 
 | `--early_stop_interval` | `5000` | Iterations per PSNR evaluation segment |
 | `--early_stop_psnr_threshold` | `0.01` | Minimum PSNR improvement threshold (dB) |
 
-Multi-stage training (`multi_stage_training_enable`, on by default; entry: `python -m Core.Multi_Stage_Training.multi_stage_training`) runs named stages: `representation` learns affine-decoded ASTC features; `decoder` fits the configured network on frozen features (`multi_stage_training_decoder_steps`, `multi_stage_training_decoder_lr_multiplier`); `layout_refit` refines the representation with that decoder fixed.
-`multi_stage_training_layout_refit_steps` (default 1000; 0 skips refinement) checks legal ASTC block layouts every 100 steps and at the final step, retaining non-regressing material/enabled-PBR PSNR/SSIM/LPIPS results without changing inference; `multi_stage_training.json` stores an extensible `stages` list, per-stage metrics/checkpoints and `final_metrics`.
-
 Warmup cannot stop early; codec activation resets the validation window. A decoder plateau multiplies LR by 0.25 down to 0.0001, then two stagnant windows stop training. Disabling early stopping still adjusts LR and runs the complete budget. Each phase restores the best compressed-validation PSNR state. Final checkpoint iterations denote completed work; each named stage in `multi_stage_training.json` records its validation or refinement details and selected checkpoint.
 
-Run `python -m unittest discover -s tests -v` for the behavior checks (native codec tests require CUDA).
-
 Each new validation best is saved atomically to `models/best_<phase>.pth`; standard final exports under `models/train_result_<completed_iteration>/` contain the restored best weights.
+
+### Multi-Stage Training
+
+Multi-stage training is enabled by default (`multi_stage_training_enable`; entry: `python -m Core.Multi_Stage_Training.multi_stage_training`). The default recipe runs:
+
+1. **Learn the representation (`representation`)**: train the feature grid with an affine decoder, without PE or feature gradients. After warmup, optimize legal ASTC endpoint/weight parameters to learn a compressed representation for material reconstruction.
+2. **Fit the decoder (`decoder`)**: freeze the learned ASTC representation and initialize a new decoder with one hidden layer of width 32 and four axial feature differences. Train the decoder on the decoded features and SR base, with a budget of 50,000 steps (`multi_stage_training_decoder_steps`; LR multiplier: `multi_stage_training_decoder_lr_multiplier`).
+3. **Refit latents and select block layouts (`layout_refit`)**: freeze the final decoder and optimize a temporary latent field, then re-encode it and select legal layouts per ASTC block. Validate at step 0, every 100 steps and the final step, retaining the best bitstream whose material and enabled-PBR PSNR/SSIM/LPIPS do not regress. The default budget is 1,000 steps (`multi_stage_training_layout_refit_steps`; 0 skips refinement), with no added inference cost.
+
+Layout refinement requires one RGBA proxy grid, SR and feature gradients, with integer GT/material resolution ratios; unsupported configurations are skipped. `multi_stage_training.json` records each stage's metrics/checkpoint and `final_metrics`.
 
 ### Quantization-Aware Training (QAT)
 
@@ -299,18 +300,15 @@ The codec interval and optional latent identity STE apply to the CPU backend. Se
 projection interval to 0 disables material projection. ASTC comparison uses the existing
 `astcenc_path`, `astcenc_quality` and `astc_block` settings.
 
-ASTC exports save annotated `comparison_strip_<texture>.png` containing FNTC-ASTC, ASTC and GT, plus four independent images named `<Type>_Uncompressed_FNTC.png`, `<Type>_FNTC_<block>.png`, `<Type>_ASTC_<block>.png` and `<Type>_GT.png` (for example, `Diffuse_`, `Normal_` and `Roughness_`). All images are directly inside the iteration directory; uncompressed FNTC remains in logs and independent images only. Unannotated strips are no longer generated. PBR exports place all images and `metrics.json` directly in `Compare_PBRScene/iter_<iteration>/`: `comparison_strip.png`, `comparison_strip_detail.png`, full-scene `Scene_FNTC_<block>.png`/`Scene_ASTC_<block>.png`/`Scene_GT.png`, and close-ups `detail_FNTC_<block>.png`/`detail_ASTC_<block>.png`/`detail_GT.png`. Without an iteration, files go directly in `Compare_PBRScene/`. Detail views are rendered again with `pbr_detail_center` (normalized x/y in the original square raster) and `pbr_detail_zoom`; their metrics are computed separately from the full-scene training logs.
+ASTC exports under `Compare_ASTC<block>/iter_<iteration>/` (for example, `Compare_ASTC6x6/iter_00001000/`) save annotated `comparison_strip_<texture>.png` containing FNTC-ASTC, ASTC and GT, plus four independent images named `<Type>_Uncompressed_FNTC.png`, `<Type>_FNTC_<block>.png`, `<Type>_ASTC_<block>.png` and `<Type>_GT.png` (for example, `Diffuse_`, `Normal_` and `Roughness_`). All images are directly inside the iteration directory; uncompressed FNTC remains in logs and independent images only. Unannotated strips are no longer generated. PBR exports place all images and `metrics.json` directly in `Compare_PBRScene/iter_<iteration>/`: `comparison_strip.png`, `comparison_strip_detail.png`, full-scene `Scene_FNTC_<block>.png`/`Scene_ASTC_<block>.png`/`Scene_GT.png`, and close-ups `detail_FNTC_<block>.png`/`detail_ASTC_<block>.png`/`detail_GT.png`. Without an iteration, files go directly in `Compare_PBRScene/`. Detail views are rendered again with `pbr_detail_center` (normalized x/y in the original square raster) and `pbr_detail_zoom`; their metrics are computed separately from the full-scene training logs.
 
 The proxy requires CUDA-enabled PyTorch, a matching CUDA toolkit, a C++ compiler and ninja.
 It reuses `tools/astc_encoder_source/Source`, downloading the pinned encoder source there if absent.
-It currently supports quantized Mip0 with four-channel feature grids and direct diffuse disabled.
-Material projection additionally requires one grid at the GT resolution and a linear SR decoder
-without PE; other configurations should set `astc_decoder_projection_interval: 0`.
+It currently supports quantized Mip0 with 6x6 ASTC, four-channel feature grids and direct diffuse disabled.
+Material projection additionally requires one grid and an affine SR decoder without PE or feature gradients; it also supports GT larger than the native material raster. Other single-stage configurations should set `astc_decoder_projection_interval: 0`.
 
-Stage two freezes the learned bitstream. Checkpoints are loaded from
+The `decoder` stage freezes the learned bitstream. Checkpoints are loaded from
 `models/train_result_<iteration>/model.pth`; `--load_iter -1` selects the latest completed checkpoint.
-The previous two-seed quality figures included a perceptual loss that has since been removed;
-they do not establish long-budget quality or speed for the current recipe.
 
 ### Feature Gradient Inputs
 
@@ -320,8 +318,7 @@ Feature gradient options are configured in the `feature gradient configs` sectio
 feature_gradient_count: 4  # 0 off | 2 right/down | 4 axial | 8 3x3 | 24 5x5
 ```
 
-`Core/Feature_Gradient/sampling.py` samples the center and positions one feature
-texel away with bilinear repeat addressing, then appends each neighbor-minus-center
+`Core/Feature_Grid/feature_gradients.py` uses bilinear repeat addressing to sample the center and selected offsets: one feature texel for 2/4/8 directions, up to two texels for the 24-direction 5x5 stencil. It appends each neighbor-minus-center
 difference to the decoder input. The differences do not add feature bitstream bytes,
 but they increase decoder input size and sampling cost. Checkpoints and
 `network_data.npz` record the direction count; inference must use the same value.
@@ -332,8 +329,7 @@ gradients participate in representation learning directly; set
 `astc_decoder_projection_interval: 0` because pointwise material projection does
 not support spatial difference inputs.
 
-The compact default uses four axial differences and a 1x32 decoder. Larger stencils
-require relaxing the compact input limit and are intended for offline experiments.
+The default decoder has one hidden layer of width 32 and four axial differences. Larger stencils are supported directly, with larger decoder inputs and greater sampling cost.
 
 ASTC training uses the same differentiably decoded texture for every feature-gradient
 sample; stage two uses frozen decoded features.
@@ -344,11 +340,11 @@ is not automatically added to the default training flow.
 
 ### Seamless Tiling (Wrap Boundary Constraint)
 
-The feature grid supports a **wrap boundary constraint**: during training, left/right and top/bottom border features (as well as corners) are softly tied together, preventing visible seams when the feature texture is sampled in Wrap/Repeat mode at runtime.
+The feature grid supports a **wrap boundary constraint**: during training, selected levels' left/right and top/bottom border features (including corners) are tied together to reduce boundary discontinuities. Sampling uses repeat addressing; boundary constraints alone do not guarantee that the reconstructed material is seamless.
 
 ### Feature Grid DDS Export
 
-When saving a model, feature grids are exported as **DDS files (R8G8B8A8, non-SRGB)** for direct loading in UE5 and other game engines. Network weights are saved as `.npz` files.
+Each `models/train_result_<iteration>/` contains `model.pth`, feature-grid **DDS files (R8G8B8A8, non-SRGB)** and `network_data.npz`. Proxy models also export `feature_grid_<index>.astc`, preserving the learned bitstream. The run directory contains `resolved_config.json`, `texture_packing.json` and, for multi-stage runs, `representation_config.json` and `multi_stage_training.json`.
 
 ### Heterogeneous Multi-Feature Grid
 
@@ -370,16 +366,16 @@ Independent loss weights can be assigned to each texture type via the `texture_l
 
 ```yaml
 n_neurons: 32
-n_hidden_layers: 0
+n_hidden_layers: 1
 output_activation: hard_swish
 ```
 
-`n_hidden_layers: 0` selects a direct mapping without hidden layers. These values can also be
+These are the default decoder settings; representation learning uses `n_hidden_layers: 0` (an affine mapping). Values can also be
 overridden with `--n_neurons`, `--n_hidden_layers`, and `--output_activation`.
 
 The bundled tiny-cuda-nn CutlassMLP ignores `use_bias`. FNTC appends a constant
 input for first-layer bias and stores an explicit `decoder_output_bias` parameter
-for the output layer.
+for the output layer. In residual SR mode, the decoder output is signed and skips the configured output activation.
 
 ### Neural Texture Super-Resolution
 
@@ -389,7 +385,7 @@ The same reconstruction is used by warmup, codec objectives/candidate checks, fr
 
 Set `super_resolution_enable: true` and configure `super_resolution_base_resolution` to train
 residual super-resolution. The source mip at that resolution is bilinearly upsampled and provided
-alongside the feature-grid samples; the network predicts `GT - bilinear_base`. Training, inference,
+alongside the feature-grid samples. At equal material/GT resolution the residual target is `GT - bilinear_base`; across resolutions the loss supervises the upsampled reconstructed material against GT. Training, inference,
 and ASTC comparison reconstruct `clamp(bilinear_base + predicted_residual, 0, 1)` at native material centers before the shared final upsampling. The same mip-level
 offset is used for lower Mips. Enabling this mode automatically disables direct-diffuse inference,
 whose direct-output semantics conflict with residual prediction.

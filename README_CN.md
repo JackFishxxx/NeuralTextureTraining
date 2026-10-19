@@ -1,6 +1,6 @@
 # NeuralTexture 训练代码
 
-该项目用于训练神经纹理（Neural Texture）模型，代码基于 [PyTorch](https://pytorch.org/get-started/locally/) 与 [tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn) 实现，支持可选的量化感知训练与模型导出等功能。同时，该项目也提供了基于纯 Pytorch 实现的版本，无需 tiny-cuda-nn 等库。
+该项目用于训练神经纹理（Neural Texture）模型，代码基于 [PyTorch](https://pytorch.org/get-started/locally/) 与 [tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn) 实现，支持量化感知训练与模型导出。当前 FNTC 入口依赖 tiny-cuda-nn 和 NVIDIA GPU；本仓库没有独立的 CPU 训练实现。
 
 ## 什么是神经纹理?
 
@@ -33,6 +33,18 @@ NVIDIA在2025年2月开源了 [RTXNTC SDK](https://github.com/NVIDIA-RTX/Rtxntc)
   - 支持训练、量化、导出全流程，研究与工程实践均可落地。
 
 
+## Core 算法模块
+
+`model.py` 将特征和编码模块与 decoder 组合起来；`train.py` 配合 ASTC 感知和多阶段模块组织训练流程：
+
+| 目录 | 职责 |
+|---|---|
+| `Core/Feature_Grid/` | 网格布局、量化/QAT 噪声、边界约束、共享采样和 feature gradients |
+| `Core/Positional_Encoding/` | UV 周期性 sin/cos 编码 |
+| `Core/Material_Encoding/` | 法线编码、解码和角度误差 |
+| `Core/ASTC_Aware/` | 压缩感知训练、latent ASTC 编解码与可微 ASTC |
+| `Core/Multi_Stage_Training/` | 表示训练、decoder 拟合和布局重拟合 |
+
 ## 安装
 
 这是一个基于Python实现的项目，因此请先安装Python，本项目建议使用 [Anaconda](https://www.anaconda.com/download/success) 进行环境配置。具体安装可参考网上已有教程。
@@ -41,30 +53,12 @@ NVIDIA在2025年2月开源了 [RTXNTC SDK](https://github.com/NVIDIA-RTX/Rtxntc)
 
 - Python 3.9+
 - PyTorch （与本机的CUDA版本匹配）
-- tiny-cuda-nn（可选，但强烈建议）
-- 其他依赖：`numpy`、`Pillow`、`torchvision`、`torchmetrics`、`torchtyping`、`tensorboardX`
+- tiny-cuda-nn（当前 FNTC 模型必需）
+- 其他依赖：`numpy`、`Pillow`、`torchvision`、`torchmetrics`、`torchtyping`、`tensorboardX`、`PyYAML`、`ninja`
 
 ### 设备要求
 
-该项目训练的神经纹理在训练和推理时本身并不需要特定的设备，但为了加速到可接受的程度，使用了 tiny-cuda-nn 进行加速，而该项目要求使用 NVIDIA 显卡进行训练。因此，设备要求参考如下：
-
-- 需要一块 NVIDIA GPU，如有 Tensor Cores 可以提升性能。
-
-- 需要一款支持 C++14 的编译器，推荐并已测试的选择如下：
-
-  - Windows：Visual Studio 2019 或 2022
-
-  - Linux：GCC/G++ 8 或更高版本
-
-- 需要一个较新的 CUDA 版本，推荐并已测试的选择如下：
-
-  - Windows：CUDA 11.5 或更高版本
-
-  - Linux：CUDA 10.2 或更高版本
-
-- 需要 CMake v3.21 或更高版本。
-
-另外，该项目理论上可以在Linux系统上进行大批量的纹理压缩，只需要将对应压缩后的神经纹理文件放到UE5内使用即可。
+当前 FNTC 训练与推理入口需要 NVIDIA GPU、CUDA 版 PyTorch 和 tiny-cuda-nn。默认的可微 ASTC 后端还需要与 PyTorch 匹配的 CUDA toolkit、受支持的 C++ 编译器和 ninja。Windows 使用 Visual Studio C++ 构建工具；Linux 使用对应 PyTorch/CUDA 版本支持的编译器。从源码安装 tiny-cuda-nn 还需要 CMake。
 
 ### 部署环境
 
@@ -84,7 +78,7 @@ pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/to
 最后，安装其余依赖
 
 ```bash
-pip install numpy Pillow torchvision torchmetrics torchtyping tensorboardX
+pip install numpy Pillow torchvision torchmetrics torchtyping tensorboardX PyYAML ninja
 ```
 
 ## 数据
@@ -111,21 +105,21 @@ data
 | 纹理类型 | 通道数 | 识别关键词 |
 |---------|:------:|-----------|
 | diffuse（漫反射/颜色） | 3 | `diffuse`、`albedo`、`color`、`diff` |
-| normal（法线） | 2（`xy`）或 3（`xyz`） | `normal`、`nor_gl` |
+| normal（法线） | 2（`xy`/`hemi_oct`）或 3（`xyz`） | `normal`、`nor_gl` |
 | roughness（粗糙度） | 1 | `roughness`、`rough` |
 | occlusion（环境光遮蔽） | 1 | `occlusion`、`ao`、`ambient` |
 | metallic（金属度） | 1 | `metallic`、`metalness` |
 | specular（高光） | 1 | `specular` |
-| displacement（位移） | 1 | `displacement`、`disp` |
+| displacement（位移） | 1 | `displacement`、`disp`、`height` |
 
-> **提示**：规范布局总通道数取决于法线编码：`normal_encoding: xyz` 时为 11 通道，`xy` 或 `hemi_oct` 时为 10 通道。缺失的纹理通道将自动填零，无需提供全部类型。不同分辨率的纹理会被自动缩放至与第一张纹理相同的分辨率。
+> **提示**：规范布局总通道数取决于法线编码：`normal_encoding: xyz` 时为 11 通道，`xy` 或 `hemi_oct` 时为 10 通道。缺失材质槽位在目标中填零，不参与 loss 和指标。分辨率不一致时，按 canonical 顺序（diffuse、normal、R/O/M/S/D）中首个有效类型的分辨率对齐。
 
 具体命名、识别和通道数量可参考 `dataset.py` 中的 `get_texture_config()` 函数。
 
 
 ## 运行
 
-项目的具体控制变量可参考 `configs.py` 内的变量与注释。
+从项目根目录执行命令。`configs.py` 自动加载 `config.yaml`；`--config path/to/recipe.yaml` 可指定其他 YAML，CLI 参数覆盖 YAML 值。默认配置启用 Mip0、XY 法线、残差超分、四个 feature gradients 和多阶段训练。`feature_grid_configs` 中每个 grid 单独指定量化与导出精度。
 
 ### 训练
 
@@ -133,24 +127,24 @@ data
 
 ```bash
 python train.py \
+    --config config.yaml \
     --mode train \
     --data_dir ./data/test \
-    --save_dir ./outputs \
-    --quantize_bits 4 \
-    --save_bits 16
+    --save_dir ./outputs
 ```
 
-如果想要重新训练已经训练了一段时间的模型，可以使用 `--load_iter` 和  `--load_dir` 指令：
+以已完成运行的最终 checkpoint 开始新的单阶段训练时，须沿用生成它的 YAML/CLI 网络结构，并关闭材质投影。此操作只加载模型权重，重新创建优化器和调度器；不会恢复多阶段流程、优化器或 RNG 状态：
 
 ```bash
 python train.py \
+    --config config.yaml \
     --mode train \
     --data_dir ./data/test \
     --save_dir ./outputs \
-    --quantize_bits 4 \
-    --save_bits 16 \
-    --load_iter 50000 \
-    --load_dir outputs/yyyy-mm-dd-hh-mm-ss
+    --no-multi_stage_training_enable \
+    --astc_decoder_projection_interval 0 \
+    --load_iter -1 \
+    --load_dir outputs/yy_mm_dd_HH_MM_SS
 ```
 
 ### 批量训练（GroupsBatching 模式）
@@ -186,27 +180,22 @@ python train.py \
 | `--groups_batching` | `False` | 启用批量训练模式 |
 | `--groups_batch_dir` | `data_batch` | 包含多个纹理组子目录的根目录 |
 | `--groups_save_dir` | `save_batch` | 批量训练结果的保存根目录 |
-| `--groups_max_workers` | `1` | 并发训练的 worker 数量（默认顺序执行） |
-| `--groups_verbose` | `False` | 是否打印每组的详细训练日志 |
+| `--groups_max_workers` | `1` | 预留参数，目前仅支持顺序执行（`1`） |
+| `--groups_verbose` | `False` | 预留参数，当前入口直接打印每组训练日志 |
 
 ### 评估
 
-训练时，会自动输出一些评估数据。而当想对已训练完毕的模型重启训练对于评估时，可以使用如下的指令
+训练时自动记录评估数据。推理时须沿用所选 checkpoint 的网络结构和材质设置；`--load_dir` 指向包含 `models/` 的运行目录，`--load_iter -1` 选择最新已完成 checkpoint：
 
 ```bash
 python train.py \
+    --config config.yaml \
     --mode infer \
     --data_dir ./data/test \
     --save_dir ./outputs \
-    --quantize_bits 4 \
-    --save_bits 16 \
-    --load_iter 50000 \
-    --load_dir outputs/yyyy-mm-dd-hh-mm-ss
+    --load_iter -1 \
+    --load_dir outputs/yy_mm_dd_HH_MM_SS
 ```
-
-### 运行Json文件
-
-本项目提供了基于vscode的 `launch.json` 文件，便于使用。
 
 ## 监控
 
@@ -214,10 +203,10 @@ python train.py \
 
 ### Tensorboard
 
-开启日志监控，评估收敛情况与模型效果：
+每次运行的事件日志位于 `<save_dir>/<timestamp>/tensorboard/`，可从输出根目录监控所有运行：
 
 ```bash
-tensorboard --logdir ./outputs/tensorboard
+tensorboard --logdir ./outputs
 ```
 
 训练过程中会自动记录以下指标：
@@ -226,8 +215,7 @@ tensorboard --logdir ./outputs/tensorboard
 - **PSNR / SSIM / LPIPS**：各 Mip 级别的图像质量评估指标
 
 在 `config.yaml` 中设置 `mip0_only: true`（或传入 `--mip0_only`），可将训练采样与 loss、
-推理指标与可视化以及 comparison 输入统一限制为全分辨率 Mip0。默认值为 `false`，保持多 Mip
-训练和推理行为。
+推理指标与可视化以及 comparison 输入统一限制为全分辨率 Mip0。仓库默认 YAML 为 `true`。多 Mip 训练需使用 `--no-mip0_only --no-multi_stage_training_enable --no-astc_aware_enable`；原生材质分辨率低于 GT 时仍须使用 Mip0。
 
 ## 主要特性
 
@@ -247,7 +235,7 @@ diffuse(3) | normal(3 或 2) | roughness(1) | occlusion(1) | metallic(1) | specu
 
 ### 基于 PSNR 的自动早停
 
-训练过程支持**基于 PSNR 的自动早停**，避免过度训练浪费时间。当连续一段时间内（`--early_stop_interval` 次迭代）的平均 PSNR 提升低于设定阈值时，训练将自动保存模型并停止。
+训练在 `--early_stop_interval` 检查点比较验证 PSNR；启用 ASTC 对比时使用压缩 FNTC 的 PSNR。连续两个窗口的提升低于阈值时，可早停的阶段才停止；decoder 阶段会先按下文规则降低学习率。
 
 | 参数 | 默认值 | 说明 |
 |------|:------:|------|
@@ -255,14 +243,19 @@ diffuse(3) | normal(3 或 2) | roughness(1) | occlusion(1) | metallic(1) | specu
 | `--early_stop_interval` | `5000` | 计算 PSNR 提升的迭代间隔 |
 | `--early_stop_psnr_threshold` | `0.01` | 最小 PSNR 提升阈值（dB） |
 
-多阶段训练（`multi_stage_training_enable`，默认开启，入口 `python -m Core.Multi_Stage_Training.multi_stage_training`）按职责命名：`representation` 用线性 decoder 学习 ASTC 表示；`decoder` 固定表示拟合配置指定的网络（`multi_stage_training_decoder_steps`、`multi_stage_training_decoder_lr_multiplier`）；`layout_refit` 固定最终 decoder 精修表示。
-`multi_stage_training_layout_refit_steps`（默认 1000，设为 0 跳过精修）每 100 步及末步验证合法 ASTC 布局，保留材质及已启用 PBR 的 PSNR/SSIM/LPIPS 均不退化的最佳码流，推理不变；`multi_stage_training.json` 用可扩展的 `stages` 列表记录各阶段指标、checkpoint 及 `final_metrics`。
-
 warmup 不早停，codec 启动后重置验证窗口。decoder 阶段平台期先将学习率乘 0.25，最低降至 0.0001；达到下限后，连续两个停滞窗口才停止。关闭早停仍执行 LR 调整并跑满步数。阶段结束恢复压缩验证 PSNR 最佳的模型；最终导出编号表示实际完成工作量，`multi_stage_training.json` 的具名阶段记录验证、精修详情和所选 checkpoint。
 
-训练行为回归并入现有测试：`python -m unittest discover -s tests -v`（原生 codec 检查需 CUDA）。
-
 每次验证刷新最佳分数时原子写入 `models/best_<phase>.pth`；常规最终导出仍在 `models/train_result_<完成迭代>/`，包含恢复后的最佳权重。
+
+### 多阶段训练（Multi-Stage Training）
+
+多阶段训练默认开启（`multi_stage_training_enable`，入口 `python -m Core.Multi_Stage_Training.multi_stage_training`）。当前默认配置依次执行：
+
+1. **学习表示（`representation`）**：使用无隐藏层的仿射 decoder 训练 feature grid，关闭 PE 和 feature gradients。warmup 后优化合法 ASTC 端点与权重参数，学习用于材质重建的压缩表示。
+2. **拟合解码器（`decoder`）**：固定已学习的 ASTC 表示，重新初始化一层宽度为 32 的 decoder，启用四个轴向 feature 差分。使用解码后的 feature 和 SR base 训练 decoder，默认最多 50,000 步（`multi_stage_training_decoder_steps`，学习率倍率为 `multi_stage_training_decoder_lr_multiplier`）。
+3. **重拟合 latent 与选择块布局（`layout_refit`）**：固定最终 decoder，优化临时 latent，再重新编码并逐 ASTC 块选择合法布局。在第 0 步、每 100 步和末步验证，保留材质及已启用 PBR 的 PSNR/SSIM/LPIPS 均不退化的最佳码流。默认 1,000 步（`multi_stage_training_layout_refit_steps`，0 跳过），不增加推理开销。
+
+布局精修要求单张 RGBA proxy grid、SR、feature gradients，且 GT/材质分辨率比例为整数；不支持的配置会跳过。`multi_stage_training.json` 记录各阶段指标、checkpoint 及 `final_metrics`。
 
 ### 量化感知训练（QAT）
 
@@ -298,16 +291,14 @@ astc_decoder_projection_interval: 500
 codec 间隔和可选 latent 恒等 STE 仅用于 CPU 后端；投影间隔设为0可关闭材质投影。
 ASTC 对比继续复用项目已有的 `astcenc_path`、`astcenc_quality` 和 `astc_block`。
 
-ASTC 的 `comparison_strip_<纹理>.png` 仅包含 FNTC-ASTC、ASTC 和 GT；四张独立图命名为 `<Type>_Uncompressed_FNTC.png`、`<Type>_FNTC_<block>.png`、`<Type>_ASTC_<block>.png`、`<Type>_GT.png`。所有图片直接放在迭代目录，未压缩 FNTC 仍保留在日志和独立图中，不再生成无指标拼图。PBR 的所有图片及 `metrics.json` 统一放在 `Compare_PBRScene/iter_<迭代>/`：`comparison_strip.png`、`comparison_strip_detail.png`、全景独立图 `Scene_FNTC_<block>.png`/`Scene_ASTC_<block>.png`/`Scene_GT.png`，以及带 `detail_` 前缀的特写独立图；未提供迭代号时直接放在 `Compare_PBRScene/`。特写按 `pbr_detail_center`（原始正方形画面中的归一化 x/y）及 `pbr_detail_zoom` 重新渲染，单独计算指标，全景日志口径不变。
+ASTC 图片位于 `Compare_ASTC<block>/iter_<迭代>/`（如 `Compare_ASTC6x6/iter_00001000/`），`comparison_strip_<纹理>.png` 仅包含 FNTC-ASTC、ASTC 和 GT；四张独立图命名为 `<Type>_Uncompressed_FNTC.png`、`<Type>_FNTC_<block>.png`、`<Type>_ASTC_<block>.png`、`<Type>_GT.png`。所有图片直接放在迭代目录，未压缩 FNTC 仍保留在日志和独立图中，不再生成无指标拼图。PBR 的所有图片及 `metrics.json` 统一放在 `Compare_PBRScene/iter_<迭代>/`：`comparison_strip.png`、`comparison_strip_detail.png`、全景独立图 `Scene_FNTC_<block>.png`/`Scene_ASTC_<block>.png`/`Scene_GT.png`，以及带 `detail_` 前缀的特写独立图；未提供迭代号时直接放在 `Compare_PBRScene/`。特写按 `pbr_detail_center`（原始正方形画面中的归一化 x/y）及 `pbr_detail_zoom` 重新渲染，单独计算指标，全景日志口径不变。
 
 代理需要 CUDA 版 PyTorch、匹配的 CUDA toolkit、C++ 编译器和 ninja。它复用
 `tools/astc_encoder_source/Source`，源码缺失时下载固定版本到该目录。目前支持量化 Mip0、
-四通道 feature grid，且 direct diffuse 必须关闭。材质投影还要求与 GT 同分辨率的单 grid
-和无 PE 的线性超分 decoder；其他配置应设置 `astc_decoder_projection_interval: 0`。
+6x6 ASTC、四通道 feature grid，且 direct diffuse 必须关闭。材质投影还要求单 grid、无 PE 和 feature gradients 的仿射超分 decoder，也支持 GT 大于原生材质分辨率；其他单阶段配置应设置 `astc_decoder_projection_interval: 0`。
 
-第二阶段冻结学习后的码流。checkpoint 从 `models/train_result_<迭代>/model.pth` 加载，
-`--load_iter -1` 选择最新已保存模型。此前两个种子的质量结果包含现在已移除的感知 loss，
-不能作为当前方案的长预算质量或速度结论。
+`decoder` 阶段冻结学习后的码流。checkpoint 从 `models/train_result_<迭代>/model.pth` 加载，
+`--load_iter -1` 选择最新已完成 checkpoint。
 
 ### Feature Gradient 输入
 
@@ -317,8 +308,7 @@ Feature gradient 参数位于独立的 `feature gradient configs` 栏目：
 feature_gradient_count: 4  # 0 关闭 | 2 右/下 | 4 四轴 | 8 3x3 | 24 5x5
 ```
 
-`Core/Feature_Gradient/sampling.py` 对中心及偏移一个 feature 纹素的位置进行
-双线性 repeat 采样，将邻居减去中心的差分拼接到 decoder 输入。差分不增加
+`Core/Feature_Grid/feature_gradients.py` 使用双线性 repeat 采样中心与所选偏移位置：2/4/8 方向偏移一个 feature 纹素，24 方向的 5x5 邻域最远偏移两个纹素。邻居减去中心的差分拼接到 decoder 输入。差分不增加
 feature 码流，但会增加 decoder 输入和采样开销。checkpoint 和 `network_data.npz`
 会记录梯度方向数，推理必须使用相同配置。
 
@@ -326,8 +316,7 @@ feature 码流，但会增加 decoder 输入和采样开销。checkpoint 和 `ne
 参与表示学习。由于逐纹素材质投影不支持空间差分输入，单阶段使用梯度时应将
 `astc_decoder_projection_interval` 设为 `0`。
 
-紧凑默认使用四个轴向差分和一层 32 神经元网络。更大的邻域需要放宽紧凑输入
-上限，建议仅用于离线实验。
+默认 decoder 使用四个轴向差分、一层宽度为 32 的隐藏层。更大邻域可直接配置，会增加 decoder 输入维度与采样开销。
 
 ASTC 阶段的 feature-gradient 采样使用同一份可微解码 feature；第二阶段使用冻结的解码 feature。
 `ASTCAwareTrainer.refine_gradient_codec` 提供显式的完整块邻域码流微调，固定 decoder 并对合法端点/权重候选做材质/PBR 验收；该方法尚未自动插入默认训练流程。
@@ -335,11 +324,11 @@ ASTC 阶段的 feature-gradient 采样使用同一份可微解码 feature；第�
 
 ### 无缝平铺（Wrap Boundary Constraint）
 
-特征网格支持**无缝平铺约束**：训练过程中自动同步网格左右、上下及四角的边界特征，使得特征纹理在 Wrap/Repeat 采样模式下不产生接缝，适合需要平铺的材质。
+特征网格支持**边界平铺约束**：训练时约束所选层级的左右、上下及四角特征，降低边界不连续。采样使用 repeat 寻址，单靠边界约束不能保证最终重建材质完全无缝。
 
 ### 特征网格 DDS 导出
 
-模型保存时，特征网格以 **DDS（R8G8B8A8，非 SRGB）格式**导出，方便在 UE5 等游戏引擎中直接加载；网络权重保存为 `.npz` 文件。
+每个 `models/train_result_<迭代>/` 包含 `model.pth`、特征网格 **DDS（R8G8B8A8，非 SRGB）**及 `network_data.npz`。代理模型另导出保留学习后码流的 `feature_grid_<index>.astc`。运行目录保存 `resolved_config.json`、`texture_packing.json`；多阶段运行还保存 `representation_config.json` 和 `multi_stage_training.json`。
 
 ### 异构多特征网格
 
@@ -361,15 +350,15 @@ ASTC 阶段的 feature-gradient 采样使用同一份可微解码 feature；第�
 
 ```yaml
 n_neurons: 32
-n_hidden_layers: 0
+n_hidden_layers: 1
 output_activation: hard_swish
 ```
 
-`n_hidden_layers: 0` 表示无隐藏层的直接映射；可通过 CLI 覆盖 `--n_neurons`、
+以上为默认 decoder 设置；representation 阶段使用 `n_hidden_layers: 0`（仿射映射）。可通过 CLI 覆盖 `--n_neurons`、
 `--n_hidden_layers` 和 `--output_activation`。
 
 当前 tiny-cuda-nn CutlassMLP 构建会忽略 `use_bias`，因此模型显式追加常数输入作为第一层
-bias，并增加 `decoder_output_bias` 作为输出层 bias。这样不依赖 tiny-cuda-nn 的隐式 bias。
+bias，并增加 `decoder_output_bias` 作为输出层 bias。残差超分模式下 decoder 输出为有符号残差，不应用配置指定的输出激活。
 
 ### 神经纹理超分
 
@@ -379,6 +368,6 @@ warmup、codec 目标及候选验收、冻结 decoder 拟合、布局重拟合�
 
 在 `config.yaml` 中设置 `super_resolution_enable: true` 并指定
 `super_resolution_base_resolution` 可启用超分残差训练。该分辨率的原始纹理 mip 作为 base，
-经双线性上采样后与 feature grid 特征拼接，网络拟合 `GT - bilinear_base`。评测、推理和 ASTC
+经双线性上采样后与 feature grid 特征拼接。同分辨率时残差目标为 `GT - bilinear_base`；跨分辨率时监督放大后的重建材质与 GT。评测、推理和 ASTC
 对比均先在原生材质中心计算 `clamp(bilinear_base + predicted_residual, 0, 1)`，再统一放大后与 GT 计算指标。更低 Mip 使用
 相同的纹理层级偏移。启用后会自动关闭与残差输出语义冲突的 direct diffuse 模式。

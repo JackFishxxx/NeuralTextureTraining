@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 
-from normal_encoding import decode_normal
+from Core.Material_Encoding.normal_encoding import decode_normal
 
 
 def _normalize(x: np.ndarray) -> np.ndarray:

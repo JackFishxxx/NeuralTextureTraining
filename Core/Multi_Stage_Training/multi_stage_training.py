@@ -15,12 +15,13 @@ import torch
 from configs import Config, get_args
 from model import TCNNModel
 from train import Trainer
+from .layout import refit_layout
 
 
 def fit_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5,
                      early_stop: bool = False):
     """Keep source latents intact while fitting their fixed ASTC-decoded inputs."""
-    from Comparison_ASTC import apply_astc_to_feature_grids
+    from Core.ASTC_Aware.differentiable_proxy import apply_astc_to_feature_grids
 
     if steps < 1 or not math.isfinite(lr_multiplier) or lr_multiplier <= 0:
         raise ValueError("steps and lr_multiplier must be positive")
@@ -171,7 +172,6 @@ def run_multi_stage_training(params, config=None):
                                    early_stop=target.early_stop)
         fitted = _record_stage(trainer, stages, "decoder", start, details)
 
-        from .layout import refit_layout
         print("[Multi Stage Training] layout_refit", flush=True)
         details = refit_layout(trainer, target.multi_stage_training_layout_refit_steps)
         if details['applied']:

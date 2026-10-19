@@ -2,8 +2,10 @@
 
 import math
 import torch
-from Comparison_ASTC import ASTCCodec, roundtrip_feature_blocks, _astc_roundtrip_superres_base_mip0
-from dataset import bilinear_repeat, resize_bilinear_repeat, material_size, clean_base_image, native_query_uv, prefiltered_material, sample_material
+from Comparison_ASTC import ASTCCodec, _astc_roundtrip_superres_base_mip0
+from .differentiable_proxy import roundtrip_feature_blocks
+from Core.Feature_Grid.sampling import bilinear_repeat, resize_bilinear_repeat
+from dataset import material_size, clean_base_image, native_query_uv, prefiltered_material, sample_material
 
 
 class ASTCAwareTrainer:
@@ -261,7 +263,8 @@ class ASTCAwareTrainer:
 
     @torch.no_grad()
     def _prepare_astc_codec_patches(self, uv, curr_iter):
-        from Core.Feature_Gradient.sampling import bilinear_texel_corners, gradient_directions
+        from Core.Feature_Grid.sampling import bilinear_texel_corners
+        from Core.Feature_Grid.feature_gradients import gradient_directions
 
         block_size = uv.new_tensor(self.configs.astc_aware_block, dtype=torch.long)
         size = material_size(self.model, self.texture_height, self.texture_width)
@@ -393,7 +396,7 @@ class ASTCAwareTrainer:
     def _sync_astc_source(self):
         # The decoded trainable bitstream is the feature texture in this mode.
         # Keep exports, ordinary eval and the subsequent frozen stage consistent.
-        from feature_grid import unorm_to_feature, quantize_feature_tensor
+        from Core.Feature_Grid.feature_grid import unorm_to_feature, quantize_feature_tensor
 
         for grid, spec, codec in zip(
             self.model.feature_grids, self.model.feature_grid_specs, self.model.astc_proxy
@@ -416,7 +419,7 @@ class ASTCAwareTrainer:
         on CUDA on all ordinary iterations.
         """
         from Core.ASTC_Aware.differentiable_proxy import ASTCProxyGrid, encode_seed
-        from feature_grid import feature_to_unorm
+        from Core.Feature_Grid.feature_grid import feature_to_unorm
 
         self._validate_astc_projection()
         model = self.model
@@ -500,7 +503,7 @@ class ASTCAwareTrainer:
         updated, and proposals must improve the actual material/PBR objective.
         """
         from .differentiable_proxy import ASTCBlockAdam
-        from Core.Feature_Gradient.sampling import gradient_directions
+        from Core.Feature_Grid.feature_gradients import gradient_directions
 
         model = self.model
         if (self.astc_codec_backend != "astc_differentiable_proxy" or not self.mip0_only

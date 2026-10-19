@@ -10,9 +10,8 @@ import math
 import numpy as np
 from PIL import Image
 import torchvision.transforms.functional as TF
-import torch.nn.functional as F
-from Core.Feature_Gradient.sampling import bilinear_texel_corners
-from normal_encoding import (
+from Core.Feature_Grid.sampling import bilinear_texel_corners, resize_bilinear_repeat, sample_image
+from Core.Material_Encoding.normal_encoding import (
     decode_normal,
     encode_normal,
     normal_encoding_channels,
@@ -33,28 +32,6 @@ def build_texture_packing(available_textures) -> Dict[str, List[str]]:
         # D is last: remove it only when all five scalar maps are present.
         groups['romsd'] = scalars[:4]
     return groups
-
-
-def bilinear_repeat(image: torch.Tensor, uv_grid: torch.Tensor) -> torch.Tensor:
-    """Texel-centered bilinear repeat lookup of an NCHW image at normalized UVs."""
-    h, w = image.shape[-2:]
-    # Modulo alone is insufficient: interpolation across the seam also needs
-    # the opposite edge texels. A circular one-texel halo supplies both corners.
-    padded = F.pad(image.float(), (1, 1, 1, 1), mode="circular")
-    uv = torch.remainder(uv_grid.float(), 1.0)
-    scale = uv.new_tensor((w, h))
-    grid = 2 * (uv * scale + 1) / (scale + 2) - 1
-    return F.grid_sample(padded, grid, mode="bilinear", align_corners=False)
-
-
-def resize_bilinear_repeat(image: torch.Tensor, size: Tuple[int, int]) -> torch.Tensor:
-    """Rasterize repeat samples at destination texel centers."""
-    h, w = size
-    y = (torch.arange(h, device=image.device, dtype=torch.float32) + .5) / h
-    x = (torch.arange(w, device=image.device, dtype=torch.float32) + .5) / w
-    yy, xx = torch.meshgrid(y, x, indexing="ij")
-    uv = torch.stack((xx, yy), -1)[None].expand(image.shape[0], -1, -1, -1)
-    return bilinear_repeat(image, uv)
 
 
 def material_size(model, height, width):
@@ -88,10 +65,6 @@ def clean_base_image(dataset, size):
     level = min(max(0, round(math.log2(ratio))) if ratio > 1 else 0, dataset.num_mips - 1)
     image = dataset.expand_mip_to_canonical_level(dataset.mip_cache[level]).permute(2, 0, 1)[None].float()
     return resize_bilinear_repeat(image, size) if tuple(image.shape[-2:]) != tuple(size) else image
-
-
-def sample_image(image, uv):
-    return bilinear_repeat(image, uv[None, :, None]).squeeze(0).squeeze(-1).T
 
 
 def native_query_uv(uv, size):

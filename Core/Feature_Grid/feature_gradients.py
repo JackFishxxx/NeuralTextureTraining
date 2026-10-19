@@ -1,6 +1,8 @@
-"""Texel-centered repeat sampling and finite-difference decoder features."""
+"""Finite-difference feature inputs: center values followed by neighbor-minus-center."""
 
 import torch
+
+from .sampling import bilinear_texel_corners
 
 
 def gradient_directions(count):
@@ -10,20 +12,6 @@ def gradient_directions(count):
         return tuple((x, y) for y in range(-2, 3) for x in range(-2, 3) if (x, y) != (0, 0))
     return ((1, 0), (0, 1), (-1, 0), (0, -1),
             (1, 1), (-1, 1), (-1, -1), (1, -1))[:count]
-
-
-def bilinear_texel_corners(uv, resolution):
-    resolution = torch.as_tensor(resolution, device=uv.device, dtype=uv.dtype)
-    if resolution.ndim < 2:
-        resolution = resolution.reshape(1, -1)
-    position = torch.remainder(uv, 1.0) * resolution - 0.5
-    lower = torch.floor(position)
-    fraction = position - lower
-    offsets = uv.new_tensor(((0, 0), (1, 0), (0, 1), (1, 1)))
-    corners = torch.remainder(lower[:, None, :] + offsets, resolution[:, None, :]).long()
-    tx, ty = fraction.unbind(1)
-    weights = torch.stack(((1-tx)*(1-ty), tx*(1-ty), (1-tx)*ty, tx*ty), 1)
-    return corners, weights
 
 
 def sample_feature_inputs(params, spec, uv, selected_level, gradient_count=0):

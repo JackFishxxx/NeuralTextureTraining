@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 
 import torch
 import yaml
-from feature_grid import FeatureGridSpec
+from Core.Feature_Grid.feature_grid import FeatureGridSpec
 
 
 def _parse_bool(value):

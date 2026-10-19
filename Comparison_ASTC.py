@@ -24,9 +24,10 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 import torchvision.transforms.functional as TF
-from feature_grid import feature_tensor_to_int, int_to_feature_tensor, quantize_feature_tensor
-from normal_encoding import decode_normal, normal_angular_psnr
-from dataset import resize_bilinear_repeat, material_size, prefiltered_material, clean_base_image, sample_image
+from Core.ASTC_Aware.differentiable_proxy import apply_astc_to_feature_grids
+from Core.Feature_Grid.sampling import resize_bilinear_repeat, sample_image
+from Core.Material_Encoding.normal_encoding import decode_normal, normal_angular_psnr
+from dataset import material_size, prefiltered_material, clean_base_image
 
 
 # ---------------------------------------------------------------------------
@@ -205,134 +206,6 @@ def _astc_roundtrip_superres_base_mip0(dataset, roundtrip_rgba, base_resolution:
     if compressed.shape[-2:] != output_size:
         compressed = resize_bilinear_repeat(compressed, output_size)
     return compressed.clamp(0.0, 1.0)
-
-
-# ---------------------------------------------------------------------------
-# FNTC feature-grid ASTC (highest level only)
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def apply_astc_to_feature_grids(astc_model, roundtrip_rgba: Callable[[np.ndarray], np.ndarray]) -> None:
-    for grid_idx, feature_grid in enumerate(astc_model.feature_grids):
-        params = astc_model._get_grid_params_tensor(feature_grid)
-        spec = astc_model.feature_grid_specs[grid_idx]
-        proxy_grids = getattr(astc_model, "astc_proxy", ())
-        if len(proxy_grids):
-            # Decode the learned legal bitstream with official CPU ASTC rules;
-            # re-encoding the clean latent would discard the optimized parameters.
-            rgba = proxy_grids[grid_idx].decode_cpu_image().to(params.device)
-            recovered = torch.round(rgba * (spec.quant_step_count - 1))
-            offset, count, _ = spec.highest_level_slice()
-            params.data[offset:offset+count] = int_to_feature_tensor(recovered.reshape(-1), spec)
-            continue
-        qbits = int(spec.quantize_bits)
-        n_k = spec.quant_step_count
-        n_fpl = int(spec.n_features_per_level)
-        offset, level_count, max_res = spec.highest_level_slice()
-
-        quant_int = feature_tensor_to_int(params, spec)
-        level = quant_int[offset : offset + level_count].reshape(max_res, max_res, n_fpl).detach().cpu().numpy()
-        recovered = level.astype(np.float32).copy()
-
-        def _roundtrip_feature_channels(channel_indices):
-            rgba = np.full((max_res, max_res, 4), 255, dtype=np.uint8)
-            for rgba_c, feature_c in enumerate(channel_indices[:4]):
-                rgba[:, :, rgba_c] = np.clip(
-                    np.round(level[:, :, feature_c].astype(np.float32) * (255.0 / float(n_k - 1))),
-                    0,
-                    255,
-                ).astype(np.uint8)
-
-            rgba_rt = roundtrip_rgba(rgba)
-            for rgba_c, feature_c in enumerate(channel_indices[:4]):
-                recovered[:, :, feature_c] = np.clip(
-                    np.round(rgba_rt[:, :, rgba_c].astype(np.float32) * (float(n_k - 1) / 255.0)),
-                    0,
-                    float(n_k - 1),
-                )
-
-        if getattr(astc_model, "direct_diffuse_enabled", False) and grid_idx == 0 and n_fpl >= 3:
-            # Direct diffuse RGB should be compared as RGB only.  Do not let the
-            # learned feature in channel A participate in the RGB ASTC encode.
-            _roundtrip_feature_channels([0, 1, 2])
-            for start in range(3, n_fpl, 4):
-                _roundtrip_feature_channels(list(range(start, min(start + 4, n_fpl))))
-        else:
-            for start in range(0, n_fpl, 4):
-                _roundtrip_feature_channels(list(range(start, min(start + 4, n_fpl))))
-
-        recovered_tensor = torch.from_numpy(recovered.reshape(-1)).to(params.device).float()
-        params.data[offset : offset + level_count] = int_to_feature_tensor(recovered_tensor, spec)
-
-
-@torch.no_grad()
-def roundtrip_feature_blocks(
-    model, grid_idx: int, block_xy: torch.Tensor,
-    roundtrip_rgba: Callable[[np.ndarray], np.ndarray], block_size: Tuple[int, int],
-) -> Tuple[torch.Tensor, torch.Tensor, float]:
-    """Encode current quantized feature blocks and return flat parameter replacements.
-
-    Blocks are assembled into an ASTC-aligned atlas. ASTC blocks encode
-    independently, so one codec invocation covers the selected positions.
-    """
-    if block_xy.ndim != 2 or block_xy.shape[1] != 2 or block_xy.shape[0] == 0:
-        raise ValueError("block_xy must have shape [N, 2] with N > 0")
-    block_w, block_h = map(int, block_size)
-    if block_w <= 0 or block_h <= 0:
-        raise ValueError("ASTC block dimensions must be positive")
-
-    grid = model.feature_grids[grid_idx]
-    params = model._get_grid_params_tensor(grid)
-    spec = model.feature_grid_specs[grid_idx]
-    offset, _, resolution = spec.highest_level_slice()
-    channels = spec.n_features_per_level
-    blocks = block_xy.to(device=params.device, dtype=torch.long)
-    local_y, local_x = torch.meshgrid(
-        torch.arange(block_h, device=params.device),
-        torch.arange(block_w, device=params.device), indexing="ij",
-    )
-    xs = blocks[:, 0, None, None] * block_w + local_x
-    ys = blocks[:, 1, None, None] * block_h + local_y
-    valid = (xs < resolution) & (ys < resolution)
-    texels = ys.clamp(max=resolution - 1) * resolution + xs.clamp(max=resolution - 1)
-    indices = offset + texels[..., None] * channels + torch.arange(channels, device=params.device)
-    codes = feature_tensor_to_int(params[indices], spec).cpu().numpy()
-    recovered = np.empty_like(codes, dtype=np.float32)
-
-    count = len(blocks)
-    atlas_cols = min(8, count)
-    atlas_rows = math.ceil(count / atlas_cols)
-    channel_groups = [list(range(channels))]
-    if getattr(model, "direct_diffuse_enabled", False) and grid_idx == 0 and channels > 3:
-        channel_groups = [[0, 1, 2], list(range(3, channels))]
-
-    for group in channel_groups:
-        atlas = np.full((atlas_rows * block_h, atlas_cols * block_w, 4), 255, dtype=np.uint8)
-        for block_idx in range(count):
-            top = block_idx // atlas_cols * block_h
-            left = block_idx % atlas_cols * block_w
-            for rgba_channel, feature_channel in enumerate(group):
-                atlas[top:top + block_h, left:left + block_w, rgba_channel] = np.rint(
-                    codes[block_idx, :, :, feature_channel] * (255.0 / (spec.quant_step_count - 1))
-                ).astype(np.uint8)
-        decoded = roundtrip_rgba(atlas)
-        for block_idx in range(count):
-            top = block_idx // atlas_cols * block_h
-            left = block_idx % atlas_cols * block_w
-            for rgba_channel, feature_channel in enumerate(group):
-                recovered[block_idx, :, :, feature_channel] = np.rint(
-                    decoded[top:top + block_h, left:left + block_w, rgba_channel]
-                    * ((spec.quant_step_count - 1) / 255.0)
-                )
-
-    decoded_codes = torch.from_numpy(recovered).to(device=params.device)
-    decoded_features = int_to_feature_tensor(decoded_codes, spec)
-    valid_channels = valid[..., None].expand_as(indices)
-    flat_indices = indices[valid_channels].reshape(-1)
-    flat_features = decoded_features[valid_channels].reshape(-1)
-    source = quantize_feature_tensor(params.index_select(0, flat_indices), spec)
-    rms_codes = float(((flat_features - source) * spec.quant_step_count).square().mean().sqrt().item())
-    return flat_indices, flat_features, rms_codes
 
 
 # ---------------------------------------------------------------------------

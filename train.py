@@ -22,7 +22,7 @@ import tinycudann as tcnn
 from configs import get_args, inference_mips, mip_sampling_probabilities
 from model import TCNNModel
 from dataset import TextureDataset
-from normal_encoding import decode_normal, normal_angular_loss, normal_angular_psnr, normal_vectors
+from Core.Material_Encoding.normal_encoding import decode_normal, normal_angular_loss, normal_angular_psnr, normal_vectors
 from configs import Config
 from Comparison_ASTC import (
     ASTCENC_DEFAULT_PATH,
@@ -32,12 +32,12 @@ from Comparison_ASTC import (
     _ref_astc_hw_from_side,
     _traditional_baseline_resampled,
     _compute_group_metrics,
-    apply_astc_to_feature_grids,
     run_astc_comparison_pipeline,
 )
 from Comparison_PBRScene import save_pbr_comparison
 from dataset import material_size
 from Core.ASTC_Aware.trainer import ASTCAwareTrainer
+from Core.ASTC_Aware.differentiable_proxy import apply_astc_to_feature_grids
 
 
 class PhaseTrainingControl:

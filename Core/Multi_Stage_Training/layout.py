@@ -3,8 +3,8 @@ import math
 
 import torch
 
-from Core.Feature_Gradient.sampling import gradient_directions
-from feature_grid import feature_to_unorm, unorm_to_feature
+from Core.Feature_Grid.feature_gradients import gradient_directions
+from Core.Feature_Grid.feature_grid import feature_to_unorm, unorm_to_feature
 from Core.ASTC_Aware.differentiable_proxy import ASTCProxyGrid, encode_seed
 from dataset import material_size
 

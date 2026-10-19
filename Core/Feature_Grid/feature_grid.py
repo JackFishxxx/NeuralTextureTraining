@@ -6,6 +6,7 @@ used by training, export, and ASTC comparison.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict
 
@@ -120,3 +121,78 @@ def feature_to_unorm(x: torch.Tensor, spec: FeatureGridSpec) -> torch.Tensor:
 def unorm_to_feature(x: torch.Tensor, spec: FeatureGridSpec) -> torch.Tensor:
     n = float(spec.quant_step_count)
     return torch.round(x.clamp(0, 1) * (n - 1.0)) / n + spec.quant_min
+
+
+def enforce_wrap_boundary_constraint_inplace(
+    flat_params: torch.Tensor,
+    base_res: int,
+    n_levels: int,
+    n_features_per_level: int,
+    strength: float = 1.0,
+    highest_k_levels: int = 1,
+) -> None:
+    """Tie opposite borders of each dense grid level for seamless repeat sampling.
+
+    This makes left/right and top/bottom borders consistent, which removes
+    visible seams when feature textures are sampled with wrap mode at runtime.
+    """
+    strength = float(max(0.0, min(1.0, strength)))
+    if strength <= 0.0:
+        return
+
+    highest_k_levels = max(1, int(highest_k_levels))
+    start_level = max(0, n_levels - highest_k_levels)
+
+    offset = 0
+    one_minus = 1.0 - strength
+
+    for level in range(n_levels):
+        res = base_res * (2 ** level)
+        level_count = res * res * n_features_per_level
+        if level < start_level:
+            offset += level_count
+            continue
+
+        level_flat = flat_params[offset: offset + level_count]
+        level_tex = level_flat.view(res, res, n_features_per_level)
+
+        # Match left/right edges
+        left = level_tex[:, 0, :].clone()
+        right = level_tex[:, -1, :].clone()
+        lr_avg = 0.5 * (left + right)
+        level_tex[:, 0, :] = left * one_minus + lr_avg * strength
+        level_tex[:, -1, :] = right * one_minus + lr_avg * strength
+
+        # Match top/bottom edges
+        top = level_tex[0, :, :].clone()
+        bottom = level_tex[-1, :, :].clone()
+        tb_avg = 0.5 * (top + bottom)
+        level_tex[0, :, :] = top * one_minus + tb_avg * strength
+        level_tex[-1, :, :] = bottom * one_minus + tb_avg * strength
+
+        # Keep four corners fully consistent to avoid corner pinching.
+        c00 = level_tex[0, 0, :].clone()
+        c01 = level_tex[0, -1, :].clone()
+        c10 = level_tex[-1, 0, :].clone()
+        c11 = level_tex[-1, -1, :].clone()
+        corner_avg = 0.25 * (c00 + c01 + c10 + c11)
+        level_tex[0, 0, :] = c00 * one_minus + corner_avg * strength
+        level_tex[0, -1, :] = c01 * one_minus + corner_avg * strength
+        level_tex[-1, 0, :] = c10 * one_minus + corner_avg * strength
+        level_tex[-1, -1, :] = c11 * one_minus + corner_avg * strength
+
+        offset += level_count
+
+
+def qat_noise_multiplier(schedule, current_iter, max_iter, warmup_frac, mult_start, mult_end):
+    """Scale fake-quant noise with the configured warmup and cosine decay."""
+    if schedule == "none":
+        return 1.0
+    T = max(1, max_iter - 1)
+    t = min(max(int(current_iter), 0), T)
+    w = int(warmup_frac * T)
+    if t <= w:
+        return mult_start
+    p = (t - w) / max(1, T - w)
+    c = 0.5 * (1.0 + math.cos(math.pi * p))
+    return mult_end + (mult_start - mult_end) * c

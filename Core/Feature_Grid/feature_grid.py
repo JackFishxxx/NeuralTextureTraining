@@ -26,6 +26,18 @@ class FeatureGridSpec:
 
     @classmethod
     def from_config(cls, cfg: Dict, default_quantize_bits: int, default_save_bits: int, default_lr: float) -> "FeatureGridSpec":
+        unknown = set(cfg) - {'max_resolution', 'n_levels', 'quantize_bits', 'save_bits',
+                              'learning_rate', 'interpolation'}
+        if unknown:
+            raise ValueError(f'Unknown feature_grid_configs keys: {sorted(unknown)}')
+        for name in ('max_resolution', 'n_levels', 'quantize_bits', 'save_bits'):
+            if name in cfg and (not isinstance(cfg[name], int) or isinstance(cfg[name], bool)):
+                raise ValueError(f'feature_grid_configs.{name} must be an integer')
+        if cfg.get('interpolation', 'Linear') not in ('Linear', 'Nearest', 'Smoothstep'):
+            raise ValueError('Unsupported feature_grid_configs.interpolation')
+        lr = cfg.get('learning_rate', default_lr)
+        if not isinstance(lr, (int, float)) or isinstance(lr, bool) or not math.isfinite(lr) or lr <= 0:
+            raise ValueError('feature_grid_configs.learning_rate must be finite and positive')
         max_res = int(cfg.get("max_resolution", 1024))
         if max_res <= 0 or (max_res & (max_res - 1)) != 0:
             raise ValueError("max_resolution must be a positive power of two")

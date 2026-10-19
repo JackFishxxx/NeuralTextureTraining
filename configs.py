@@ -1,4 +1,5 @@
 import argparse
+import difflib
 import math
 import os
 import re
@@ -71,12 +72,71 @@ def _load_yaml_defaults(config_path=None):
         p = Path(__file__).resolve().parent / "config.yaml"
 
     if not p.exists():
+        if config_path is not None:
+            raise FileNotFoundError(f'Config file does not exist: {p}')
         return {}
 
     with open(p, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
+        class ConfigLoader(yaml.SafeLoader):
+            pass
 
-    return data if isinstance(data, dict) else {}
+        def unique_mapping(loader, node):
+            keys = [loader.construct_object(key) for key, _ in node.value]
+            if any(not isinstance(key, str) for key in keys):
+                raise ValueError(f'Configuration keys must be strings in {p}')
+            if len(keys) != len(set(keys)):
+                raise ValueError(f'Duplicate configuration key in {p}')
+            return loader.construct_mapping(node)
+
+        ConfigLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)
+        data = yaml.load(f, Loader=ConfigLoader)
+
+    if not isinstance(data, dict):
+        raise ValueError(f'Config must contain a YAML mapping: {p}')
+    return data
+
+
+def _validate_yaml_defaults(parser, defaults):
+    actions = {action.dest: action for action in parser._actions}
+    for name, value in defaults.items():
+        if name not in actions or name in ('help', 'config'):
+            match = difflib.get_close_matches(str(name), actions, n=1, cutoff=.55)
+            hint = f'; {name} -> {match[0]}' if match else ''
+            parser.error(f'Unknown configuration key: {name}{hint}')
+        action = actions[name]
+        valid = True
+        if isinstance(action.default, bool):
+            valid = isinstance(value, bool)
+        elif action.type in (int, float):
+            values = value if isinstance(action.nargs, int) and isinstance(value, list) else [value]
+            valid = all(isinstance(item, (int, float) if action.type is float else int)
+                        and not isinstance(item, bool) and math.isfinite(item) for item in values)
+            if isinstance(action.nargs, int):
+                valid &= isinstance(value, list) and len(value) == action.nargs
+            if value is None:
+                valid = action.default is None
+        elif action.type is str:
+            valid = isinstance(value, str) or (value is None and action.default is None)
+        if not valid:
+            parser.error(f'Invalid type or nonfinite value for {name}: {value!r}')
+        if action.choices is not None and value not in action.choices:
+            parser.error(f'Invalid {name}: {value!r}; choose from {action.choices}')
+    for name in ('feature_grid_configs', 'pbr_point_lights'):
+        if name in defaults:
+            value = defaults[name]
+            if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+                parser.error(f'{name} must be a list of mappings')
+    if 'feature_grid_configs' in defaults and not defaults['feature_grid_configs']:
+        parser.error('feature_grid_configs must not be empty')
+    if 'texture_loss_weights' in defaults and not isinstance(defaults['texture_loss_weights'], dict):
+        parser.error('texture_loss_weights must be a mapping')
+    for name in ('pbr_directional_light_direction', 'pbr_directional_light_color'):
+        if name in defaults:
+            value = defaults[name]
+            if (not isinstance(value, list) or len(value) != 3
+                    or not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                               and math.isfinite(v) for v in value)):
+                parser.error(f'{name} must contain three finite numbers')
 
 class Config():
 
@@ -203,6 +263,20 @@ class Config():
         self.early_stop = params.early_stop
         self.early_stop_interval = params.early_stop_interval
         self.early_stop_psnr_threshold = params.early_stop_psnr_threshold
+        for name in ('max_iter', 'batch_size', 'eval_interval', 'save_interval', 'early_stop_interval',
+                     'n_neurons', 'pos_encoding_tile_size'):
+            if getattr(params, name) <= 0:
+                raise ValueError(f'{name} must be positive')
+        for name in ('n_frequencies', 'n_hidden_layers', 'eval_inference_tile', 'eval_metrics_max_edge'):
+            if getattr(params, name) < 0:
+                raise ValueError(f'{name} must be nonnegative')
+        for name in ('learning_rate', 'qat_noise_mult_start', 'qat_noise_mult_end',
+                     'subpixel_sampling_ratio', 'subpixel_jitter', 'early_stop_psnr_threshold'):
+            value = getattr(params, name)
+            if not math.isfinite(value) or value < 0 or (name == 'learning_rate' and value == 0):
+                raise ValueError(f'{name} must be finite and nonnegative (learning_rate must be positive)')
+        if not math.isfinite(params.qat_noise_warmup_frac) or not 0 <= params.qat_noise_warmup_frac <= 1:
+            raise ValueError('qat_noise_warmup_frac must be in [0, 1]')
         # early_stop_interval must be a multiple of eval_interval so that PSNR is available at check points
         if self.early_stop and self.early_stop_interval % self.eval_interval != 0:
             raise ValueError(
@@ -272,6 +346,12 @@ class Config():
             "displacement": 0.4,
         }
         yaml_texture_weights = getattr(params, "texture_loss_weights", None)
+        if yaml_texture_weights is not None:
+            if not isinstance(yaml_texture_weights, dict) or set(yaml_texture_weights) - set(default_texture_weights):
+                raise ValueError('texture_loss_weights must map known material names to weights')
+            if any(not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or v < 0
+                   for v in yaml_texture_weights.values()):
+                raise ValueError('texture_loss_weights values must be finite and nonnegative')
         self.texture_weights: Optional[Dict[str, float]] = (
             {str(k): float(v) for k, v in yaml_texture_weights.items()}
             if isinstance(yaml_texture_weights, dict)
@@ -290,6 +370,8 @@ class Config():
         self.astcenc_quality = params.astcenc_quality
         self.astc_block, self.astc_aware_block = _normalize_astc_block(params.astc_block)
         self.ref_astc_resolution = getattr(params, "ref_astc_resolution", None)
+        if self.ref_astc_resolution is not None and self.ref_astc_resolution <= 0:
+            raise ValueError('ref_astc_resolution must be positive')
 
         ### ---------- PBR scene comparison ---------- ###
         self.enable_pbr_compare = bool(getattr(params, "enable_pbr_compare", False))
@@ -311,6 +393,9 @@ class Config():
             {"position": [0.0, 0.82, 0.7], "intensity": 6.5, "color": [1.0, 1.0, 1.0]},
             {"position": [-0.8, 0.45, -0.15], "intensity": 1.2, "color": [1.0, 1.0, 1.0]},
         ]))
+        for name in ('pbr_loss_weight', 'pbr_directional_light_intensity'):
+            if not math.isfinite(getattr(self, name)):
+                raise ValueError(f'{name} must be finite')
         if self.pbr_compare_interval <= 0:
             raise ValueError("pbr_compare_interval must be positive")
         if self.pbr_render_resolution < 64:
@@ -324,10 +409,15 @@ class Config():
         if self.pbr_directional_light_intensity < 0.0:
             raise ValueError("pbr_directional_light_intensity must be non-negative")
         for index, light in enumerate(self.pbr_point_lights):
+            if isinstance(light, dict) and set(light) - {'position', 'intensity', 'color'}:
+                raise ValueError(f'Unknown pbr_point_lights[{index}] keys')
             if not isinstance(light, dict) or len(light.get("position", [])) != 3:
                 raise ValueError(f"pbr_point_lights[{index}] must contain a 3-value position")
             if len(light.get("color", [1.0, 1.0, 1.0])) != 3:
                 raise ValueError(f"pbr_point_lights[{index}] color must contain 3 values")
+            values = [*light['position'], *light.get('color', [1., 1., 1.]), light.get('intensity', 0.)]
+            if any(not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) for v in values):
+                raise ValueError(f'pbr_point_lights[{index}] must contain finite numbers')
             if float(light.get("intensity", 0.0)) < 0.0:
                 raise ValueError(f"pbr_point_lights[{index}] intensity must be non-negative")
 
@@ -573,13 +663,14 @@ def get_args():
     # ── Two-stage parsing: YAML defaults → CLI overrides ──
     # Stage 1: extract --config path only
     known, _ = parser.parse_known_args()
-    yaml_defaults = _load_yaml_defaults(known.config)
+    try:
+        yaml_defaults = _load_yaml_defaults(known.config)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        parser.error(str(exc))
 
     if yaml_defaults:
-        # Filter to only keys that correspond to valid parser destinations
-        valid_dests = {a.dest for a in parser._actions}
-        filtered = {k: v for k, v in yaml_defaults.items() if k in valid_dests}
-        parser.set_defaults(**filtered)
+        _validate_yaml_defaults(parser, yaml_defaults)
+        parser.set_defaults(**yaml_defaults)
 
     # Stage 2: full parse (CLI args override YAML values)
     return parser.parse_args()

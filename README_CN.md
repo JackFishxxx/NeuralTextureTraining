@@ -185,6 +185,8 @@ python train.py \
 
 ### 评估
 
+ROMSD 的 LPIPS 按有效标量通道分别计算，再取平均值。
+
 训练时自动记录评估数据。推理时须沿用所选 checkpoint 的网络结构和材质设置；`--load_dir` 指向包含 `models/` 的运行目录，`--load_iter -1` 选择最新已完成 checkpoint：
 
 ```bash

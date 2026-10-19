@@ -301,7 +301,7 @@ def _compute_ssim_safe(pred_ref: torch.Tensor, gt_ref: torch.Tensor, ssim_metric
 
 def _compute_metrics_from_refs(
     pred_ref: torch.Tensor, gt_ref: torch.Tensor, psnr_metric, ssim_metric, lpips_metric,
-    is_normal: bool = False, normal_encoding: str = "xyz",
+    is_normal: bool = False, normal_encoding: str = "xyz", scalar_channels: bool = False,
 ) -> Tuple[float, float, float]:
     pred_ref = torch.nan_to_num(pred_ref.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     gt_ref = torch.nan_to_num(gt_ref.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
@@ -319,16 +319,10 @@ def _compute_metrics_from_refs(
 
     if pred_ref.shape[-2] >= 128 and pred_ref.shape[-1] >= 128:
         c = pred_ref.shape[1]
-        if c == 1:
-            lpips_pred, lpips_gt = pred_ref.repeat(1, 3, 1, 1), gt_ref.repeat(1, 3, 1, 1)
-        elif c == 2:
-            lpips_pred = pred_ref[:, :1, :, :].repeat(1, 3, 1, 1)
-            lpips_gt = gt_ref[:, :1, :, :].repeat(1, 3, 1, 1)
-        elif c == 3:
+        if c == 3 and not scalar_channels:
             lpips_pred, lpips_gt = pred_ref, gt_ref
         else:
-            # LPIPS accepts RGB only. Evaluate each scalar material channel
-            # independently instead of silently dropping displacement from ROMSD.
+            # Scalar maps have no RGB color relationship, regardless of count.
             values = []
             for channel_idx in range(c):
                 p = pred_ref[:, channel_idx:channel_idx + 1].repeat(1, 3, 1, 1)
@@ -337,6 +331,8 @@ def _compute_metrics_from_refs(
                 values.append(float(lpips_metric(p.float(), g.float()).item()))
                 lpips_metric.reset()
             lpips_value = float(np.mean(values)) if values else 0.0
+            if not math.isfinite(lpips_value):
+                lpips_value = 0.0
             return psnr_value, ssim_value, lpips_value
         lpips_metric.reset()
         lpips_value = float(lpips_metric(lpips_pred.float(), lpips_gt.float()).item())
@@ -381,6 +377,7 @@ def _compute_group_metrics(pred_image, gt_image, dataset, psnr_metric, ssim_metr
             pred_ref, gt_ref, psnr_metric, ssim_metric, lpips_metric,
             is_normal=(group_name == "normal"),
             normal_encoding=str(getattr(dataset, "normal_encoding", "xyz")),
+            scalar_channels=(group_name == "romsd"),
         )
 
     if group_metrics:

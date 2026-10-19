@@ -189,6 +189,8 @@ Available GroupsBatching parameters:
 
 ### Evaluation
 
+ROMSD LPIPS is computed independently for each active scalar channel, then averaged.
+
 During training, evaluation metrics are automatically logged. For inference, reuse the architecture and material settings of the selected checkpoint; `--load_dir` is the run directory containing `models/`, and `--load_iter -1` selects its latest completed checkpoint:
 
 ```bash

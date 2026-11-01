@@ -315,6 +315,12 @@ material_recompression_enable: true
 
 PBR 对 baseline 和 FNTC_Recompressed 采样整张材质各级实际压缩、解码后的 mip，与文件导出共用相同码流。双线性/三线性采样在完整材质上采用 repeat 寻址。FNTC_Uncompressed 和 GT 分别在各自原生分辨率生成浮点 mip 链。对齐 GT 尺寸的截图仅用于图像指标与输出；报告记录各方法的 `mip_sources` 和纹理寻址规则。
 
+PBR 报告在 Windows 上使用无窗口的 **DirectX 12** 硬件光栅化。首次渲染通过已安装的 x64 MSVC 和 Windows SDK 编译小型原生 DLL，缓存到 `%LOCALAPPDATA%/NeuralTextureTraining/dx12`，不需要额外图形包。报告记录渲染器与 GPU 型号。其他平台设置 `enable_pbr_compare: false`；训练和材质评估继续使用原有 CUDA 路径。
+
+Scene 与 Detail 共用设备、几何、管线和阴影，每种材质只准备并上传一次；浮点 mip 纹素在每个 GPU 上打包后统一回读。每个通道最多缓存三种 GPU 纹理布局，对应浮点推理、压缩推理和 GT（BC5 法线的通道数可能少于浮点纹理）。Scene 按目标高度直接渲染贴合房间范围的矩形，移除 CPU 裁剪缩放。非法 mip 链在修改 GPU 状态前被拒绝；原生渲染失败后会丢弃失效渲染器，下次调用时重新创建。
+
+场景包含两个顶置平滑球体的方体。相机略微俯视，默认 Detail 视口（`center: [0.76, 0.59]`、`zoom: 3.5`）拉近到右侧球体与方体的局部，同时保留墙面、地面和投影。数据集加载时已将颜色转为线性，因此渲染器直接使用线性材质值及压缩 mip 纹素，避免重复 gamma 转换。OpenGL 源法线按对应的绿色通道约定解释。平行光、点光源均采用缓存的 1024 像素阴影贴图与 PCF 过滤。默认使用室内点光源；可选的室外平行光也会被天花板遮挡。着色采用 Cook-Torrance GGX、少量环境补光、Reinhard 色调映射及 sRGB 输出，不模拟全局光照。本次渲染修改后的 PBR 指标不能直接与旧报告比较。
+
 FNTC 存储统计计压缩 latent、decoder 和 CNN；材质 tile cache 大小单列。基线统计压缩材质 payload，不含容器头或共享 SR base。
 
 ### ASTC 感知 Latent 训练

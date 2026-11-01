@@ -83,14 +83,14 @@ material_recompression_enable: true  # reuse material_compression_formats from t
 # ---------- PBR scene comparison configs ----------
 enable_pbr_compare: true
 pbr_compare_interval: 5000
-pbr_render_resolution: 1024  # final cropped Cornell-box height per panel
+pbr_render_resolution: 1024  # directly rendered Cornell-box height per panel
 pbr_detail_resolution: 2048  # independent detail viewport, width and height
-pbr_detail_center: [0.5, 0.62]  # normalized x/y in the original square camera raster
-pbr_detail_zoom: 4.0  # separately render the focused viewport
+pbr_detail_center: [0.76, 0.59]  # close-up of part of the right sphere/box, wall and floor
+pbr_detail_zoom: 3.5  # separately render the focused viewport
 pbr_mip_lod_bias: 0.0  # use one sharper mip level
 pbr_loss_enable: true
 pbr_loss_weight: 0.2
-pbr_directional_light_enable: true
+pbr_directional_light_enable: false  # interior point lights; enable for sunlight through the open front
 # Direction points from the shaded surface toward the light.
 pbr_directional_light_direction: [-0.45, 0.62, -0.72]
 pbr_directional_light_intensity: 13.4

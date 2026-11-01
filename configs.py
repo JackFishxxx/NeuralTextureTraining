@@ -367,7 +367,7 @@ class Config():
         self.pbr_mip_lod_bias = float(getattr(params, "pbr_mip_lod_bias", -1.0))
         self.pbr_loss_enable = bool(getattr(params, "pbr_loss_enable", False))
         self.pbr_loss_weight = float(getattr(params, "pbr_loss_weight", 0.1))
-        self.pbr_directional_light_enable = bool(getattr(params, "pbr_directional_light_enable", True))
+        self.pbr_directional_light_enable = bool(getattr(params, "pbr_directional_light_enable", False))
         self.pbr_directional_light_direction = list(getattr(params, "pbr_directional_light_direction", [-0.45, 0.62, -0.72]))
         self.pbr_directional_light_intensity = float(getattr(params, "pbr_directional_light_intensity", 2.4))
         self.pbr_directional_light_color = list(getattr(params, "pbr_directional_light_color", [1.0, 1.0, 1.0]))
@@ -679,12 +679,12 @@ def get_args():
     parser.add_argument('--pbr_compare_interval', type=int, default=5000,
                         help='training iteration interval for PBR scene comparison images')
     parser.add_argument('--pbr_render_resolution', type=int, default=512,
-                        help='final cropped scene height of each PBR comparison panel')
+                        help='height of each directly rendered PBR scene panel')
     parser.add_argument('--pbr_detail_resolution', type=int, default=2048,
                         help='independent PBR detail render width and height')
-    parser.add_argument('--pbr_detail_center', type=float, nargs=2, default=[0.5, 0.62],
+    parser.add_argument('--pbr_detail_center', type=float, nargs=2, default=[0.76, 0.59],
                         help='detail viewport center in the original square raster, normalized x/y from top-left')
-    parser.add_argument('--pbr_detail_zoom', type=float, default=4.0,
+    parser.add_argument('--pbr_detail_zoom', type=float, default=3.5,
                         help='PBR detail viewport magnification, rendered separately; must be > 1')
     parser.add_argument('--pbr_mip_lod_bias', type=float, default=-1.0,
                         help='PBR texture mip LOD bias; negative values select sharper mips')
@@ -692,7 +692,7 @@ def get_args():
                         help='add differentiable material-to-PBR shaded RGB loss during training')
     parser.add_argument('--pbr_loss_weight', type=float, default=0.1,
                         help='weight of the differentiable PBR shaded RGB loss')
-    parser.add_argument('--pbr_directional_light_enable', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--pbr_directional_light_enable', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--pbr_directional_light_direction', type=yaml.safe_load, default=[-0.45, 0.62, -0.72])
     parser.add_argument('--pbr_directional_light_intensity', type=float, default=2.4)
     parser.add_argument('--pbr_directional_light_color', type=yaml.safe_load, default=[1.0, 1.0, 1.0])

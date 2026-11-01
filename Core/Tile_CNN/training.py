@@ -5,6 +5,7 @@ import json
 import math
 import os
 import time
+from dataclasses import asdict
 
 import torch
 from torch.nn import functional as F
@@ -13,11 +14,7 @@ from Common.comparison_astc import cached_astc_base
 from Common.material_reconstruction import comparison_material_size, make_deployment_model, _render_model_mip0
 from Core.Feature_Grid.sampling import resize_bilinear_repeat
 from .material_cnn import MaterialCNN
-
-
-def atomic_save(value, path):
-    torch.save(value, path + '.tmp')
-    os.replace(path + '.tmp', path)
+from checkpoint import atomic_torch_save
 
 
 def validate_training_size(gt_size, inference_size):
@@ -97,8 +94,8 @@ def fit_material_cnn(trainer, steps=50000, validation_interval=1000, resume_stat
     if steps < 1 or validation_interval < 1:
         raise ValueError('Material CNN steps and validation interval must be positive')
     model = trainer.model
-    if not trainer.mip0_only or model.feature_gradient_count != 4 or model.material_cnn is not None:
-        raise ValueError('Material CNN fitting requires an unfiltered four-gradient Mip0 decoder')
+    if not trainer.mip0_only or model.material_cnn is not None:
+        raise ValueError('Material CNN fitting requires an unfiltered Mip0 decoder')
     size = comparison_material_size(model, trainer.texture_height, trainer.texture_width,
                                     trainer.ref_astc_resolution)
     gt_size = (trainer.texture_height, trainer.texture_width)
@@ -181,8 +178,8 @@ def fit_material_cnn(trainer, steps=50000, validation_interval=1000, resume_stat
     source_state = model.state_dict()
 
     def checkpoint():
-        atomic_save(dict(version=2, signature=signature, steps=steps, validation_interval=interval,
-                         completed=completed, source_iteration=model.current_iter,
+        atomic_torch_save(dict(version=2, signature=signature, steps=steps, validation_interval=interval,
+                         completed=completed, source_iteration=model.current_iter, progress=asdict(trainer.progress),
                          source_model=source_state, model=post.state_dict(),
                          optimizer=optimizer.state_dict(), validation=validation,
                          best=best, best_state=best_state, best_step=best_step, history=history,
@@ -226,7 +223,8 @@ def fit_material_cnn(trainer, steps=50000, validation_interval=1000, resume_stat
         accepted, reason = accept_quality(before, after)
     if accepted:
         model.material_cnn = post.eval()
-        model.register_buffer('_material_cnn_version', torch.tensor(MaterialCNN.version, device=trainer.device))
+        from Core.Feature_Grid.serialization import refresh_inference_contract
+        refresh_inference_contract(model)
     print(f'[Tile CNN] accepted={accepted}: {reason}', flush=True)
     return dict(steps=steps, best_step=best_step, best_validation_loss=best, accepted=accepted,
                 reason=reason, baseline=before, candidate=after, inference_size=list(size),

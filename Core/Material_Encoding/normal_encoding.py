@@ -5,9 +5,11 @@ import torch
 NORMAL_XY_MIN_Z = 0.01
 
 
-def _enc(normal_encoding: str) -> str:
-    enc = str(normal_encoding).strip().lower().replace('-', '_')
-    return 'hemi_oct' if enc in {'hemi_oct', 'hemi_octa'} else enc
+def _enc(normal_encoding):
+    enc = str(normal_encoding).lower()
+    if enc not in ('xyz', 'xy', 'hemi_oct'):
+        raise ValueError(f'Unsupported normal encoding: {normal_encoding}')
+    return enc
 
 
 def _channel_dim(x: torch.Tensor) -> int:
@@ -34,7 +36,7 @@ def encode_normal(normal_rgb: torch.Tensor, normal_encoding: str = 'xyz') -> tor
     enc = _enc(normal_encoding)
     n = normalize_normal_rgb(normal_rgb)
     cd = _channel_dim(n)
-    if enc in {'xyz', 'rgb'}:
+    if enc == 'xyz':
         return normal_to_rgb(n)
     if enc == 'xy':
         return torch.clamp(_take(n, 0, 2) * 0.5 + 0.5, 0.0, 1.0)
@@ -51,7 +53,7 @@ def encode_normal(normal_rgb: torch.Tensor, normal_encoding: str = 'xyz') -> tor
 def decode_normal(encoded: torch.Tensor, normal_encoding: str = 'xyz') -> torch.Tensor:
     enc = _enc(normal_encoding)
     cd = _channel_dim(encoded)
-    if enc in {'xyz', 'rgb'}:
+    if enc == 'xyz':
         return normal_to_rgb(normalize_normal_rgb(encoded))
     xy = _take(encoded, 0, 2) * 2.0 - 1.0
     if enc == 'xy':

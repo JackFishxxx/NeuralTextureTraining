@@ -603,9 +603,9 @@ def run_pbr_comparison_pipeline(model, dataset, codec, config, output_root, *, c
     elif prediction.shape != reference['gt'].shape:
         raise ValueError('PBR material override must match the canonical GT raster')
     storage = log_comparison_storage(model, dataset, codec.astc_block, config.ref_astc_resolution, verbose=False)
-    fntc_label = method_label(compressed_method(model,codec.astc_block))
+    fntc_label = method_label(compressed_method(model))
     context = dict(report_context or {}, fntc_label=fntc_label, gt_size=[height, width], inference_size=[ref_h, ref_w],
-                   storage_bytes={fntc_label: storage[compressed_method(model, codec.astc_block)],
+                   storage_bytes={fntc_label: storage[compressed_method(model)],
                                   method_label('astc', codec.astc_block): storage[f'ref_astc_{codec.astc_block}'],
                                   'GT': storage['gt']})
     return save_pbr_comparison(

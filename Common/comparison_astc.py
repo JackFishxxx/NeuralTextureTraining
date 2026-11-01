@@ -49,7 +49,7 @@ def log_comparison_storage(model, dataset, block: str, ref_astc_resolution=None,
 
     uncompressed_latent = sum(spec.max_resolution**2*4*math.ceil(spec.n_features_per_level/4)
                               for spec in model.feature_grid_specs)
-    latent = latent_payload_bytes(model, block)
+    latent = latent_payload_bytes(model)
     decoder, cnn = model.decoder_storage_bytes(deployment_config)
     height, width = dataset.texture_height, dataset.texture_width
     ref_h, ref_w = comparison_material_size(model, height, width, ref_astc_resolution)
@@ -71,7 +71,7 @@ def log_comparison_storage(model, dataset, block: str, ref_astc_resolution=None,
                   f'| {details}; Mip0 payload only')
     return {
         'fntc_quantized': uncompressed_latent + decoder + cnn,
-        compressed_method(model, block): latent + decoder + cnn,
+        compressed_method(model): latent + decoder + cnn,
         f'ref_astc_{block}': maps * astc_bytes(ref_h, ref_w),
         'gt': height * width * channels,
     }
@@ -600,7 +600,7 @@ def run_astc_comparison_pipeline(
 ) -> Dict[str, Dict[str, Tuple[float, float, float]]]:
     block_tag = astc_codec.astc_block.lower()
     storage = log_comparison_storage(model, dataset, astc_codec.astc_block, ref_astc_resolution, verbose=False)
-    fntc_astc_name = compressed_method(model, astc_codec.astc_block)
+    fntc_astc_name = compressed_method(model)
     ref_astc_name = f"ref_astc_{astc_codec.astc_block}"
 
     compare_root = os.path.join(output_root, f"Compare_ASTC{block_tag}")

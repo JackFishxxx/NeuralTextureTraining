@@ -15,6 +15,48 @@ from dataset import material_size, clean_base_image, sample_material
 from Core.ASTC_Aware.parameters import ASTCTrainingOperations
 
 
+def prepare_decoder_inputs(trainer):
+    """Use the same immutable decoded latents and SR base for fresh and resumed fitting."""
+    from .compression import decoded_feature_grids, freeze_proxies
+
+    model = trainer.model
+    proxies, active = model.astc_proxy, getattr(model, '_codec_active_grids', None)
+    flags = [(p, p.requires_grad) for p in model.parameters()]
+    frozen = [(m, m.codec_frozen.clone()) for m in proxies.modules() if hasattr(m, 'codec_frozen')]
+    try:
+        freeze_proxies(model)
+        fields = decoded_feature_grids(model)
+    except Exception:
+        model.astc_proxy, model._codec_active_grids = proxies, active
+        for parameter, flag in flags:
+            parameter.requires_grad_(flag)
+        for module, value in frozen:
+            module.codec_frozen.copy_(value)
+        raise
+    trainer._decoder_source_grad = [g.params.requires_grad for g in model.feature_grids]
+    model._decoder_adaptation_features = fields
+    for grid in model.feature_grids:
+        grid.params.requires_grad_(False)
+    if trainer.super_resolution_enable:
+        trainer._decoder_source_base = trainer.dataset.superres_base_cache[0]
+        base = trainer.astc_superres_base_mip0
+        if base.shape[:2] == trainer._decoder_source_base.shape[:2]:
+            slices = trainer.dataset.canonical_channel_slices
+            trainer.dataset.superres_base_cache[0] = torch.cat(
+                [base[..., slices[name][0]:slices[name][1]] for name in trainer.dataset.available_textures], -1)
+
+
+def release_decoder_inputs(trainer):
+    trainer.model._decoder_adaptation_features = None
+    for grid, flag in zip(trainer.model.feature_grids, trainer._decoder_source_grad):
+        grid.params.requires_grad_(flag)
+    if trainer.super_resolution_enable:
+        trainer.dataset.superres_base_cache[0] = trainer._decoder_source_base
+        del trainer._decoder_source_base
+    del trainer._decoder_source_grad
+    trainer.model._qat_param_cache.clear()
+
+
 class FeatureGridTraining(ASTCTrainingOperations):
     def _initialize_astc_aware(self, dataset, configs):
         self.material_size = material_size(self.model, self.texture_height, self.texture_width)
@@ -33,11 +75,12 @@ class FeatureGridTraining(ASTCTrainingOperations):
         self._codec_phase_logged = False
         self._astc_block_optimizer = None
         self._astc_codec_pass_count = 0
-        if configs.codec_training_enable and configs.native_astc_only:
+        if (self.progress.stage in ('single', 'representation') and configs.codec_training_enable
+                and configs.astc_aware_enable and configs.native_astc_grids):
             if not self.mip0_only or not self.model.quantize:
                 raise ValueError("Native ASTC optimization requires quantized Mip0")
-            if configs.astc_decoder_projection_interval > 0:
-                self._validate_astc_projection()
+            if configs.astc_decoder_projection_interval > 0 and not self._supports_astc_projection():
+                print('[ASTC Projection] inactive: requires an affine SR decoder without PE/feature gradients')
             from Core.ASTC_Aware.differentiable_proxy import native_extension
 
             native_extension()
@@ -78,14 +121,20 @@ class FeatureGridTraining(ASTCTrainingOperations):
         return prediction - inputs[:, 3:].float() if self.super_resolution_enable else prediction
 
     def _begin_astc_step(self, curr_iter):
+        self.model.current_iter = curr_iter
         if self._astc_block_optimizer is not None:
             self._astc_block_optimizer.zero_grad()
-        start = int(self.max_iter * self.configs.codec_start_frac)
-        active = self.configs.codec_training_enable and curr_iter >= start
+        policies = self.configs.grid_training
+        indices = tuple(i for i, policy in enumerate(policies)
+                        if self.configs.codec_training_enable and self.progress.stage in ('single', 'representation')
+                        and policy.active(curr_iter, self.configs.max_iter))
+        self.model._codec_active_grids = indices
+        self._codec_due_grids = tuple(i for i in indices if policies[i].due(curr_iter, self.configs.max_iter))
+        active = bool(indices)
         if active and not self._codec_phase_logged:
             print(f"[Latent Codec] phase active at iter {curr_iter}", flush=True)
             self._codec_phase_logged = True
-        return active and (curr_iter - start) % self.configs.codec_interval == 0
+        return active
 
     def _training_batch_loss(self, inputs, target, base, weights, curr_iter, codec_due):
         if codec_due:
@@ -220,7 +269,7 @@ class FeatureGridTraining(ASTCTrainingOperations):
     @torch.no_grad()
     def _astc_proxy_objective(self):
         """Re-evaluate the same batches with fixed decoder for candidate acceptance."""
-        self.model._qat_param_cache.clear()
+        self.model.clear_codec_cache()
         self.model.astc_codec_branch_enabled = True
         try:
             total = 0
@@ -260,14 +309,19 @@ class FeatureGridTraining(ASTCTrainingOperations):
         )
 
     @torch.no_grad()
-    def _sync_astc_source(self):
+    def _sync_astc_source(self, indices=None):
         # The decoded trainable bitstream is the feature texture in this mode.
         # Keep exports, ordinary eval and the subsequent frozen stage consistent.
         from Core.Feature_Grid.feature_grid import unorm_to_feature, quantize_feature_tensor
 
-        for grid, spec, codec in zip(
+        active = getattr(self.model, '_codec_active_grids', None)
+        for index, (grid, spec, codec) in enumerate(zip(
             self.model.feature_grids, self.model.feature_grid_specs, self.model.astc_proxy
-        ):
+        )):
+            if indices is not None and index not in indices:
+                continue
+            if self.model._decoder_adaptation_features is None and active is not None and index not in active:
+                continue
             if not hasattr(codec, "decode_image"):
                 continue
             offset, count, _ = spec.highest_level_slice()
@@ -283,7 +337,8 @@ class FeatureGridTraining(ASTCTrainingOperations):
 
         if self._astc_block_optimizer is None:
             self._astc_block_optimizer = GridCompressionOptimizer(self)
-        self._astc_block_optimizer.prepare()
+        else:
+            self._astc_block_optimizer.prepare()
 
     def _step_astc_parameters(self, codec_due):
         if codec_due:

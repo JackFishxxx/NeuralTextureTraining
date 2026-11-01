@@ -21,7 +21,7 @@ def surface_plan(spec, recipe, direct_diffuse=False):
         groups = [tuple(range(min(3, channels)))]
         groups.extend(tuple(range(i, min(i + 4, channels))) for i in range(3, channels, 4))
     else:
-        capacity = recipe.channels_per_surface
+        capacity = 4
         groups = [
             tuple(range(i, min(i + capacity, channels))) for i in range(0, channels, capacity)
         ]

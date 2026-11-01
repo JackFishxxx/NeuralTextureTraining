@@ -138,6 +138,11 @@ class Config():
         self.load_iter = params.load_iter
         self.load_dir = params.load_dir
         self.mode = params.mode
+        self.warm_start = params.warm_start
+        if self.load_dir and self.load_iter == 0:
+            raise ValueError('load_dir requires load_iter; use -1 for the newest checkpoint')
+        if self.load_iter != 0 and not self.load_dir:
+            raise ValueError('load_iter requires load_dir')
         if self.mode == "infer":
             if not self.load_dir:
                 raise ValueError("infer mode requires --load_dir")
@@ -183,7 +188,6 @@ class Config():
         self.qat_noise_mult_start = float(getattr(params, "qat_noise_mult_start", 1.0))
         self.qat_noise_mult_end = float(getattr(params, "qat_noise_mult_end", 0.25))
         self.qat_noise_warmup_frac = float(getattr(params, "qat_noise_warmup_frac", 0.1))
-        # Legacy fallbacks only. New YAMLs select compression in each grid.format.
         self.bcn_usage_weight = params.bcn_usage_weight
         if not math.isfinite(self.bcn_usage_weight) or self.bcn_usage_weight < 0:
             raise ValueError("bcn_usage_weight must be finite and nonnegative")
@@ -218,8 +222,8 @@ class Config():
         ### ---------- tile cnn configs ---------- ###
         self.material_cnn_enable = params.material_cnn_enable
         if self.material_cnn_enable:
-            if self.feature_gradient_count != 4 or not params.mip0_only:
-                raise ValueError("Material CNN requires Mip0 and feature_gradient_count: 4")
+            if not params.mip0_only:
+                raise ValueError("Material CNN requires Mip0")
             if params.mode == "train" and not params.multi_stage_training_enable:
                 raise ValueError("Material CNN training requires multi_stage_training_enable: true")
         self.material_cnn_steps = params.material_cnn_steps
@@ -247,6 +251,10 @@ class Config():
         self.momentum = params.momentum
         self.weight_decay = params.weight_decay
         self.lr_scheduler = params.lr_scheduler
+        if not math.isfinite(self.momentum) or not 0 <= self.momentum < 1:
+            raise ValueError('momentum must be in [0, 1); it controls Adam beta1')
+        if not math.isfinite(self.weight_decay) or self.weight_decay < 0:
+            raise ValueError('weight_decay must be finite and nonnegative')
 
         self.eval_interval = params.eval_interval
         self.save_interval = params.save_interval
@@ -301,10 +309,6 @@ class Config():
             )
 
         self.normal_encoding = str(getattr(params, "normal_encoding", "xyz")).strip().lower().replace("-", "_")
-        if self.normal_encoding == "rgb":
-            self.normal_encoding = "xyz"
-        if self.normal_encoding == "hemi_octa":
-            self.normal_encoding = "hemi_oct"
         if self.normal_encoding not in {"xyz", "xy", "hemi_oct"}:
             raise ValueError("normal_encoding must be one of: xyz, xy, hemi_oct")
 
@@ -322,10 +326,13 @@ class Config():
 
         # Learned feature grids.
         default_feature_grids = [
-            {"max_resolution": 1024, "quantize_bits": 8, "save_bits": 32, "learning_rate": 0.005},
+            {"max_resolution": 1024, "format": "astc6x6", "quantize_bits": 8, "save_bits": 32, "learning_rate": 0.005},
             #{"max_resolution": 512, "quantize_bits": 8, "save_bits": 32, "learning_rate": 0.005},
         ]
-        self.feature_grid_configs: Optional[List[Dict]] = params.feature_grid_configs or default_feature_grids
+        self.feature_grid_configs = default_feature_grids if params.feature_grid_configs is None else params.feature_grid_configs
+        if (not isinstance(self.feature_grid_configs, list) or not self.feature_grid_configs
+                or not all(isinstance(g, dict) for g in self.feature_grid_configs)):
+            raise ValueError('feature_grid_configs must be a nonempty list of mappings')
 
         # Per-texture-type weights shared by training loss and evaluation aggregation.
         # If None, weights from dataset.get_texture_config() will be used
@@ -352,8 +359,6 @@ class Config():
             if isinstance(yaml_texture_weights, dict)
             else default_texture_weights
         )
-        # Backward-compatible alias for older call sites/configs.
-        self.texture_loss_weights = self.texture_weights
 
         # Final per-channel loss weights list (generated from texture_weights and available textures)
         self.output_loss_weights: Optional[List[float]] = None
@@ -429,40 +434,31 @@ class Config():
             if float(light.get("intensity", 0.0)) < 0.0:
                 raise ValueError(f"pbr_point_lights[{index}] intensity must be non-negative")
 
-        # Parse compact per-grid formats; expanded legacy recipes remain readable.
+        # Parse each grid's explicit compact format.
         from Core.Feature_Grid.formats import GridCompression
 
         raw_grids = self.feature_grid_configs
         recipes = tuple(
-            GridCompression.from_config(g, params.latent_format, self.astc_block, params.bc1_mode)
+            GridCompression.from_config(g)
             for g in raw_grids
         )
-        bc_count = sum(r.format == "bc1" for r in recipes)
         processed = []
         for cfg, recipe in zip(raw_grids, recipes):
             cfg = dict(cfg)
             if recipe.format == "bc1":
                 if not self.mip0_only or self.direct_diffuse_infer_mode != "disable":
                     raise ValueError("BC1 grids require mip0_only and direct diffuse disabled")
-                if recipe.bc1_mode == "rgba_binary":
-                    cfg.setdefault("n_features_per_level", 8 if bc_count == 1 else 4)
+                cfg.setdefault("n_features_per_level", 4)
+            if recipe.format == 'astc':
+                cfg.setdefault('n_features_per_level', 4)
             spec = FeatureGridSpec.from_config(
                 cfg, self.quantize_bits, self.save_bits, self.learning_rate
             )
             if (
                 recipe.format == "bc1"
-                and recipe.bc1_mode == "rgba_binary"
                 and spec.n_features_per_level not in (4, 8)
             ):
                 raise ValueError("BC1 RGBA needs four or eight features")
-            if (
-                recipe.format == "bc1"
-                and recipe.bc1_mode == "opaque_rgb"
-                and spec.n_features_per_level > 4
-            ):
-                raise ValueError("Legacy opaque BC1 supports at most four features")
-            if recipe.format == "astc" and spec.n_features_per_level > 4:
-                raise ValueError("ASTC grids currently support at most four features")
             processed.append(
                 dict(
                     max_resolution=spec.max_resolution,
@@ -482,42 +478,41 @@ class Config():
             ("bc1" in families and self.bcn_aware_enable)
             or ("astc" in families and self.astc_aware_enable)
         )
-        heterogeneous = len(set(recipes)) > 1
-        self.codec_start_frac = (
-            float(params.astc_codec_start_frac) if self.native_astc_only else 0.0
-        )
-        self.codec_interval = 1
-        if families == {"astc"} and self.astc_codec_backend == "astcenc" and not heterogeneous:
-            self.codec_start_frac = float(params.astc_codec_start_frac)
-            self.codec_interval = int(params.astc_codec_in_loop_interval)
+        from Core.Feature_Grid.formats import GridTraining
+        self.grid_training = tuple(
+            GridTraining(self.bcn_aware_enable if r.format == 'bc1' else self.astc_aware_enable,
+                         0. if r.format == 'bc1' else warmup,
+                         1 if r.format == 'bc1' or i in self.native_astc_grids else interval)
+            for i, r in enumerate(recipes))
+        active = [p for p in self.grid_training if p.enabled]
+        self.codec_start_frac = min((p.start_frac for p in active), default=0.)
+        self.codec_interval = math.gcd(*(p.interval for p in active)) if active else 1
         self.astc_decoder_projection_interval = (
-            int(params.astc_decoder_projection_interval) if self.native_astc_only else 0
+            int(params.astc_decoder_projection_interval) if self.native_astc_grids else 0
         )
-        if ("bc1" in families or heterogeneous) and (
+        if ("bc1" in families or len(set(recipes)) > 1) and (
             not self.mip0_only or self.direct_diffuse_infer_mode != "disable"
         ):
             raise ValueError("BC1/mixed grids require mip0_only and direct diffuse disabled")
 
     @property
-    def native_astc_only(self):
-        return (
-            self.astc_codec_backend == "astc_differentiable_proxy"
-            and all(
-                r.format == "astc" and r.astc_block == "6x6" and g["n_features_per_level"] == 4
-                for r, g in zip(self.grid_compressions, self.feature_grid_configs)
-            )
-            and self.direct_diffuse_infer_mode == "disable"
+    def native_astc_grids(self):
+        return tuple(
+            i for i, (r, g) in enumerate(zip(self.grid_compressions, self.feature_grid_configs))
+            if self.astc_codec_backend == "astc_differentiable_proxy"
+            and r.format == "astc" and r.astc_block == "6x6"
+            and g["n_features_per_level"] == 4
+            and not (i == 0 and self.direct_diffuse_infer_mode != "disable")
         )
+
+    @property
+    def native_astc_only(self):
+        return len(self.native_astc_grids) == len(self.grid_compressions)
 
     @property
     def latent_format(self):
         families = {r.format for r in self.grid_compressions}
         return next(iter(families)) if len(families) == 1 else "mixed"
-
-    @property
-    def bc1_mode(self):
-        modes = {r.bc1_mode for r in self.grid_compressions if r.format == "bc1"}
-        return next(iter(modes)) if len(modes) == 1 else None
 
     def make_group_config(self, group_name: str) -> "Config":
         """Create a shallow copy of this Config with data_dir and save_dir
@@ -542,7 +537,7 @@ class Config():
 
 
 def get_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
 
     # --config: path to a YAML config file (parsed first, then overridden by CLI args)
     parser.add_argument('--config', type=str, default=None,
@@ -557,6 +552,8 @@ def get_args():
                         help='0 -> do not load model, -1 means the newest')
     parser.add_argument('--load_dir', type=str,
                         help='')
+    parser.add_argument('--warm_start', action='store_true', default=False,
+                        help='load weights into a new run instead of resuming training state')
     parser.add_argument('--mode', type=str, default="train",
                         help='',
                         choices=['train', 'infer'])
@@ -577,13 +574,10 @@ def get_args():
     parser.add_argument('--quantize_bits', type=int, default=8,
                         help='choose the bits to quantize',
                         choices=[2, 4, 8])
-    parser.add_argument('--latent_format', choices=['astc', 'bc1'], default='astc', help=argparse.SUPPRESS)
-    parser.add_argument('--bc1_mode', choices=['rgba_binary', 'opaque_rgb'], default='rgba_binary',
-                        help=argparse.SUPPRESS)
-    parser.add_argument('--bcn_usage_weight', '--bc1_usage_weight', dest='bcn_usage_weight', type=float, default=0.01,
+    parser.add_argument('--bcn_usage_weight', dest='bcn_usage_weight', type=float, default=0.01,
                         help='Weak binary usage/confidence prior; 0 disables it')
-    parser.add_argument('--bcn_aware_enable', '--bc1_aware_enable', dest='bcn_aware_enable', action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--bcn_learning_rate', '--bc1_learning_rate', dest='bcn_learning_rate', type=float, default=0.01,
+    parser.add_argument('--bcn_aware_enable', dest='bcn_aware_enable', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--bcn_learning_rate', dest='bcn_learning_rate', type=float, default=0.01,
                         help='Adam learning rate in RGB565/selector code units')
     parser.add_argument('--save_bits', type=int, default=32,
                         help='choose the bits to quantize',
@@ -624,8 +618,6 @@ def get_args():
                         help="proxy endpoint and weight learning rate")
     group.add_argument("--astc_codec_in_loop_interval", type=int, default=100,
                         help="CPU codec interval; proxy runs every step")
-    group.add_argument("--astc_codec_update_latent", action=argparse.BooleanOptionalAction, default=False,
-                        help=argparse.SUPPRESS)
     group.add_argument("--astc_decoder_projection_interval", type=int, default=500,
                         help="proxy material projection interval; 0 disables it")
 
@@ -640,7 +632,7 @@ def get_args():
     group.add_argument('--material_cnn_enable', action=argparse.BooleanOptionalAction, default=False,
                        help='fit material CNN after layout_refit in multi-stage training, or load it for inference')
     group.add_argument('--material_cnn_steps', type=int, default=50000,
-                       help='material CNN fitting steps after four-gradient decoder/layout stages')
+                       help='material CNN fitting steps after decoder/layout stages; independent of feature gradients')
 
     ### ---------- trainer configs ---------- ###
     parser.add_argument('--multi_stage_training_enable', action=argparse.BooleanOptionalAction, default=True,
@@ -662,12 +654,12 @@ def get_args():
     parser.add_argument('--learning_rate', type=float, default=0.01,
                         help='learning rate')
     parser.add_argument('--momentum', type=float, default=0.9,
-                        help='learning rate momentum')
+                        help='Adam first-moment coefficient (beta1)')
     parser.add_argument('--weight_decay', type=float, default=0,
                         help='weight decay')
-    parser.add_argument('--lr_scheduler', type=str, default='steplr',
+    parser.add_argument('--lr_scheduler', type=str, default='plateau',
                         help='scheduler type',
-                        choices=['steplr', 'cosine', 'poly'])
+                        choices=['plateau', 'steplr', 'cosine', 'poly', 'none'])
     parser.add_argument('--eval_interval', type=int, default=500,
                         help='iteration interval for evaluation')
     parser.add_argument('--save_interval', type=int, default=5000,
@@ -767,14 +759,6 @@ def get_args():
         parser.error(str(exc))
 
     if yaml_defaults:
-        for old,new in (('bc1_aware_enable','bcn_aware_enable'),
-                        ('bc1_learning_rate','bcn_learning_rate'),
-                        ('bc1_usage_weight','bcn_usage_weight')):
-            if old in yaml_defaults:
-                value=yaml_defaults.pop(old)
-                if new in yaml_defaults and yaml_defaults[new]!=value:
-                    parser.error(f'Conflicting legacy {old} and {new}')
-                yaml_defaults.setdefault(new,value)
         _validate_yaml_defaults(parser, yaml_defaults)
         parser.set_defaults(**yaml_defaults)
 
@@ -786,7 +770,7 @@ def write_resolved_config(configs, directory) -> None:
     """Persist scalar/list/dict config values so log analyzers can recover run settings."""
     out = {}
     for key, value in vars(configs).items():
-        if key.startswith("_") or key == "grid_compressions":
+        if key.startswith("_") or key in ("grid_compressions", "grid_training"):
             continue
         if isinstance(value, (str, int, float, bool)) or value is None:
             out[key] = value

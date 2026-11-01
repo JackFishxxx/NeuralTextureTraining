@@ -37,10 +37,21 @@ from Common.comparison_astc import (
 from Common.comparison_pbr_scene import run_pbr_comparison_pipeline
 from dataset import material_size
 from Core.Feature_Grid.training import FeatureGridTraining
+from Core.Feature_Grid.optimization import make_scheduler
 from Core.Feature_Grid.compression import compressed_method
 
 
 class PhaseTrainingControl:
+    STATE_KEYS = ('phase', 'start', 'threshold', 'best_score', 'best_iteration', 'best_state',
+                  'previous_score', 'bad_windows', 'lr_reductions')
+
+    def state_dict(self):
+        return {key: getattr(self, key) for key in self.STATE_KEYS}
+
+    def load_state_dict(self, state):
+        for key in self.STATE_KEYS:
+            setattr(self, key, state[key])
+
     def __init__(self, phase, start, threshold=0.01):
         self.phase, self.start = phase, start
         self.threshold = threshold
@@ -96,13 +107,19 @@ class PhaseTrainingControl:
 class Trainer(FeatureGridTraining):
 
     def __init__(self, params: argparse.Namespace, config_override: Config = None,
-                 deployment_config: Config = None) -> None:
+                 deployment_config: Config = None, checkpoint=None) -> None:
 
         # initialize required runtime fieldsvariables, e.g. dataset, configs and models
         if config_override is not None:
             configs = config_override
         else:
             configs = Config(params)
+        from checkpoint import read_resume, TrainingProgress, data_contract, training_recipe
+        if checkpoint is None:
+            checkpoint = read_resume(configs)
+        self._training_recipe = training_recipe(deployment_config or configs)
+        self.progress = TrainingProgress(**checkpoint.state['progress']) if checkpoint else TrainingProgress()
+        self._checkpoint_data = checkpoint.state['data'] if checkpoint else data_contract(configs.data_dir)
         startup_log = io.StringIO()
         try:
             with contextlib.redirect_stdout(startup_log):
@@ -111,13 +128,14 @@ class Trainer(FeatureGridTraining):
                 configs.num_mips = dataset.num_mips
                 # Tile size is measured in decoder/material texels, independent of GT resolution.
                 configs.pos_encoding_reference_edge = max(dataset.material_reconstruction_size)
+                configs.material_reconstruction_size = list(dataset.material_reconstruction_size)
                 configs.material_cnn_inference_size = list(comparison_material_size(
                     configs, dataset.texture_height, dataset.texture_width, configs.ref_astc_resolution))
                 if (deployment_config or configs).material_cnn_enable:
                     from Core.Tile_CNN.training import validate_training_size
                     validate_training_size((dataset.texture_height, dataset.texture_width),
                                            configs.material_cnn_inference_size)
-                model = TCNNModel(configs)
+                model = TCNNModel(configs, checkpoint=checkpoint.model_path if checkpoint else None)
                 model.configure_direct_diffuse_from_dataset(dataset)
                 configs.material_reconstruction_size = list(material_size(model, dataset.texture_height, dataset.texture_width))
                 configs.num_channels = model.num_channels
@@ -143,7 +161,7 @@ class Trainer(FeatureGridTraining):
         self.last_checkpoint_time = self.start_time
         self.end_time = 0
         self.duration_time = 0
-        self.save_path = os.path.join(self.save_dir, self.start_time.strftime(r"%y_%m_%d_%H_%M_%S"))
+        self.save_path = os.path.join(self.save_dir, self.start_time.strftime(r"%y_%m_%d_%H_%M_%S_%f"))
         self.log_path = os.path.join(self.save_path, "tensorboard")
         self.model_path = os.path.join(self.save_path, "models")
         self.media_path = os.path.join(self.save_path, "media")
@@ -174,7 +192,7 @@ class Trainer(FeatureGridTraining):
 
         # Canonical per-channel weights; eval keeps diffuse weight, training loss may zero direct diffuse.
         self.eval_weights = dataset.get_canonical_loss_weights(
-            config_weights=getattr(configs, 'texture_weights', getattr(configs, 'texture_loss_weights', None))
+            config_weights=configs.texture_weights
         )
         self.output_loss_weights = list(configs.output_loss_weights or self.eval_weights)
         if getattr(model, "direct_diffuse_enabled", False) and "diffuse" in dataset.available_textures:
@@ -227,7 +245,21 @@ class Trainer(FeatureGridTraining):
         }
         self.normal_encoding = str(getattr(configs, "normal_encoding", "xyz")).lower()
         self.super_resolution_enable = bool(getattr(configs, "super_resolution_enable", False))
-        self._initialize_astc_aware(dataset, configs)
+        try:
+            self._initialize_astc_aware(dataset, configs)
+            if checkpoint is not None:
+                from checkpoint import restore_training_state
+                restore_training_state(self, checkpoint.state)
+        except Exception:
+            self.writer.close()
+            raise
+
+    def save_checkpoint(self, iteration, completed=False):
+        from checkpoint import save_training_state
+        if completed and self.progress.status == 'running':
+            self.progress.status = 'stage_complete'
+        self.model.save(iteration, self.model_path)
+        save_training_state(self, iteration)
 
     def _log_checkpoint_interval(self, curr_iter: int) -> None:
         now = datetime.datetime.now()
@@ -282,15 +314,17 @@ class Trainer(FeatureGridTraining):
         self._early_stop_phase_start_iter = start
 
     def _validation_score(self, curr_iter, eval_psnr, verbose=True):
-        if not self.enable_astc_compare:
-            return float(eval_psnr)
-        metrics = self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path, verbose=verbose)
-        average = metrics.get(compressed_method(self.model, self.astc_block), {}).get("average")
-        if average is None:
-            raise ValueError("Compressed validation metrics are required for best-model selection")
-        score = float(average[0])
+        score = float(self.deployment_metrics()['average'][0])
+        if self.enable_astc_compare:
+            self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path, verbose=verbose)
         self.writer.add_scalar('EarlyStop/compressed_PSNR', score, curr_iter)
         return score
+
+    @torch.no_grad()
+    def deployment_metrics(self):
+        decoded = make_deployment_model(self.model)
+        prediction, gt, _, _ = self._render_mip_pair(0, decoded)
+        return self._compute_material_metrics(prediction, gt)
 
     def _observe_training_score(self, score, iteration, **kwargs):
         previous_best = self._phase_control.best_score
@@ -300,8 +334,8 @@ class Trainer(FeatureGridTraining):
             # copy. Final exported checkpoints still use the standard save path.
             filename = f"best_{self._phase_control.phase}.pth"
             path = os.path.join(self.model_path, filename)
-            torch.save(self._phase_control.best_state, path + ".tmp")
-            os.replace(path + ".tmp", path)
+            from checkpoint import atomic_torch_save
+            atomic_torch_save(self._phase_control.best_state, path)
         return stop
 
     def _complete_training_phase(self, eval_psnr=None, score=None, final_report=True):
@@ -326,17 +360,19 @@ class Trainer(FeatureGridTraining):
         if final_report:
             if self.enable_pbr_compare:
                 self.run_pbr_comparison(curr_iter=last_iter, output_root=self.media_path)
-            self.model.save(last_iter, self.model_path)
+            self.save_checkpoint(last_iter, completed=True)
             self.save_compressed_materials(self.media_path, last_iter)
             self._log_checkpoint_interval(last_iter)
         self._log_total_training_time()
 
     def train(self, final_report=True) -> None:
-
+        if self.progress.complete:
+            print('[Resume] This training stage is already complete')
+            return
         loss_weights = torch.tensor(
             self.output_loss_weights, device=self.device, dtype=torch.float32
         )
-        if self.model._decoder_adaptation_features is None:
+        if self._phase_control is None:
             codec_start = int(self.max_iter * self.configs.codec_start_frac)
             phase = (
                 "warmup"
@@ -351,8 +387,9 @@ class Trainer(FeatureGridTraining):
             if codec_due and self._phase_control.phase == "warmup":
                 self._reset_training_phase("codec", curr_iter)
                 # Reset plateau history when the input distribution changes.
-                self.model.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                    self.model.optimizer, factor=0.85, patience=2000)
+                if isinstance(self.model.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    self.model.scheduler = make_scheduler(
+                        self.model.optimizer, self.configs.lr_scheduler, self.max_iter - curr_iter)
             self.model.optimizer.zero_grad()
 
             # update model's current iteration for noise annealing
@@ -416,7 +453,10 @@ class Trainer(FeatureGridTraining):
             self._step_astc_parameters(codec_due)
             self.model.optimizer.step()
             if self.model.scheduler is not None:
-                self.model.scheduler.step(metrics=loss_value)
+                if isinstance(self.model.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    self.model.scheduler.step(metrics=loss_value)
+                else:
+                    self.model.scheduler.step()
 
             # print(self.model.optimizer.param_groups[0]['lr'], self.model.optimizer.param_groups[1]['lr'])
 
@@ -454,7 +494,7 @@ class Trainer(FeatureGridTraining):
                     self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path)
                 if self.enable_pbr_compare:
                     self.run_pbr_comparison(curr_iter=curr_iter, output_root=self.media_path)
-                self.model.save(curr_iter, self.model_path)
+                self.save_checkpoint(curr_iter)
                 self._log_checkpoint_interval(curr_iter)
 
             if (self.enable_pbr_compare and curr_iter > 0 and curr_iter + 1 < self.max_iter
@@ -626,8 +666,8 @@ class Trainer(FeatureGridTraining):
         for mip in self._infer_mips():
             pred, gt, mip_height, mip_width = self._render_mip_pair(mip, decoded)
             material_metrics = self._compute_material_metrics(pred, gt)
-            records.extend(metric_records(material_metrics, method_label(compressed_method(self.model, self.astc_block)),
-                                          mip=mip, storage_bytes=storage[compressed_method(self.model, self.astc_block)],
+            records.extend(metric_records(material_metrics, method_label(compressed_method(self.model)),
+                                          mip=mip, storage_bytes=storage[compressed_method(self.model)],
                                           lpips_available=min(mip_height, mip_width) >= 128))
             self._save_mip_visuals(pred, gt, self.infer_path, f"Mip_{mip}.png")
         del decoded

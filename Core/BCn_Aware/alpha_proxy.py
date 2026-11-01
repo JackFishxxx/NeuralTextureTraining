@@ -14,16 +14,20 @@ import torch.nn.functional as F
 from torch import nn
 
 from Common.Block_Compression.bc import decode_blocks
-from .differentiable_proxy import BC1ProxyGrid, _ExactSTE, expanded, pack565, ste_round, unpack565
+from .differentiable_proxy import seed_rgb_endpoints, _ExactSTE, expanded, pack565, ste_round, unpack565
 
 
-class BC1AlphaProxyGrid(BC1ProxyGrid):
+class BC1AlphaProxyGrid(nn.Module):
     proxy_kind = 'bc1_rgba'
 
     def __init__(self, endpoints, weights, height, width, channels, modes=None):
         if channels not in (4, 8):
             raise ValueError("BC1 RGBA requires 4 or 8 features per grid")
-        super().__init__(endpoints, weights, height, width, channels)
+        super().__init__()
+        self.endpoints = nn.Parameter(endpoints.float())
+        self.weights = nn.Parameter(weights.float())
+        self.register_buffer('shape', torch.tensor([height, width, channels], device=endpoints.device))
+        self._image_shape, self.channels = (height, width), channels
         blocks = math.ceil(height / 4) * math.ceil(width / 4) * (channels // 4)
         if tuple(weights.shape) != (blocks, 16, 4) or tuple(endpoints.shape) != (blocks, 2, 3):
             raise ValueError("BC1 RGBA parameter shapes do not match image dimensions")
@@ -36,18 +40,35 @@ class BC1AlphaProxyGrid(BC1ProxyGrid):
 
     @classmethod
     @torch.no_grad()
-    def from_image(cls, image):
+    def from_image(cls, image, *, binary_seed=True):
         if image.ndim != 3 or image.shape[-1] not in (4, 8):
             raise ValueError("BC1 RGBA seed requires HWC with 4 or 8 channels")
         h, w, c = image.shape
+        if not binary_seed:
+            # Offline proposals encode the candidate alpha values faithfully;
+            # the sparse exploration mask belongs only to training startup.
+            from Common.Block_Compression.bc import BC1Codec
+
+            codec = BC1Codec()
+            blocks = []
+            for start in range(0, c, 4):
+                rgba = (image[..., start:start+4].detach().clamp(0, 1)*255).round().byte().cpu().numpy()
+                blocks.append(codec.encode_rgba(rgba)[128:])
+            packed = np.frombuffer(b''.join(blocks), dtype=np.dtype([
+                ('a', '<u2'), ('b', '<u2'), ('bits', '<u4')]))
+            words = torch.tensor(np.stack((packed['a'], packed['b']), 1).astype(np.int64), device=image.device)
+            bits = torch.tensor(packed['bits'].astype(np.int64), device=image.device)
+            selectors = (bits[:, None] >> (2*torch.arange(16, device=image.device))) & 3
+            modes = F.one_hot((words[:, 0] > words[:, 1]).long(), 2).float()*.25
+            ends = unpack565(words.sort(1).values).float()
+            return cls(ends, F.one_hot(selectors, 4).float()*.25, h, w, c, modes)
         bh, bw = math.ceil(h / 4), math.ceil(w / 4)
         surfaces = image.reshape(h, w, c // 4, 4).permute(2, 0, 1, 3).clamp(0, 1)
         endpoints, pixels = [], []
         y = torch.arange(bh * 4, device=image.device).clamp(max=h - 1)
         x = torch.arange(bw * 4, device=image.device).clamp(max=w - 1)
         for surface in surfaces:
-            rgb = BC1ProxyGrid.from_image(surface[..., :3])
-            words = pack565(rgb._legal_endpoints()).sort(1).values
+            words = pack565(seed_rgb_endpoints(surface[..., :3])).sort(1).values
             endpoints.append(unpack565(words).float())
             padded = surface[y[:, None], x[None, :]]
             pixels.append(padded.reshape(bh, 4, bw, 4, 4).permute(0, 2, 1, 3, 4).reshape(-1, 16, 4))

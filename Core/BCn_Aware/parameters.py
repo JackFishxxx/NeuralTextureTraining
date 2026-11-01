@@ -4,9 +4,9 @@ import torch
 
 
 def binary_regularization(trainer):
-    losses = [
-        p.binary_usage_loss() for p in trainer.model.astc_proxy if hasattr(p, "binary_usage_loss")
-    ]
+    active = getattr(trainer.model, '_codec_active_grids', None)
+    losses = [p.binary_usage_loss() for i, p in enumerate(trainer.model.astc_proxy)
+              if hasattr(p, "binary_usage_loss") and (active is None or i in active)]
     if not losses:
         return 0.0
     loss = torch.stack(losses).mean()

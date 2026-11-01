@@ -284,6 +284,22 @@ class ASTCBlockAdam:
             grid.endpoints.grad = None
             grid.weights.grad = None
 
+    def state_dict(self):
+        return dict(search_count=self._search_count, lrs=self.lrs,
+                    grids=[{name: tuple(v.detach().clone() for v in self.state[p])
+                            for name, p in (('endpoints', grid.endpoints), ('weights', grid.weights))
+                            if p in self.state} for grid in self.grids])
+
+    def load_state_dict(self, state):
+        if len(state['grids']) != len(self.grids):
+            raise ValueError('ASTC optimizer grid count mismatch')
+        self._search_count, self.lrs = state['search_count'], state['lrs']
+        self.state.clear()
+        for grid, saved in zip(self.grids, state['grids']):
+            for name, values in saved.items():
+                parameter = getattr(grid, name)
+                self.state[parameter] = tuple(v.to(parameter.device).clone() for v in values)
+
     @torch.no_grad()
     def reset_rows(self, index, ids):
         for parameter in (self.grids[index].endpoints, self.grids[index].weights):

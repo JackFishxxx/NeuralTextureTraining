@@ -1,8 +1,11 @@
 """One per-material compression recipe for baseline and FNTC tile output."""
 import numpy as np
 import torch
+import math
+from pathlib import Path
+from torch.nn import functional as F
 from Common.Block_Compression.astc import ASTCCodec
-from Common.Block_Compression.bc import BCCodec
+from Common.Block_Compression.bc import BCCodec, dds_header
 from Common.Block_Compression.formats import TextureFormat
 from .normal_encoding import decode_normal, encode_normal
 from Core.Feature_Grid.sampling import tile_regions
@@ -34,19 +37,15 @@ class MaterialCompression:
         return {group: self.formats[group].name for group in GROUP_NAMES if group in dataset.texture_packing}
 
     def payload_bytes(self, dataset, size):
-        return sum(tile['payload_bytes'] for tile in self.tile_layout(dataset,size))
+        return sum(self.formats[group].payload_bytes(*size) for group in dataset.texture_packing)
 
     def tile_layout(self, dataset, size):
         regions = list(tile_regions(*size,self.tile_size or max(size)))
         layout = []
         for group in dataset.texture_packing:
             fmt = self.formats[group]
-            extension = '.astc' if fmt.name.startswith('ASTC') else '.dds'
             for y,x,h,w in regions:
-                suffix = f'_tile_{y}_{x}' if len(regions) > 1 else ''
-                layout.append(dict(group=group,file=GROUP_NAMES[group]+suffix+extension,
-                                   origin=[y,x],size=[h,w],format=fmt.name,
-                                   payload_bytes=fmt.payload_bytes(h,w)))
+                layout.append(dict(group=group,origin=[y,x],size=[h,w],format=fmt.name))
         return layout
 
     def validate_dataset(self, dataset):
@@ -56,6 +55,36 @@ class MaterialCompression:
             if channels > fmt.channels and not (group == 'normal' and fmt.name == 'BC5' and channels == 3):
                 raise ValueError(f'{GROUP_NAMES[group]} has {channels} channels but {fmt.name} stores {fmt.channels} continuous channels')
 
+    def _encode_tiled(self, rgba, group):
+        """Assemble tile blocks; re-encode when tile boundaries cut codec blocks."""
+        codec,fmt = self.codecs[group],self.formats[group]
+        h,w = rgba.shape[:2]
+        bw,bh = fmt.block
+        blocks = np.empty((math.ceil(h/bh),math.ceil(w/bw),fmt.block_bytes),np.uint8)
+        aligned = (self.tile_size is None or
+                   ((h <= self.tile_size or self.tile_size % bh == 0)
+                    and (w <= self.tile_size or self.tile_size % bw == 0)))
+        decoded = np.empty_like(rgba) if not aligned else None
+        first = None
+        for y,x,th,tw in tile_regions(h,w,self.tile_size or max(h,w)):
+            data = codec.encode_rgba(rgba[y:y+th,x:x+tw])
+            if first is None:
+                first = data
+            if aligned:
+                offset = (128 if fmt.name == 'BC1' else 148) if isinstance(codec,BCCodec) else 16
+                rows,cols = math.ceil(th/bh),math.ceil(tw/bw)
+                blocks[y//bh:y//bh+rows,x//bw:x//bw+cols] = np.frombuffer(data[offset:],np.uint8).reshape(rows,cols,fmt.block_bytes)
+            else:
+                decoded[y:y+th,x:x+tw] = codec.decode_bytes(data)
+        if not aligned:
+            # A BC/ASTC block cannot represent two separately padded tile blocks.
+            return codec.encode_rgba(decoded)
+        if isinstance(codec,BCCodec):
+            header = dds_header(w,h,fmt.name)
+        else:
+            header = first[:7]+w.to_bytes(3,'little')+h.to_bytes(3,'little')+first[13:16]
+        return header+blocks.tobytes()
+
     @torch.no_grad()
     def compress(self, image, dataset):
         self.validate_dataset(dataset)
@@ -63,7 +92,6 @@ class MaterialCompression:
             raise ValueError('Cannot compress nonfinite material values')
         result = image.clone()
         textures = {}
-        layout = self.tile_layout(dataset,image.shape[-2:])
         for group, names in dataset.texture_packing.items():
             indices = [i for name in names for i in range(*dataset.canonical_channel_slices[name])]
             source = image[0, indices]
@@ -74,15 +102,10 @@ class MaterialCompression:
             h, w = source.shape[-2:]
             rgba = np.full((h, w, 4), 255, np.uint8)
             rgba[..., :len(source)] = (source.clamp(0, 1)*255).round().byte().permute(1, 2, 0).cpu().numpy()
-            decoded = np.empty_like(rgba)
-            for tile in layout:
-                if tile['group'] != group:
-                    continue
-                y,x = tile['origin']
-                th,tw = tile['size']
-                data = self.codecs[group].encode_rgba(rgba[y:y+th,x:x+tw])
-                decoded[y:y+th,x:x+tw] = self.codecs[group].decode_bytes(data)
-                textures[tile['file']] = data
+            data = self._encode_tiled(rgba,group)
+            extension = '.dds' if isinstance(self.codecs[group],BCCodec) else '.astc'
+            textures[GROUP_NAMES[group]+extension] = data
+            decoded = self.codecs[group].decode_bytes(data)
             restored = torch.from_numpy(decoded[..., :len(source)].copy()).permute(2, 0, 1).to(image).div_(255)
             if normal_rgb:
                 xy = restored*2-1
@@ -93,3 +116,64 @@ class MaterialCompression:
 
     def roundtrip(self, image, dataset):
         return self.compress(image,dataset)[0]
+
+    def export_materials(self, textures, dataset, size, directory, *, method):
+        """Write the same compressed mip chains consumed by PBR evaluation."""
+        directory = Path(directory)
+        directory.mkdir(parents=True,exist_ok=True)
+        self.prepare_textures(textures,dataset,size)
+        for filename,data in textures.items():
+            source = Path(filename)
+            group,separator,mip = source.stem.partition('_mip')
+            name = f'{group}_{method}_{self.formats[group.lower()].name}'
+            if separator:
+                name += f'_mip{mip}'
+            if source.suffix == '.dds':
+                name = 'DDS_'+name
+            (directory/(name+source.suffix)).write_bytes(data)
+
+    def prepare_textures(self, textures, dataset, size):
+        """Complete full-image chains once, shared by export and PBR sampling."""
+        result = []
+        for group in dataset.texture_packing:
+            codec = self.codecs[group]
+            filename = GROUP_NAMES[group]+('.dds' if isinstance(codec,BCCodec) else '.astc')
+            data = textures[filename]
+            encoding = None
+            if group == 'normal':
+                encoding = ('xy' if self.formats['normal'].name == 'BC5' and dataset.normal_encoding == 'xyz'
+                            else dataset.normal_encoding)
+            if isinstance(codec,BCCodec):
+                levels = codec.decode_mipmaps(data)
+                if len(levels) == 1 and max(size) > 1:
+                    data = codec.with_mipmaps(data,self._material_mipmaps(levels[0],encoding))
+                    textures[filename] = data
+                    levels = codec.decode_mipmaps(data)
+            else:
+                levels = [codec.decode_bytes(data)]
+                for mip,rgba in enumerate(self._material_mipmaps(levels[0],encoding),1):
+                    mip_file = GROUP_NAMES[group]+f'_mip{mip}.astc'
+                    if mip_file not in textures:
+                        textures[mip_file] = self._encode_tiled(rgba,group)
+                    levels.append(codec.decode_bytes(textures[mip_file]))
+            if tuple(levels[0].shape[:2]) != tuple(size):
+                raise ValueError('Compressed material dimensions do not match inference size')
+            if tuple(levels[-1].shape[:2]) != (1,1):
+                raise ValueError('Compressed material requires a complete mip chain')
+            result.append((group,levels))
+        return result
+
+    @staticmethod
+    def _material_mipmaps(rgba, normal_encoding):
+        level = torch.from_numpy(rgba.copy()).permute(2,0,1)[None].float()/255
+        channels = 3 if normal_encoding == 'xyz' else 2
+        while max(level.shape[-2:]) > 1:
+            size = tuple(max(1,n//2) for n in level.shape[-2:])
+            if normal_encoding is None:
+                level = F.interpolate(level,size=size,mode='area')
+            else:
+                normal = decode_normal(level[:,:channels],normal_encoding)
+                normal = encode_normal(F.interpolate(normal,size=size,mode='area'),normal_encoding)
+                level = F.interpolate(level,size=size,mode='area')
+                level[:,:channels] = normal
+            yield (level[0].clamp(0,1)*255).round().byte().permute(1,2,0).numpy()

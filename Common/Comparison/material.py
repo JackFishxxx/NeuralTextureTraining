@@ -3,7 +3,7 @@ import csv
 import math
 import json
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
@@ -65,6 +65,7 @@ class MaterialEvaluation:
     size: tuple
     reference: dict | None = None
     textures: dict | None = None
+    compressed_maps: dict = field(default_factory=dict)
 
 
 @torch.no_grad()
@@ -479,6 +480,7 @@ def run_material_comparison_pipeline(trainer, *, evaluation=None, curr_iter=None
                                 compression_formats=compression.recipe(dataset),
                                 fntc_tile_size=trainer.configs.fntc_tile_size,
                                 tile_layout=compression.tile_layout(dataset,evaluation.size),
+                                dds_mipmaps='assembled full-material chains down to 1x1; storage_bytes counts Mip0 only',
                                 texture_packing=dataset.texture_packing,
                                 canonical_channel_slices=dataset.canonical_channel_slices,
                                 normal_encoding=dataset.normal_encoding,
@@ -494,10 +496,8 @@ def run_material_comparison_pipeline(trainer, *, evaluation=None, curr_iter=None
     save_material_images(evaluation,dataset,compression,
                          (trainer.psnr,trainer.ssim,trainer.lpips),root,metrics=metrics)
     for method,textures in (evaluation.textures or {}).items():
-        folder = root/'tiles'/method
-        folder.mkdir(parents=True,exist_ok=True)
-        for filename,data in textures.items():
-            (folder/filename).write_bytes(data)
+        label = 'Baseline' if method == baseline_method(compression,dataset) else 'FNTC_Recompressed'
+        compression.export_materials(textures,dataset,evaluation.size,root,method=label)
     if verbose:
         _print_comparison_metrics(display,curr_iter)
     return metrics

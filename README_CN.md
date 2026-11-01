@@ -215,7 +215,7 @@ tensorboard --logdir ./outputs
 - **Loss/train**：训练损失
 - **PSNR / SSIM / LPIPS**：各材质组的 Mip0 图像质量指标；ROMSD LPIPS 分别评估有效标量通道后取平均。
 
-训练、块压缩导出和材质对比使用 Mip0（`mip0_only: true`）。
+训练、latent 块压缩导出和材质指标对比使用 Mip0（`mip0_only: true`）。
 
 ## 主要特性
 
@@ -293,9 +293,9 @@ material_compression_formats:
 fntc_tile_size: 128
 ```
 
-tile 大小以推理材质栅格上的 texel 计。CNN 训练采样和推理中心区域、FNTC 二次压缩、传统基线压缩使用同一套从左上角开始的 tile 边界。CNN 额外读取真实邻域 halo，避免引入 tile 接缝；右侧和底部不足一个 tile 时使用实际尺寸。每个压缩 tile 独立编码，格式块补齐造成的字节开销按实际计入统计。`eval_inference_tile` 仅控制 MLP 查询批次的显存用量，不改变上述 tile 边界。
+tile 大小以推理材质栅格上的 texel 计。CNN 训练采样和推理中心区域、FNTC 二次压缩、传统基线压缩使用同一套从左上角开始的 tile 边界。CNN 额外读取真实邻域 halo，避免引入 tile 接缝；右侧和底部不足一个 tile 时使用实际尺寸。各 tile 的压缩块组装为整张材质纹理，字节数按组装后的有效压缩载荷统计。`eval_inference_tile` 仅控制 MLP 查询批次的显存用量，不改变上述 tile 边界。
 
-报告记录 `fntc_tile_size` 和 `tile_layout`；多 tile 资产命名为 `Diffuse_tile_<y>_<x>.dds` 等，单 tile 保留 `Diffuse.dds`。CNN checkpoint 和 NPZ 保存 tile 大小，并校验恢复时的设置。
+报告记录 `fntc_tile_size` 和 `tile_layout`；完整材质纹理直接输出到 `Compare_Material/iter_<iteration>/`，例如 `DDS_Diffuse_Baseline_BC7.dds`、`DDS_Diffuse_FNTC_Recompressed_BC7.dds`，Normal 和 Romsd 文件同样标明方法及配置格式。CNN checkpoint 和 NPZ 保存 tile 大小，并校验恢复时的设置。
 
 ### FNTC 二次 tile 压缩
 
@@ -307,11 +307,13 @@ material_recompression_enable: true
 
 `FNTC_Uncompressed` 指压缩 latent 解码后推理得到、尚未再次压缩的材质；`FNTC_Recompressed_DiffuseBC7_NormalBC5_RomsdBC1` 指同一材质按基线配方再次压缩；`Baseline_DiffuseBC7_NormalBC5_RomsdBC1` 指传统材质压缩基线。默认开启二次压缩，以 FNTC_Recompressed 为核心部署方法；关闭后使用 FNTC_Uncompressed。重建损失用于训练 decoder，真实二次压缩用于验证，不通过传统编码器反传。
 
-`[Material Test]` 按 `material_compare_interval` 触发，周期独立于保存、早停及阶段起点，阶段结束另输出最终结果。材质报告位于 `Compare_Material/iter_<iteration>/`，含 `metrics.json`、`metrics.csv`、带左上角指标的独立图和拼图；`tiles/<方法>/` 保存二次压缩或基线的 DDS/ASTC 文件。PBR 在 `Compare_PBRScene/iter_<iteration>/` 比较各启用方法，Scene 使用 `pbr_render_resolution`，独立渲染的 Scene Detail 使用 `pbr_detail_resolution`。
+`[Material Test]` 按 `material_compare_interval` 触发，周期独立于保存、早停及阶段起点，阶段结束另输出最终结果。材质报告位于 `Compare_Material/iter_<iteration>/`，同目录保存 `metrics.json`、`metrics.csv`、带左上角指标的独立图、拼图以及二次压缩和基线的 DDS/ASTC 文件。PBR 在 `Compare_PBRScene/iter_<iteration>/` 比较各启用方法，Scene 使用 `pbr_render_resolution`，独立渲染的 Scene Detail 使用 `pbr_detail_resolution`。
+
+整张材质 DDS 包含逐级缩小至 1×1 的完整 mip 链，从拼接、解码后的 Mip0 连续过滤生成各级，法线采用向量过滤。ASTC 材质单独保存为 `Diffuse_Baseline_ASTC6x6.astc`、`Diffuse_Baseline_ASTC6x6_mip1.astc` 等文件。压缩块对齐时直接拼接 tile 码流；内部 tile 边界切开压缩块时，对拼接后的解码图重新编码，使导出纹理与评估像素一致。质量指标与存储对比仍按 Mip0 统计；导出文件另外包含低级 mip 和容器头。模型 latent surface 仍只导出 Mip0。
 
 例如 GT=2048、推理/基线=1024，以下文件都保存为2048×2048；低分辨率内容在压缩之后双线性拉伸再对高分辨率 GT 计算指标：`Diffuse_GT[1024x1024].png`、`Diffuse_GT[2048x2048].png`、`Diffuse_BC7.png`、`Diffuse_FNTC_Uncompressed.png`、`Diffuse_FNTC_Recompressed.png`。低分辨率 GT 图表示预滤波后的未压缩源，`Diffuse_BC7.png` 表示其传统压缩结果。
 
-PBR 直接采样各方法的原生材质栅格，并按该分辨率生成 mip 链。GT 保留自身分辨率；对齐 GT 尺寸的截图图像仅用于图像指标与输出。
+PBR 对 baseline 和 FNTC_Recompressed 采样整张材质各级实际压缩、解码后的 mip，与文件导出共用相同码流。双线性/三线性采样在完整材质上采用 repeat 寻址。FNTC_Uncompressed 和 GT 分别在各自原生分辨率生成浮点 mip 链。对齐 GT 尺寸的截图仅用于图像指标与输出；报告记录各方法的 `mip_sources` 和纹理寻址规则。
 
 FNTC 存储统计计压缩 latent、decoder 和 CNN；材质 tile cache 大小单列。基线统计压缩材质 payload，不含容器头或共享 SR base。
 

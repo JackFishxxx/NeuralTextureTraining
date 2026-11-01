@@ -219,7 +219,7 @@ The following metrics are logged automatically during training:
 - **Loss/train**: Training loss
 - **PSNR / SSIM / LPIPS**: Mip0 quality metrics per material group; ROMSD LPIPS averages the independently evaluated scalar channels.
 
-Training, block-compressed export and material comparisons use Mip0 (`mip0_only: true`).
+Training, latent block-compressed export and material image metrics use Mip0 (`mip0_only: true`).
 
 ---
 
@@ -296,9 +296,11 @@ Each material group accepts BC1/3/4/5/7 or a legal ASTC footprint such as `ASTC6
 fntc_tile_size: 128
 ```
 
-Tile size is measured in inference material texels. CNN training/inference, FNTC recompression and conventional baselines share tile boundaries anchored at the top left. CNN tiles read a real neighbor halo to avoid seams. Right/bottom tiles keep their actual dimensions; each compressed tile is encoded independently and block padding is included in payload accounting. `eval_inference_tile` only limits MLP query batches and does not change material tile boundaries.
+Tile size is measured in inference material texels. CNN training/inference, FNTC recompression and conventional baselines share tile boundaries anchored at the top left. CNN tiles read a real neighbor halo to avoid seams. Right/bottom tiles keep their actual dimensions. Tile compression blocks are assembled into a full material image; if internal tile boundaries cut codec blocks, the stitched decoded image is re-encoded so the exported texture and evaluated pixels agree. `eval_inference_tile` only limits MLP query batches and does not change material tile boundaries.
 
-Reports record `fntc_tile_size` and `tile_layout`. Multiple tiles export as `Diffuse_tile_<y>_<x>.dds`, etc.; a single tile retains `Diffuse.dds`. CNN checkpoints and NPZ exports preserve tile size and validate it during restoration.
+Reports record `fntc_tile_size` and `tile_layout`. Full material textures are written directly under `Compare_Material/iter_<iteration>/`, for example `DDS_Diffuse_Baseline_BC7.dds` and `DDS_Diffuse_FNTC_Recompressed_BC7.dds`, with corresponding Normal and Romsd files in their configured formats. CNN checkpoints and NPZ exports preserve tile size and validate it during restoration.
+
+DDS material images include a full mip chain down to 1×1. Mips are filtered successively from the assembled, decoded Mip0, with vector filtering for normals. ASTC material mips use separate files such as `Diffuse_Baseline_ASTC6x6.astc` and `Diffuse_Baseline_ASTC6x6_mip1.astc`. Quality metrics and storage comparisons count Mip0; exported files additionally contain lower mips and container headers. Model latent surfaces retain their Mip0 export.
 
 ### FNTC tile recompression
 
@@ -310,11 +312,11 @@ Recompression uses `material_compression_formats` from the baseline section. Sta
 
 `FNTC_Uncompressed` is inference from compressed latent textures, before material recompression. `FNTC_Recompressed_DiffuseBC7_NormalBC5_RomsdBC1` applies the same per-group formats as `Baseline_DiffuseBC7_NormalBC5_RomsdBC1`. Recompression is enabled by default, making FNTC_Recompressed the primary deployment method; disabling it selects FNTC_Uncompressed. The reconstruction objective trains the decoder; conventional recompression is evaluated without differentiating through the codec.
 
-`[Material Test]` runs every `material_compare_interval` iterations independently of saving, early-stop windows or stage starts, with an additional terminal report. `Compare_Material/iter_<iteration>/` contains `metrics.json`, `metrics.csv`, annotated standalone images and strips; `tiles/<method>/` contains baseline/recompressed DDS or ASTC files. PBR compares all enabled methods under `Compare_PBRScene/iter_<iteration>/`: Scene uses `pbr_render_resolution`, and the separately rendered Scene Detail uses `pbr_detail_resolution`.
+`[Material Test]` runs every `material_compare_interval` iterations independently of saving, early-stop windows or stage starts, with an additional terminal report. `Compare_Material/iter_<iteration>/` contains `metrics.json`, `metrics.csv`, annotated standalone images, strips and baseline/recompressed DDS or ASTC files. PBR compares all enabled methods under `Compare_PBRScene/iter_<iteration>/`: Scene uses `pbr_render_resolution`, and the separately rendered Scene Detail uses `pbr_detail_resolution`.
 
 For 2048 GT and a 1024 inference/baseline raster, every screenshot is 2048×2048: `Diffuse_GT[1024x1024].png`, `Diffuse_GT[2048x2048].png`, `Diffuse_BC7.png`, `Diffuse_FNTC_Uncompressed.png`, `Diffuse_FNTC_Recompressed.png`. Compression occurs at 1024 before bilinear upsampling and evaluation against full-resolution GT. The low-resolution GT image shows the prefiltered source before conventional compression. Every standalone image has metrics in its upper-left corner.
 
-PBR samples each method's native material raster and builds its mip chain at that resolution. GT retains its own resolution; the GT-sized screenshot images are used only for image metrics and output.
+PBR samples baseline and FNTC_Recompressed from the actual decoded blocks of every full-material compressed mip, sharing those bitstreams with file export. Bilinear/trilinear sampling uses repeat addressing across the complete material image. FNTC_Uncompressed and GT use floating mip pyramids at their respective native resolutions. GT-sized screenshot images are used only for image metrics and output. The report records each method's `mip_sources` and texture addressing.
 
 FNTC storage counts compressed latents, decoder and CNN; material tile cache bytes are reported separately. Baseline storage counts compressed material payload. Containers and the shared SR base are excluded.
 

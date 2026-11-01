@@ -7,14 +7,18 @@ from .formats import TextureFormat
 _DXGI_FORMATS = {'BC1': 71, 'BC3': 77, 'BC4': 80, 'BC5': 83, 'BC7': 98}
 
 
-def dds_header(width, height, format='BC1'):
+def dds_header(width, height, format='BC1', mip_count=1):
     fmt = TextureFormat(format)
     if fmt.name not in _DXGI_FORMATS or width < 1 or height < 1:
         raise ValueError('Expected a BC format and positive texture dimensions')
+    if not isinstance(mip_count, int) or isinstance(mip_count, bool) or not 1 <= mip_count <= max(width,height).bit_length():
+        raise ValueError('DDS mip count exceeds texture dimensions')
     fourcc = 0x31545844 if fmt.name == 'BC1' else 0x30315844
-    header = (b'DDS ' + struct.pack('<7I',124,0x81007,height,width,fmt.payload_bytes(height,width),0,1)
+    flags = 0x81007 | (0x20000 if mip_count > 1 else 0)
+    caps = 0x1000 | (0x400008 if mip_count > 1 else 0)
+    header = (b'DDS ' + struct.pack('<7I',124,flags,height,width,fmt.payload_bytes(height,width),0,mip_count)
               + bytes(44) + struct.pack('<8I',32,4,fourcc,0,0,0,0,0)
-              + struct.pack('<5I',0x1000,0,0,0,0))
+              + struct.pack('<5I',caps,0,0,0,0))
     if fmt.name != 'BC1':
         header += struct.pack('<5I',_DXGI_FORMATS[fmt.name],3,0,1,0)
     return header
@@ -148,14 +152,52 @@ class BCCodec:
         height,width = rgba.shape[:2]
         return dds_header(width,height,self.format.name)+blocks
 
-    def decode_bytes(self, data):
+    def _dds_levels(self, data):
         if len(data) < 128 or data[:4] != b'DDS ' or struct.unpack_from('<I',data,4)[0] != 124:
             raise ValueError('Expected a DDS texture')
         height,width = struct.unpack_from('<II',data,12)
-        header = dds_header(width,height,self.format.name)
+        count = struct.unpack_from('<I',data,28)[0]
+        header = dds_header(width,height,self.format.name,count)
         if data[84:88] != header[84:88] or (self.format.name != 'BC1' and data[128:148] != header[128:148]):
             raise ValueError('DDS format does not match codec')
-        return self.decode_blocks(data[len(header):],width,height)
+        levels, offset = [], len(header)
+        for _ in range(count):
+            size = self.format.payload_bytes(height,width)
+            levels.append((width,height,data[offset:offset+size]))
+            offset += size
+            width,height = max(1,width//2),max(1,height//2)
+        if offset != len(data):
+            raise ValueError('DDS payload does not match mip dimensions')
+        return levels
+
+    def decode_bytes(self, data, mip=0):
+        levels = self._dds_levels(data)
+        if not isinstance(mip,int) or isinstance(mip,bool) or not 0 <= mip < len(levels):
+            raise ValueError('DDS mip index out of range')
+        width,height,blocks = levels[mip]
+        return self.decode_blocks(blocks,width,height)
+
+    def decode_mipmaps(self, data):
+        return [self.decode_blocks(blocks,width,height) for width,height,blocks in self._dds_levels(data)]
+
+    def with_mipmaps(self, data, mipmaps):
+        """Append a complete RGBA mip pyramid while preserving the base bitstream."""
+        levels = self._dds_levels(data)
+        if len(levels) != 1:
+            raise ValueError('Expected a single-level DDS before appending mipmaps')
+        width,height,base = levels[0]
+        w,h = width,height
+        blocks = [base]
+        for image in mipmaps:
+            if (w,h) == (1,1):
+                raise ValueError('DDS mip chain extends past 1x1')
+            w,h = max(1,w//2),max(1,h//2)
+            if image.shape != (h,w,4):
+                raise ValueError('DDS mip image dimensions do not match the previous level')
+            blocks.append(self.encode_blocks(image))
+        if (w,h) != (1,1):
+            raise ValueError('DDS mip chain must end at 1x1')
+        return dds_header(width,height,self.format.name,len(blocks))+b''.join(blocks)
 
     def roundtrip_rgba(self, rgba):
         return self.decode_bytes(self.encode_rgba(rgba))

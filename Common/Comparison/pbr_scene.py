@@ -8,6 +8,7 @@ runtime dependency to the training environment.
 import os
 import math
 import json
+from dataclasses import dataclass
 from typing import Dict, Iterable, Tuple
 
 import numpy as np
@@ -16,7 +17,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 
 from Core.Material_Encoding.normal_encoding import decode_normal, encode_normal, normal_vectors
-from .material import baseline_method, comparison_label_color, load_overlay_font, metric_records, write_metrics, log_comparison_storage
+from .material import UNCOMPRESSED, baseline_method, comparison_label_color, load_overlay_font, metric_records, write_metrics, log_comparison_storage
 
 
 def _normalize(x: np.ndarray) -> np.ndarray:
@@ -157,20 +158,17 @@ def _mip_pyramid(texture: np.ndarray, normal_encoding=None):
     return levels
 
 
-def _sample(texture: np.ndarray, uv: np.ndarray, uv_dx=None, uv_dy=None,
-            mip_lod_bias: float = 0.0, normal_encoding=None) -> np.ndarray:
-    """Bilinear magnification and trilinear mip-filtered minification."""
+def _sample_pyramid(levels, uv, uv_dx, uv_dy, mip_lod_bias):
     if uv_dx is None or uv_dy is None:
-        return _sample_level(texture, uv)
-    levels = _mip_pyramid(texture, normal_encoding)
-    h, w = texture.shape[-2:]
+        return _sample_level(levels[0],uv)
+    h, w = levels[0].shape[-2:]
     scale = np.asarray([w, h], np.float32)
     rho = np.maximum(np.linalg.norm(uv_dx * scale, axis=1), np.linalg.norm(uv_dy * scale, axis=1))
     lod = np.clip(np.log2(np.maximum(rho, 1.0)) + float(mip_lod_bias), 0.0, len(levels) - 1.0)
     lo = np.floor(lod).astype(np.int32)
     hi = np.minimum(lo + 1, len(levels) - 1)
     blend = (lod - lo)[:, None]
-    low_result = np.empty((uv.shape[0], texture.shape[0]), np.float32)
+    low_result = np.empty((uv.shape[0], levels[0].shape[0]), np.float32)
     high_result = np.empty_like(low_result)
     for level in np.unique(lo):
         mask = lo == level
@@ -181,7 +179,43 @@ def _sample(texture: np.ndarray, uv: np.ndarray, uv_dx=None, uv_dy=None,
     return low_result * (1.0 - blend) + high_result * blend
 
 
+@dataclass
+class CompressedTexture:
+    """Actual full-image mip levels decoded from the exported compressed blocks."""
+    levels: tuple
+    normal_encoding: str | None = None
+
+
+def _compressed_material_maps(compression, textures, dataset, size):
+    maps = {}
+    for group,levels in compression.prepare_textures(textures,dataset,size):
+        offset = 0
+        for name in dataset.texture_packing[group]:
+            start,end = dataset.canonical_channel_slices[name]
+            encoding = dataset.normal_encoding if name == 'normal' else None
+            if name == 'normal' and compression.formats['normal'].name == 'BC5' and encoding == 'xyz':
+                encoding = 'xy'
+            channels = 2 if encoding == 'xy' else end-start
+            maps[name] = CompressedTexture(tuple(
+                level[...,offset:offset+channels].transpose(2,0,1).astype(np.float32)/255
+                for level in levels),encoding)
+            offset += channels
+    return maps
+
+
+def _sample(texture, uv: np.ndarray, uv_dx=None, uv_dy=None,
+            mip_lod_bias: float = 0.0, normal_encoding=None) -> np.ndarray:
+    """Sample physical compressed mips or a floating reference pyramid."""
+    if isinstance(texture,CompressedTexture):
+        return _sample_pyramid(texture.levels,uv,uv_dx,uv_dy,mip_lod_bias)
+    if uv_dx is None or uv_dy is None:
+        return _sample_level(texture,uv)
+    return _sample_pyramid(_mip_pyramid(texture,normal_encoding),uv,uv_dx,uv_dy,mip_lod_bias)
+
+
 def _sample_normal(texture, uv, uv_dx=None, uv_dy=None, mip_lod_bias=0., normal_encoding='xyz'):
+    if isinstance(texture,CompressedTexture):
+        normal_encoding = texture.normal_encoding
     encoded = _sample(texture, uv, uv_dx, uv_dy, mip_lod_bias, normal_encoding)
     return normal_vectors(torch.from_numpy(encoded), normal_encoding).numpy()
 
@@ -201,12 +235,13 @@ def _material_maps(texture: torch.Tensor, slices: Dict[str, tuple], normal_encod
 def render_pbr_scene(texture: torch.Tensor, slices: Dict[str, tuple], normal_encoding: str,
                      resolution: int = 512, available_textures=None,
                      mip_lod_bias: float = -1.0, lighting=None,
-                     view_center=(0.5, 0.5), view_zoom: float = 1.0) -> np.ndarray:
+                     view_center=(0.5, 0.5), view_zoom: float = 1.0, texture_maps=None) -> np.ndarray:
     """Rasterize float sRGB; an off-axis viewport re-renders a magnified scene region."""
     if (not math.isfinite(view_zoom) or view_zoom < 1 or len(view_center) != 2
             or any(not math.isfinite(v) or not 0 <= v <= 1 for v in view_center)):
         raise ValueError('View zoom must be finite and >= 1; center must be two coordinates in [0,1]')
-    maps = _material_maps(texture, slices, normal_encoding, available_textures)
+    maps = (_material_maps(texture, slices, normal_encoding, available_textures)
+            if texture_maps is None else texture_maps)
     lighting = lighting or {}
     point_lights = lighting.get("point_lights", [
         {"position": [0.0, 0.82, 0.7], "intensity": 6.5, "color": [1.0, 1.0, 1.0]},
@@ -451,6 +486,17 @@ def run_pbr_comparison_pipeline(trainer, evaluation, output_root, *, curr_iter=N
         views.append(('Scene Detail',config.pbr_detail_resolution,config.pbr_detail_center,config.pbr_detail_zoom))
     baseline_name = baseline_method(compression,dataset)
     fixed_names = (baseline_name,'GT')
+    for name,textures in (evaluation.textures or {}).items():
+        if name not in evaluation.compressed_maps:
+            if name == baseline_name:
+                if 'compressed_maps' not in reference:
+                    reference['compressed_maps'] = _compressed_material_maps(compression,textures,dataset,evaluation.size)
+                evaluation.compressed_maps[name] = reference['compressed_maps']
+            else:
+                evaluation.compressed_maps[name] = _compressed_material_maps(compression,textures,dataset,evaluation.size)
+    for name in evaluation.native_images:
+        if name not in (UNCOMPRESSED,'GT') and name not in evaluation.compressed_maps:
+            raise ValueError(f'PBR requires compressed full-image mip chains for {name}')
     for view,resolution,center,zoom in views:
         fixed = cache.setdefault(view,{})
         rendered = {}
@@ -460,7 +506,8 @@ def run_pbr_comparison_pipeline(trainer, evaluation, output_root, *, curr_iter=N
             else:
                 image_render = render_pbr_scene(image,dataset.canonical_channel_slices,dataset.normal_encoding,
                                                 resolution,dataset.available_textures,config.pbr_mip_lod_bias,
-                                                trainer.pbr_lighting,view_center=center or (.5,.5),view_zoom=zoom or 1.)
+                                                trainer.pbr_lighting,view_center=center or (.5,.5),view_zoom=zoom or 1.,
+                                                texture_maps=evaluation.compressed_maps.get(name))
                 rendered[name] = image_render
                 if name in fixed_names:
                     fixed[name] = image_render
@@ -507,6 +554,9 @@ def run_pbr_comparison_pipeline(trainer, evaluation, output_root, *, curr_iter=N
                                     inference_size=list(evaluation.size),
                                     material_sizes={name:list(image.shape[-2:]) for name,image in evaluation.native_images.items()},
                                     normal_encoding=dataset.normal_encoding,
+                                    mip_sources={name: ('compressed full-image mip chains' if name in evaluation.compressed_maps
+                                                       else 'floating mip pyramid') for name in evaluation.native_images},
+                                    texture_addressing='repeat full material UVs; bilinear/trilinear sampling of assembled compressed mips',
                                     mip_lod_bias=config.pbr_mip_lod_bias,lighting=trainer.pbr_lighting,
                                     detail_view=dict(center=config.pbr_detail_center,zoom=config.pbr_detail_zoom,
                                                      resolution=config.pbr_detail_resolution,rendered_separately=True)))

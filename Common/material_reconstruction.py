@@ -66,8 +66,15 @@ def _render_model_mip0(model, dataset, texture_height: int, texture_width: int, 
 @torch.no_grad()
 def make_deployment_model(model):
     decoded = copy.deepcopy(model).eval()
-    decoded.simulate_quantize()
-    apply_latent_compression(decoded)
+    fields = decoded._decoder_adaptation_features
+    if fields is not None and all(not field.requires_grad for field in fields):
+        # Decoder fitting already owns immutable, deployment-quantized fields.
+        for grid, field in zip(decoded.feature_grids, fields):
+            grid.params.copy_(field)
+        decoded._pending_grid_sync.clear()
+    else:
+        decoded.simulate_quantize()
+        apply_latent_compression(decoded)
     decoded._decoder_adaptation_features = None
     return decoded
 
@@ -88,7 +95,8 @@ def cached_astc_base(dataset, codec, base_resolution, output_size):
         image = compression.roundtrip(source,dataset)
         if tuple(image.shape[-2:]) != tuple(output_size):
             image = resize_bilinear_repeat(image,output_size)
-        dataset._sr_base_cache = (key,image.cpu())
+        # Training and evaluation share this immutable GPU raster.
+        dataset._sr_base_cache = (key,image)
     return dataset._sr_base_cache[1].to(dataset.mip_cache[0].device)
 
 

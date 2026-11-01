@@ -38,3 +38,19 @@ def sample_feature_inputs(params, spec, uv, selected_level):
     samples = (values * weights[..., None]).sum(1).reshape(len(uv), len(shifts), -1)
     center = samples[:, :1]
     return torch.cat((center, samples[:, 1:] - center), 1).flatten(1)
+
+
+def sample_feature_centers(params, spec, uv):
+    """Gather known highest-level texel centers and their integer neighbors.
+
+    The caller guarantees a matching power-of-two native raster and one grid
+    level. General/fractional UVs continue to use sample_feature_inputs.
+    """
+    resolution = spec.max_resolution
+    shifts = torch.tensor(((0, 0), *gradient_directions(spec.feature_gradient_count)),
+                          device=uv.device, dtype=torch.long)
+    pixels = (uv * resolution).floor().long()
+    xy = (pixels[:, None] + shifts).remainder(resolution)
+    indices = xy[..., 1] * resolution + xy[..., 0]
+    samples = params.reshape(-1, spec.n_features_per_level)[indices].float()
+    return torch.cat((samples[:, :1], samples[:, 1:] - samples[:, :1]), 1).flatten(1)

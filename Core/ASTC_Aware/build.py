@@ -5,11 +5,10 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
-import subprocess
 import tempfile
 import urllib.request
 import zipfile
-import torch
+from Common.cuda_build import prepare_cuda_build
 
 
 # Core astcenc sources; paths are resolved against the shared Source directory.
@@ -107,51 +106,11 @@ def resolve_encoder_source(native_root=None):
     return _validate_encoder_source(install_root / "Source")
 
 
-def _windows_toolchain():
-    if os.name != "nt" or shutil.which("cl"):
-        return
-    installer = (
-        Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)"))
-        / "Microsoft Visual Studio/Installer/vswhere.exe"
-    )
-    if not installer.exists():
-        raise RuntimeError(
-            "ASTC differentiable proxy requires MSVC: use an x64 Visual Studio developer shell"
-        )
-    installation = subprocess.check_output(
-        [
-            str(installer),
-            "-latest",
-            "-products",
-            "*",
-            "-requires",
-            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-            "-property",
-            "installationPath",
-        ],
-        text=True,
-    ).strip()
-    script = Path(installation) / "VC/Auxiliary/Build/vcvars64.bat"
-    if not script.exists():
-        raise RuntimeError("MSVC x64 C++ toolchain not found")
-    result = subprocess.check_output(f'call "{script}" >nul && set', shell=True, text=True)
-    for line in result.splitlines():
-        if "=" in line and not line.startswith("="):
-            key, value = line.split("=", 1)
-            os.environ[key] = value
-
-
 @lru_cache(maxsize=1)
 def native_extension():
     root = Path(__file__).resolve().parent / "native"
     upstream = resolve_encoder_source(root)
-    _windows_toolchain()
-    import ninja
-
-    os.environ["PATH"] = str(ninja.BIN_DIR) + os.pathsep + os.environ["PATH"]
-    if "TORCH_CUDA_ARCH_LIST" not in os.environ:
-        major, minor = torch.cuda.get_device_capability()
-        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
+    prepare_cuda_build()
     from torch.utils.cpp_extension import load
 
     sources = [root / "astc_native.cpp", root / "astc_proxy.cu"]

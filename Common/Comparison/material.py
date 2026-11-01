@@ -64,12 +64,13 @@ class MaterialEvaluation:
     native_images: dict
     size: tuple
     reference: dict | None = None
-    textures: dict | None = None
+    textures: dict = field(default_factory=dict)
     compressed_maps: dict = field(default_factory=dict)
 
 
 @torch.no_grad()
-def evaluate_materials(model, dataset, config, compression, sr_codec, *, baseline=True, material_override=None):
+def evaluate_materials(model, dataset, config, compression, sr_codec, *, baseline=True,
+                       material_override=None, primary_only=False):
     size = material_size(model,dataset.texture_height,dataset.texture_width,
                          resolution=config.material_compare_resolution)
     native = material_override
@@ -90,14 +91,26 @@ def evaluate_materials(model, dataset, config, compression, sr_codec, *, baselin
         name = recompressed_method(compression,dataset)
         decoded,textures[name] = compression.compress(native,dataset)
         native_images[name] = decoded
-    reference = comparison_reference(dataset, compression, size) if baseline else None
-    if reference is not None:
-        native_images[baseline_method(compression,dataset)] = reference['baseline'].to(native.device)
-        native_images['GT'] = reference['gt'].to(native.device)
-        textures[baseline_method(compression,dataset)] = reference['textures']
-    images = {name: _at_gt_size(image,dataset) for name,image in native_images.items()}
-    return MaterialEvaluation(images=images, native_images=native_images, size=tuple(size),
-                              reference=reference, textures=textures)
+    names = [primary_method(compression,dataset,config.material_recompression_enable)] if primary_only else native_images
+    images = {name: _at_gt_size(native_images[name],dataset) for name in names}
+    evaluation = MaterialEvaluation(images=images, native_images=native_images, size=tuple(size), textures=textures)
+    return complete_material_evaluation(evaluation,dataset,compression) if baseline else evaluation
+
+
+def complete_material_evaluation(evaluation, dataset, compression):
+    """Add report images to this iteration's PSNR evaluation without rendering again."""
+    if evaluation.reference is None:
+        reference = comparison_reference(dataset,compression,evaluation.size)
+        device = next(iter(evaluation.native_images.values())).device
+        name = baseline_method(compression,dataset)
+        evaluation.reference = reference
+        evaluation.native_images[name] = reference['baseline'].to(device)
+        evaluation.native_images['GT'] = reference['gt'].to(device)
+        evaluation.textures[name] = reference['textures']
+    for name,image in evaluation.native_images.items():
+        if name not in evaluation.images:
+            evaluation.images[name] = _at_gt_size(image,dataset)
+    return evaluation
 
 
 METRIC_FIELDS = ('iteration', 'method', 'view', 'mip', 'group', 'psnr_type',
@@ -170,13 +183,12 @@ def _compute_ssim_safe(pred_ref: torch.Tensor, gt_ref: torch.Tensor, ssim_metric
 def _compute_metrics_from_refs(
     pred_ref: torch.Tensor, gt_ref: torch.Tensor, psnr_metric, ssim_metric, lpips_metric,
     is_normal: bool = False, normal_encoding: str = "xyz", scalar_channels: bool = False,
-) -> Tuple[float, float, float]:
+    psnr_only: bool = False,
+) -> Tuple[float, Optional[float], Optional[float]]:
     pred_ref = torch.nan_to_num(pred_ref.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     gt_ref = torch.nan_to_num(gt_ref.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     if is_normal:
         psnr_value = float(normal_angular_psnr(pred_ref, gt_ref, normal_encoding).item())
-        pred_ref = decode_normal(pred_ref, normal_encoding)
-        gt_ref = decode_normal(gt_ref, normal_encoding)
     else:
         psnr_metric.reset()
         psnr_value = float(psnr_metric(pred_ref, gt_ref).item())
@@ -185,6 +197,11 @@ def _compute_metrics_from_refs(
             psnr_value = 120.0
     if not math.isfinite(psnr_value):
         psnr_value = 0.0
+    if psnr_only:
+        return psnr_value, None, None
+    if is_normal:
+        pred_ref = decode_normal(pred_ref, normal_encoding)
+        gt_ref = decode_normal(gt_ref, normal_encoding)
     ssim_value = _compute_ssim_safe(pred_ref, gt_ref, ssim_metric)
 
     if pred_ref.shape[-2] >= 128 and pred_ref.shape[-1] >= 128:
@@ -236,9 +253,10 @@ def _group_metric_weights(dataset, eval_weights=None) -> Dict[str, float]:
 
 
 @torch.no_grad()
-def _compute_group_metrics(pred_image, gt_image, dataset, psnr_metric, ssim_metric, lpips_metric, eval_weights=None):
+def _compute_group_metrics(pred_image, gt_image, dataset, psnr_metric, ssim_metric, lpips_metric,
+                           eval_weights=None, *, psnr_only=False):
     group_channels = _metric_channel_groups(dataset)
-    group_metrics: Dict[str, Tuple[float, float, float]] = {}
+    group_metrics: Dict[str, Tuple[float, Optional[float], Optional[float]]] = {}
     for group_name, channels in group_channels.items():
         ch_idx = torch.tensor(channels, device=pred_image.device, dtype=torch.long)
         pred_ref = torch.index_select(pred_image, dim=1, index=ch_idx)
@@ -248,24 +266,19 @@ def _compute_group_metrics(pred_image, gt_image, dataset, psnr_metric, ssim_metr
             is_normal=(group_name == "normal"),
             normal_encoding=str(getattr(dataset, "normal_encoding", "xyz")),
             scalar_channels=(group_name == "romsd"),
+            psnr_only=psnr_only,
         )
 
     if group_metrics:
         order = [n for n in ("diffuse", "normal", "romsd") if n in group_metrics]
         weights = _group_metric_weights(dataset, eval_weights)
-        vals = np.array([group_metrics[n] for n in order], dtype=np.float64)
+        vals = np.array([group_metrics[n][:1] if psnr_only else group_metrics[n] for n in order], dtype=np.float64)
         ws = np.array([max(0.0, weights.get(n, 1.0)) for n in order], dtype=np.float64)
         if ws.sum() <= 0:
             ws = np.ones_like(ws)
         ws = ws / ws.sum()
-        avg_psnr, avg_ssim, avg_lpips = [float(v) for v in (vals * ws[:, None]).sum(axis=0)]
-        if not math.isfinite(avg_ssim):
-            avg_ssim = 0.0
-        if not math.isfinite(avg_psnr):
-            avg_psnr = 0.0
-        if not math.isfinite(avg_lpips):
-            avg_lpips = 0.0
-        group_metrics["average"] = (avg_psnr, avg_ssim, avg_lpips)
+        averages = tuple(float(v) if math.isfinite(v) else 0.0 for v in (vals * ws[:, None]).sum(axis=0))
+        group_metrics["average"] = averages + (None, None) if psnr_only else averages
     return group_metrics
 
 

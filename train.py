@@ -23,7 +23,8 @@ from Common.material_loss import MaterialLoss
 from Common.material_reconstruction import canonical_gt_mip
 from configs import Config, write_resolved_config
 from Common.Comparison.material import (log_comparison_storage, _compute_group_metrics,
-                                        run_material_comparison_pipeline, evaluate_materials, primary_method)
+                                        run_material_comparison_pipeline, evaluate_materials, primary_method,
+                                        complete_material_evaluation)
 from Core.Material_Encoding.compression import MaterialCompression
 from Common.Comparison.pbr_scene import run_pbr_comparison_pipeline
 from dataset import material_size
@@ -267,7 +268,7 @@ class Trainer(FeatureGridTraining):
         return self._objective
 
     def _compute_reconstruction_loss(self, gt_texture, predict_texture, loss_weights, curr_iter=None):
-        loss, stats = self._material_objective().reconstruction(
+        loss, stats = self._material_objective().training_reconstruction(
             gt_texture, predict_texture, loss_weights, statistics=curr_iter is not None)
         if curr_iter is not None:
             for group, values in stats.items():
@@ -312,32 +313,34 @@ class Trainer(FeatureGridTraining):
         self._early_stop_phase_start_iter = start
 
     def _validation_score(self, curr_iter, eval_psnr=None):
-        score = float(eval_psnr if eval_psnr is not None else self.deployment_metrics()['average'][0])
+        score = float(eval_psnr if eval_psnr is not None else self.deployment_metrics(psnr_only=True)['average'][0])
         self.writer.add_scalar('EarlyStop/recompressed_PSNR' if self.configs.material_recompression_enable
                                else 'EarlyStop/uncompressed_PSNR', score, curr_iter)
         return score
 
-    def material_evaluation(self, *, baseline=True, material_override=None):
+    def material_evaluation(self, *, baseline=True, material_override=None, primary_only=False):
         return evaluate_materials(self.model, self.dataset, self.configs, self.material_compression,
-                                  self.astc_codec, baseline=baseline, material_override=material_override)
+                                  self.astc_codec, baseline=baseline, material_override=material_override,
+                                  primary_only=primary_only)
 
     @property
     def primary_method(self):
         return primary_method(self.material_compression,self.dataset,self.configs.material_recompression_enable)
 
     @torch.no_grad()
-    def deployment_metrics(self):
-        evaluation = self.material_evaluation(baseline=False)
+    def deployment_metrics(self, *, evaluation=None, psnr_only=False):
+        evaluation = evaluation or self.material_evaluation(baseline=False, primary_only=True)
         prediction = evaluation.images[self.primary_method]
         gt = canonical_gt_mip(self.dataset, 0)
-        return self._compute_material_metrics(prediction, gt)
+        return self._compute_material_metrics(prediction, gt, psnr_only=psnr_only)
 
-    def run_comparison_reports(self, iteration, *, material=True, pbr=True, output_root=None):
+    def run_comparison_reports(self, iteration, *, material=True, pbr=True, output_root=None, evaluation=None):
         material = material and self.enable_material_compare
         pbr = pbr and self.enable_pbr_compare
         if not material and not pbr:
             return None, None
-        evaluation = self.material_evaluation()
+        evaluation = (complete_material_evaluation(evaluation,self.dataset,self.material_compression)
+                      if evaluation is not None else self.material_evaluation())
         material_metrics = self.run_material_comparison(curr_iter=iteration, output_root=output_root,
                                                         evaluation=evaluation) if material else None
         pbr_metrics = self.run_pbr_comparison(curr_iter=iteration, output_root=output_root,
@@ -356,12 +359,13 @@ class Trainer(FeatureGridTraining):
             atomic_torch_save(self._phase_control.best_state, path)
         return stop
 
-    def _complete_training_phase(self, eval_psnr=None, score=None, final_report=True):
+    def _complete_training_phase(self, eval_psnr=None, score=None, final_report=True, *, evaluation=None):
         last_iter = self.model.current_iter
         # Include the final updated model even when its iteration is not a check point.
         if score is None:
             if eval_psnr is None:
-                eval_psnr = self.eval(last_iter)
+                evaluation = evaluation or self.material_evaluation(baseline=False, primary_only=True)
+                eval_psnr = self.eval(last_iter, evaluation=evaluation)
             score = self._validation_score(last_iter, eval_psnr)
         self._observe_training_score(score, last_iter, allow_stop=False, adjust_lr=False)
         final_lr = self.model.optimizer.param_groups[0]["lr"]
@@ -372,11 +376,12 @@ class Trainer(FeatureGridTraining):
                                         completed_iteration=last_iter, final_decoder_lr=final_lr)
         # Refresh terminal media and metrics after best-state restoration.
         if restored_earlier:
-            restored_psnr = self.eval(last_iter)
+            evaluation = self.material_evaluation(baseline=False, primary_only=True)
+            restored_psnr = self.eval(last_iter, evaluation=evaluation)
             if final_report:
                 self._validation_score(last_iter, restored_psnr)
         if final_report:
-            self.run_comparison_reports(last_iter)
+            self.run_comparison_reports(last_iter, evaluation=evaluation)
             self.save_checkpoint(last_iter, completed=True)
             if not self.enable_material_compare:
                 self.save_compressed_materials(self.media_path, last_iter)
@@ -399,6 +404,7 @@ class Trainer(FeatureGridTraining):
             )
             self._reset_training_phase(phase, self.trained_iter)
         eval_psnr = current_psnr = None
+        evaluation = None  # Keep a raster only for this step (or final completion).
         for curr_iter in range(self.trained_iter, self.max_iter):
             self._training_scalars.clear()
             codec_due = self._begin_codec_step(curr_iter)
@@ -460,7 +466,8 @@ class Trainer(FeatureGridTraining):
 
             # eval
             if (curr_iter - self._early_stop_phase_start_iter) % self.eval_interval == 0:
-                eval_psnr = self.eval(curr_iter)
+                evaluation = self.material_evaluation(baseline=False, primary_only=True)
+                eval_psnr = self.eval(curr_iter, evaluation=evaluation)
 
                 if (curr_iter > self._early_stop_phase_start_iter
                         and (curr_iter - self._early_stop_phase_start_iter) % self.early_stop_interval == 0):
@@ -473,7 +480,7 @@ class Trainer(FeatureGridTraining):
                     print(f"[EarlyStopCheck] {self._phase_control.phase} iter {curr_iter}: "
                           f"PSNR={current_psnr:.4f}, stagnant_windows={self._phase_control.bad_windows}")
                     if stop:
-                        self._complete_training_phase(eval_psnr, current_psnr, final_report)
+                        self._complete_training_phase(eval_psnr, current_psnr, final_report, evaluation=evaluation)
                         return
 
                 # print(self.model.optimizer.param_groups[0]['lr'], self.model.optimizer.param_groups[1]['lr'])
@@ -482,7 +489,9 @@ class Trainer(FeatureGridTraining):
             periodic = 0 < curr_iter < self.max_iter - 1
             material_due = periodic and curr_iter % self.material_compare_interval == 0
             pbr_due = periodic and curr_iter % self.pbr_compare_interval == 0
-            self.run_comparison_reports(curr_iter, material=material_due, pbr=pbr_due)
+            self.run_comparison_reports(curr_iter, material=material_due, pbr=pbr_due, evaluation=evaluation)
+            if curr_iter + 1 < self.max_iter:
+                evaluation = None
             if curr_iter > 0 and curr_iter + 1 < self.max_iter and curr_iter % self.save_interval == 0:
                 self.save_checkpoint(curr_iter)
                 self._log_checkpoint_interval(curr_iter)
@@ -491,14 +500,14 @@ class Trainer(FeatureGridTraining):
                 torch.cuda.empty_cache()
                 tcnn.free_temporary_memory()
 
-        self._complete_training_phase(eval_psnr, current_psnr, final_report)
+        self._complete_training_phase(eval_psnr, current_psnr, final_report, evaluation=evaluation)
 
     def fit_material_cnn(self, steps=50000, validation_interval=1000, resume_state=None):
         from Core.Tile_CNN.training import fit_material_cnn
         return fit_material_cnn(self, steps, validation_interval, resume_state)
 
     def _compute_material_metrics(
-        self, pred: torch.Tensor, gt: torch.Tensor
+        self, pred: torch.Tensor, gt: torch.Tensor, *, psnr_only=False
     ) -> dict:
         """Compute per-material groups plus the evaluation-weighted overall score."""
         return _compute_group_metrics(
@@ -509,6 +518,7 @@ class Trainer(FeatureGridTraining):
             self.ssim,
             self.lpips,
             eval_weights=self.eval_weights,
+            psnr_only=psnr_only,
         )
 
     @torch.no_grad()
@@ -534,11 +544,10 @@ class Trainer(FeatureGridTraining):
                     selected_iteration=selected)
 
     @torch.no_grad()
-    def eval(self, curr_iter) -> float:
-        metrics = self.deployment_metrics()
+    def eval(self, curr_iter, *, evaluation=None) -> float:
+        metrics = self.deployment_metrics(evaluation=evaluation, psnr_only=True)
         for group, scores in metrics.items():
-            for name, value in zip(('PSNR', 'SSIM', 'LPIPS'), scores):
-                self.writer.add_scalar(f'Material/{self.primary_method}/{group}/{name}/train', value, curr_iter)
+            self.writer.add_scalar(f'Material/{self.primary_method}/{group}/PSNR/train', scores[0], curr_iter)
         score = float(metrics['average'][0])
         print(f'Iter:{curr_iter}, {self.primary_method} MaterialPSNR:{score:.4f}. {self._loss_stats_str()}')
         return score
@@ -561,6 +570,10 @@ class Trainer(FeatureGridTraining):
             output_root=output_root,
             verbose=verbose, save_outputs=save_outputs,
             report_context={**self._metrics_context(curr_iter), **(report_context or {})})
+        if curr_iter is not None:
+            for group,scores in metrics[self.primary_method].items():
+                for name,value in zip(('PSNR', 'SSIM', 'LPIPS'),scores):
+                    self.writer.add_scalar(f'Material/{self.primary_method}/{group}/{name}/train',value,curr_iter)
         if save_outputs:
             self._saved_material_report = (str(Path(output_root).resolve()),curr_iter)
         return metrics

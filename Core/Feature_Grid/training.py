@@ -6,8 +6,9 @@ ASTC native operations and BC1 endpoint updates remain format-specific.
 import torch
 from Common.Block_Compression.astc import ASTCCodec
 from Common.material_reconstruction import cached_astc_base
-from Core.Feature_Grid.sampling import bilinear_repeat
-from dataset import material_size, clean_base_image, sample_material
+from Common.cuda_graph import make_graphed_callables
+from Core.Feature_Grid.sampling import RepeatImageSampler
+from dataset import material_size, clean_base_image, sample_material, NativeQueryPlan
 
 
 from Core.ASTC_Aware.parameters import ASTCTrainingOperations
@@ -59,6 +60,7 @@ class FeatureGridTraining(ASTCTrainingOperations):
     def _initialize_grid_compression(self, dataset, configs):
         self.material_size = material_size(self.model, self.texture_height, self.texture_width)
         self.native_reconstruction = self.material_size != (self.texture_height, self.texture_width)
+        self._native_query_plans = {}
         if self.native_reconstruction and not self.mip0_only:
             raise ValueError(
                 "Native material reconstruction below GT resolution currently requires mip0_only"
@@ -68,6 +70,7 @@ class FeatureGridTraining(ASTCTrainingOperations):
             if self.native_reconstruction and self.super_resolution_enable
             else None
         )
+        self._clean_base_sampler = RepeatImageSampler(self.native_clean_base) if self.native_clean_base is not None else None
         self.astc_codec_backend = configs.astc_codec_backend
         self.astc_codec = ASTCCodec(self.astcenc_path, self.astcenc_quality, self.astc_block)
         self._codec_phase_logged = False
@@ -89,6 +92,7 @@ class FeatureGridTraining(ASTCTrainingOperations):
         if self.super_resolution_enable:
             self.astc_codec.ensure_executable()
         self.astc_superres_base_mip0 = None
+        self._astc_base_sampler = None
         if self.super_resolution_enable:
             decoded = cached_astc_base(
                 dataset,
@@ -97,6 +101,7 @@ class FeatureGridTraining(ASTCTrainingOperations):
                 output_size=self.material_size,
             )
             self.astc_superres_base_mip0 = decoded[0].permute(1, 2, 0).contiguous()
+            self._astc_base_sampler = RepeatImageSampler(self.astc_superres_base_mip0.permute(2, 0, 1)[None])
 
     def _predict_material(self, inputs):
         """Keep the residual API while supervising the deployed native-raster upsampler."""
@@ -107,14 +112,17 @@ class FeatureGridTraining(ASTCTrainingOperations):
             self.model.codec_branch_enabled
             or self.model._decoder_adaptation_features is not None
         )
-        base_image = None
+        base_sampler = None
         if self.super_resolution_enable:
-            base_image = (
-                self.astc_superres_base_mip0.permute(2, 0, 1)[None].float()
-                if codec
-                else self.native_clean_base
-            )
-        prediction = sample_material(self.model, inputs[:, :2], size, base_image)
+            base_sampler = self._astc_base_sampler if codec else self._clean_base_sampler
+        uv = inputs[:, :2]
+        query_plan = None
+        if uv.is_cuda and not uv.requires_grad and len(uv) and len(uv)*4 <= size[0]*size[1]//2:
+            key = (len(uv), uv.dtype, uv.device, size)
+            if key not in self._native_query_plans:
+                self._native_query_plans[key] = NativeQueryPlan(uv, size)
+            query_plan = self._native_query_plans[key]
+        prediction = sample_material(self.model, uv, size, base_sampler=base_sampler, query_plan=query_plan)
         return prediction - inputs[:, 3:].float() if self.super_resolution_enable else prediction
 
     def _begin_codec_step(self, curr_iter):
@@ -173,7 +181,7 @@ class FeatureGridTraining(ASTCTrainingOperations):
             # candidate checks reuse the same forward after training backward.
             if not hasattr(self, "_pbr_loss_graph"):
                 with torch.enable_grad():
-                    self._pbr_loss_graph = torch.cuda.make_graphed_callables(
+                    self._pbr_loss_graph = make_graphed_callables(
                         self._compute_pbr_render_loss,
                         (target.detach().clone(), prediction.detach().clone().requires_grad_(True)),
                     )
@@ -281,15 +289,7 @@ class FeatureGridTraining(ASTCTrainingOperations):
     def _astc_base_at_uv(self, uv):
         if not self.super_resolution_enable:
             return None
-        return (
-            bilinear_repeat(
-                self.astc_superres_base_mip0.permute(2, 0, 1)[None].float(),
-                uv.view(1, -1, 1, 2),
-            )
-            .squeeze(0)
-            .squeeze(-1)
-            .T.to(torch.float16)
-        )
+        return self._astc_base_sampler(uv).to(torch.float16)
 
     def _sync_grid_sources(self, indices=None):
         from .compression import sync_grid_sources

@@ -77,27 +77,83 @@ def clean_base_image(dataset, size):
 
 
 def native_query_uv(uv, size):
-    """Return wrapped native raster corner centers and their interpolation weights."""
+    """Prepare shared native corners with fixed or exact output capacity.
+
+    Sparse batches use fixed-capacity compaction to avoid synchronizing a
+    dynamic unique count with the CPU. Repeated corners still share predictions
+    and accumulate their gradients before the decoder's FP16 backward.
+    Dense queries compact to an exact size to bound decoder work and memory.
+    """
     height, width = size
-    corners, weights = bilinear_texel_corners(uv, uv.new_tensor((width, height)))
+    return _native_query_uv(uv, size, uv.new_tensor((width, height)),
+                            uv.new_tensor(((0, 0), (1, 0), (0, 1), (1, 1))))
+
+
+def _native_query_uv(uv, size, resolution, offsets):
+    height, width = size
+    corners, weights = bilinear_texel_corners(uv, resolution, offsets=offsets)
     ids = corners[..., 1] * width + corners[..., 0]
-    unique, inverse = ids.flatten().unique(return_inverse=True)
+    if ids.numel() and ids.numel() <= height * width // 2:
+        ordered, permutation = ids.flatten().sort()
+        starts = torch.cat((ordered.new_ones(1), (ordered[1:] != ordered[:-1]).long()))
+        groups = starts.cumsum(0) - 1
+        # Equal IDs write the same value. Unused capacity contains texel zero;
+        # inverse never refers to it, so its decoder gradient remains zero.
+        unique = torch.zeros_like(ordered).scatter_(0, groups, ordered)
+        inverse = torch.empty_like(groups).scatter_(0, permutation, groups)
+    else:
+        unique, inverse = ids.flatten().unique(return_inverse=True)
     centers = torch.stack(((unique % width + .5) / width, (unique // width + .5) / height), 1)
     return centers, inverse, weights
 
 
-def sample_material(model, uv, size, base_image=None):
+class NativeQueryPlan:
+    """Replay fixed-capacity query preparation without per-operator CPU launches."""
+
+    def __init__(self, uv, size):
+        if not uv.is_cuda or uv.requires_grad or len(uv)*4 > size[0]*size[1]//2 or not len(uv):
+            raise ValueError('A query plan requires a sparse, non-trainable CUDA coordinate batch')
+        self.size = size
+        with torch.cuda.device(uv.device):
+            self._input = uv.detach().contiguous().clone()
+            resolution = uv.new_tensor((size[1], size[0]))
+            offsets = uv.new_tensor(((0, 0), (1, 0), (0, 1), (1, 1)))
+            self._constants = resolution, offsets
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                _native_query_uv(self._input, size, resolution, offsets)  # Initialize sort/scan workspaces.
+            torch.cuda.current_stream().wait_stream(stream)
+            self._graph = torch.cuda.CUDAGraph()
+            from Common.cuda_graph import graph_capture_lifetime
+            with graph_capture_lifetime(), torch.cuda.graph(self._graph):
+                self._outputs = _native_query_uv(self._input, size, resolution, offsets)
+
+    def __call__(self, uv):
+        if (uv.requires_grad or uv.shape != self._input.shape or uv.dtype != self._input.dtype
+                or uv.device != self._input.device):
+            return native_query_uv(uv, self.size)
+        self._input.copy_(uv)
+        self._graph.replay()
+        # Calls may precede a shared backward. Consumers must not retain views
+        # into the graph buffers that the next query replay will overwrite.
+        return tuple(value.clone() for value in self._outputs)
+
+
+def sample_material(model, uv, size, base_image=None, *, base_sampler=None, query_plan=None):
     """Differentiate through U(clamp(base_native + decoder_native)) at arbitrary UVs.
 
-    Only native raster centers reach the decoder. Repeated centers share one
-    prediction; the four output values, rather than latent features, interpolate.
+    Only native raster centers reach the decoder. The four output values,
+    rather than latent features, interpolate. Dense batches share predictions.
     """
-    centers, inverse, weights = native_query_uv(uv, size)
+    centers, inverse, weights = query_plan(uv) if query_plan is not None else native_query_uv(uv, size)
     inputs = torch.cat((centers, centers.new_zeros((len(centers), 1))), 1)
-    base = sample_image(base_image, centers) if base_image is not None else None
+    base = (base_sampler(centers) if base_sampler is not None
+            else sample_image(base_image, centers) if base_image is not None else None)
     if base is not None:
         inputs = torch.cat((inputs, base), 1)
-    values = model(inputs).float()
+    native_forward = getattr(model, 'forward_native_centers', None)
+    values = (native_forward(inputs, size) if native_forward is not None else model(inputs)).float()
     if base is not None:
         values = values + base
     bounded = values.clamp(0, 1)

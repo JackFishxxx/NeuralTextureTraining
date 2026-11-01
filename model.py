@@ -8,7 +8,7 @@ from torchtyping import TensorType
 
 from configs import Config
 from Core.Positional_Encoding.positional_encoding import TiledPositionalEncoding
-from Core.Feature_Grid.feature_gradients import sample_feature_inputs
+from Core.Feature_Grid.feature_gradients import sample_feature_inputs, sample_feature_centers
 from Core.Tile_CNN.material_cnn import MaterialCNN
 from Core.Feature_Grid.sampling import resize_bilinear_repeat
 from Core.Material_Encoding.normal_encoding import NORMAL_XY_MIN_Z
@@ -377,7 +377,11 @@ class TCNNModel(torch.nn.Module):
             tex = resize_fn(tex, size=(int(out_h), int(out_w)))
         return tex.clamp(0, 1)
 
-    def forward(self, x: torch.Tensor) -> TensorType["batch_size", "num_channels"]:
+    def forward_native_centers(self, x, size):
+        """Use direct feature gathers when the caller supplies native centers."""
+        return self(x, native_size=size)
+
+    def forward(self, x: torch.Tensor, *, native_size=None) -> TensorType["batch_size", "num_channels"]:
 
         expected_dims = 3 + (self.num_channels if self.super_resolution_enable else 0)
         if x.shape[1] != expected_dims:
@@ -399,18 +403,22 @@ class TCNNModel(torch.nn.Module):
         features = []
         direct_diffuse = None
         for idx, feature_grid in enumerate(self.feature_grids):
-            grid_levels = self.feature_grid_specs[idx].n_levels
-            clipped_mips = torch.clamp(mips, max=grid_levels - num_sampled_mips)
-            selected_level_f = grid_levels - num_sampled_mips - clipped_mips
+            spec = self.feature_grid_specs[idx]
             active_params = None
             if self._decoder_adaptation_features is not None:
                 active_params = self._decoder_adaptation_features[idx]
             elif self.quantize and self.training:
                 active_params = self._get_qat_grid_params(idx, feature_grid)
             params = active_params if active_params is not None else feature_grid.params
-            sampled_features = sample_feature_inputs(
-                params, self.feature_grid_specs[idx], uvs, selected_level_f
-            ).to(feature_grid.dtype)
+            if (native_size == (spec.max_resolution, spec.max_resolution) and spec.n_levels == 1
+                    and uvs.dtype == torch.float32 and not uvs.requires_grad):
+                sampled_features = sample_feature_centers(params, spec, uvs)
+            else:
+                grid_levels = spec.n_levels
+                clipped_mips = torch.clamp(mips, max=grid_levels - num_sampled_mips)
+                selected_level_f = grid_levels - num_sampled_mips - clipped_mips
+                sampled_features = sample_feature_inputs(params, spec, uvs, selected_level_f)
+            sampled_features = sampled_features.to(feature_grid.dtype)
 
             if self.direct_diffuse_enabled and idx == 0:
                 # Center channels come first, before the feature differences.

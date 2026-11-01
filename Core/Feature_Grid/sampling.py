@@ -15,14 +15,15 @@ def tile_regions(height, width, tile_size):
             yield y, x, min(tile_size, height-y), min(tile_size, width-x)
 
 
-def bilinear_texel_corners(uv, resolution):
+def bilinear_texel_corners(uv, resolution, *, offsets=None):
     resolution = torch.as_tensor(resolution, device=uv.device, dtype=uv.dtype)
     if resolution.ndim < 2:
         resolution = resolution.reshape(1, -1)
     position = torch.remainder(uv, 1.0) * resolution - 0.5
     lower = torch.floor(position)
     fraction = position - lower
-    offsets = uv.new_tensor(((0, 0), (1, 0), (0, 1), (1, 1)))
+    if offsets is None:
+        offsets = uv.new_tensor(((0, 0), (1, 0), (0, 1), (1, 1)))
     corners = torch.remainder(lower[:, None, :] + offsets, resolution[:, None, :]).long()
     tx, ty = fraction.unbind(1)
     weights = torch.stack(((1-tx)*(1-ty), tx*(1-ty), (1-tx)*ty, tx*ty), 1)
@@ -35,10 +36,36 @@ def bilinear_repeat(image: torch.Tensor, uv_grid: torch.Tensor) -> torch.Tensor:
     # Modulo alone is insufficient: interpolation across the seam also needs
     # the opposite edge texels. A circular one-texel halo supplies both corners.
     padded = F.pad(image.float(), (1, 1, 1, 1), mode="circular")
+    scale = padded.new_tensor((w, h))
+    return _sample_padded_repeat(padded, scale, uv_grid)
+
+
+def _sample_padded_repeat(padded, scale, uv_grid):
     uv = torch.remainder(uv_grid.float(), 1.0)
-    scale = uv.new_tensor((w, h))
     grid = 2 * (uv * scale + 1) / (scale + 2) - 1
     return F.grid_sample(padded, grid, mode="bilinear", align_corners=False)
+
+
+class RepeatImageSampler:
+    """Reuse the circular halo of a fixed NCHW source; refresh on in-place edits.
+
+    Trainable images use bilinear_repeat directly so their graphs stay fresh.
+    This sampler is for the immutable clean/compressed SR training bases.
+    """
+
+    def __init__(self, image):
+        if image.requires_grad:
+            raise ValueError('A cached repeat sampler requires a non-trainable image')
+        self.image = image
+        self._version = None
+
+    def __call__(self, uv):
+        if self._version != self.image._version:
+            h, w = self.image.shape[-2:]
+            self._padded = F.pad(self.image.float(), (1, 1, 1, 1), mode='circular')
+            self._scale = self._padded.new_tensor((w, h))
+            self._version = self.image._version
+        return _sample_padded_repeat(self._padded, self._scale, uv[None, :, None]).squeeze(0).squeeze(-1).T
 
 
 def resize_bilinear_repeat(image: torch.Tensor, size: Tuple[int, int]) -> torch.Tensor:

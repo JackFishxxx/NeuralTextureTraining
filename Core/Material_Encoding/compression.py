@@ -2,6 +2,10 @@
 import numpy as np
 import torch
 import math
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 from torch.nn import functional as F
 from Common.Block_Compression.astc import ASTCCodec
@@ -12,6 +16,47 @@ from Core.Feature_Grid.sampling import tile_regions
 
 GROUP_NAMES = {'diffuse': 'Diffuse', 'normal': 'Normal', 'romsd': 'Romsd'}
 DEFAULT_FORMATS = {'diffuse': 'BC7', 'normal': 'BC5', 'romsd': 'BC1'}
+
+
+@lru_cache(maxsize=1)
+def _physical_core_count():
+    """Query physical cores without assuming that every CPU uses two-way SMT."""
+    try:
+        if os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+            query = ctypes.WinDLL('kernel32', use_last_error=True).GetLogicalProcessorInformationEx
+            query.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD))
+            query.restype = wintypes.BOOL
+            size = wintypes.DWORD()
+            query(0, None, ctypes.byref(size))  # RelationProcessorCore
+            buffer = ctypes.create_string_buffer(size.value)
+            if not query(0, buffer, ctypes.byref(size)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            offset, cores = 0, 0
+            while offset < size.value:
+                relationship, length = np.frombuffer(buffer, np.uint32, count=2, offset=offset)
+                if length < 8:
+                    raise ValueError('Invalid processor topology record')
+                cores += int(relationship == 0)
+                offset += int(length)
+            return max(1, cores)
+        if sys.platform == 'darwin':
+            import subprocess
+            return max(1, int(subprocess.check_output(['sysctl', '-n', 'hw.physicalcpu'])))
+        cpus = os.sched_getaffinity(0) if hasattr(os, 'sched_getaffinity') else range(os.cpu_count() or 1)
+        topology = Path('/sys/devices/system/cpu')
+        return max(1, len({((topology/f'cpu{cpu}/topology/physical_package_id').read_text(),
+                            (topology/f'cpu{cpu}/topology/core_id').read_text()) for cpu in cpus}))
+    except (OSError, ValueError, AttributeError):
+        return 1
+
+
+@lru_cache(maxsize=1)
+def _tile_encoder_pool():
+    # Shared across materials/runs; the executor starts only as many threads as
+    # there are queued tiles and joins them at interpreter shutdown.
+    return ThreadPoolExecutor(max_workers=_physical_core_count(), thread_name_prefix='material-codec')
 
 
 def parse_material_formats(formats):
@@ -66,8 +111,13 @@ class MaterialCompression:
                     and (w <= self.tile_size or self.tile_size % bw == 0)))
         decoded = np.empty_like(rgba) if not aligned else None
         first = None
-        for y,x,th,tw in tile_regions(h,w,self.tile_size or max(h,w)):
-            data = codec.encode_rgba(rgba[y:y+th,x:x+tw])
+        regions = list(tile_regions(h,w,self.tile_size or max(h,w)))
+        def encode(region):
+            y,x,th,tw = region
+            return codec.encode_rgba(rgba[y:y+th,x:x+tw])
+        parallel = fmt.name in ('BC1', 'BC7') and len(regions) > 1 and _physical_core_count() > 1
+        encoded = _tile_encoder_pool().map(encode, regions) if parallel else map(encode, regions)
+        for (y,x,th,tw),data in zip(regions,encoded):
             if first is None:
                 first = data
             if aligned:

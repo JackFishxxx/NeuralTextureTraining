@@ -14,7 +14,39 @@ import torch.nn.functional as F
 from torch import nn
 
 from Common.Block_Compression.bc import decode_blocks
+from .build import native_extension
 from .differentiable_proxy import seed_rgb_endpoints, _ExactSTE, expanded, pack565, ste_round, unpack565
+
+
+class _DecodeBC1CUDA(torch.autograd.Function):
+    """Fused hard decoding and the original joint STE's first-order backward."""
+
+    @staticmethod
+    def forward(ctx, endpoints, weights, modes, temperature, image_shape, extension):
+        ctx.save_for_backward(endpoints, weights, modes, temperature)
+        ctx.image_shape, ctx.extension = image_shape, extension
+        return extension.decode(endpoints, weights, modes, *image_shape)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, gradient):
+        ge, gw, gm = ctx.extension.backward(gradient.contiguous(), *ctx.saved_tensors, *ctx.image_shape)
+        return ge, gw, gm, None, None, None
+
+
+class _BinaryUsageCUDA(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, weights, modes, temperature, surfaces, extension):
+        loss, occupancy_gradient = extension.usage(weights, modes, temperature, surfaces)
+        ctx.save_for_backward(weights, modes, temperature, occupancy_gradient)
+        ctx.surfaces, ctx.extension = surfaces, extension
+        return loss
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, gradient):
+        gw, gm = ctx.extension.usage_backward(gradient.contiguous(), *ctx.saved_tensors, ctx.surfaces)
+        return gw, gm, None, None, None
 
 
 class BC1AlphaProxyGrid(nn.Module):
@@ -141,14 +173,19 @@ class BC1AlphaProxyGrid(nn.Module):
         return (self.weights / temp).softmax(-1), (self.modes / temp).softmax(-1)
 
     def decode_image(self):
+        extension = native_extension() if self.endpoints.is_cuda else None
+        if extension is not None:
+            return _DecodeBC1CUDA.apply(self.endpoints.contiguous(), self.weights.contiguous(),
+                                       self.modes.contiguous(), self.temperature,
+                                       (*self._image_shape, self.channels), extension)
+        return self._decode_image_torch()
+
+    def _decode_image_torch(self):
+        """Portable reference path when CUDA compilation is unavailable."""
         palettes = self._palettes()
         rows = torch.arange(len(palettes), device=palettes.device)
         hard_palette = palettes[rows, self.modes.argmax(-1)]
         hard_pixels = hard_palette.gather(1, self.weights.argmax(-1)[..., None].expand(-1, -1, 4))
-        # Endpoint gradients follow the selected legal colors. Categorical
-        # gradients use the JOINT soft expectation: separate hard STE factors
-        # can trap an opaque block with selector!=3 because neither factor on
-        # its own exposes alpha. The joint surrogate lets it discover both.
         pixels = hard_pixels
         if torch.is_grad_enabled():
             selectors, modes = self.probabilities()
@@ -171,6 +208,13 @@ class BC1AlphaProxyGrid(nn.Module):
         Penalize each surface if its hard transparent fraction leaves [.1,.9].
         Also sharpen the joint mode/selector decision as temperature anneals.
         """
+        extension = native_extension() if self.weights.is_cuda and not self.temperature.requires_grad else None
+        if extension is not None:
+            return _BinaryUsageCUDA.apply(self.weights.contiguous(), self.modes.contiguous(),
+                                          self.temperature, self.channels // 4, extension)
+        return self._binary_usage_loss_torch()
+
+    def _binary_usage_loss_torch(self):
         selectors, modes = self.probabilities()
         zero_prob = modes[:, :1] * selectors[..., 3]
         surfaces = zero_prob.reshape(self.channels // 4, -1)

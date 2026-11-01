@@ -131,9 +131,20 @@ def encode_grid(model, index):
 
 
 @torch.no_grad()
+def _decoded_grid_image(model, index):
+    """Decode existing native proxies without exporting a bitstream for evaluation."""
+    proxies = getattr(model, 'grid_proxies', ())
+    if len(proxies) > index:
+        proxy = proxies[index]
+        if proxy.proxy_kind in ('bc1_rgba', 'astc_native') and proxy.endpoints.is_cuda:
+            return proxy.decode_image()
+    return encode_grid(model, index).image.to(model.feature_grids[index].params.device)
+
+
+@torch.no_grad()
 def apply_latent_compression(model):
     for i, (grid, spec) in enumerate(zip(model.feature_grids, model.feature_grid_specs)):
-        image = encode_grid(model, i).image.to(grid.params.device)
+        image = _decoded_grid_image(model, i)
         offset, count, _ = spec.highest_level_slice()
         grid.params[offset : offset + count].copy_(
             quantize_feature_tensor(unorm_to_feature(image.reshape(-1), spec), spec)
@@ -164,7 +175,7 @@ def decoded_feature_grids(model):
     for i, (grid, spec) in enumerate(zip(model.feature_grids, model.feature_grid_specs)):
         field = quantize_feature_tensor(grid.params.detach(), spec)
         offset, count, _ = spec.highest_level_slice()
-        field[offset:offset+count] = unorm_to_feature(encode_grid(model, i).image.to(field.device).flatten(), spec)
+        field[offset:offset+count] = unorm_to_feature(_decoded_grid_image(model, i).flatten(), spec)
         fields.append(field)
     return fields
 

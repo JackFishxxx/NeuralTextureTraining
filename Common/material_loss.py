@@ -1,6 +1,7 @@
 """Material reconstruction objectives, independent of training and reporting."""
 import torch
 from typing import List
+from .cuda_graph import make_graphed_callables
 from Core.Material_Encoding.normal_encoding import normal_angular_loss, normal_vectors
 
 
@@ -9,6 +10,8 @@ class MaterialLoss:
         self.dataset = dataset
         self.normal_encoding = normal_encoding
         self._loss_group_indices = {}
+        self._reconstruction_graphs = {}
+        self._pending_reconstruction_graphs = set()
 
     def _group_indices(self, textures: List[str], device: torch.device) -> torch.Tensor:
         key = (tuple(textures), device)
@@ -128,3 +131,46 @@ class MaterialLoss:
                     'weight': weight.detach(),
                 }
         return total, stats
+
+    def training_reconstruction(self, gt, pred, weights, statistics=True):
+        """Replay the fixed-shape training objective and backward as CUDA graphs.
+
+        Primary and subpixel batches have separate entries, including whether
+        diagnostics are requested. Weights are graph inputs, so later stages
+        may change their values without capturing a stale loss definition.
+        CPU/no-grad and gradients to GT/weights retain the ordinary path.
+        """
+        if (not pred.is_cuda or not torch.is_grad_enabled() or not pred.requires_grad
+                or gt.requires_grad or weights.requires_grad or torch.is_autocast_enabled()):
+            return self.reconstruction(gt, pred, weights, statistics)
+        groups = tuple(group for group,textures in self.dataset.texture_packing.items()
+                       if any(name in self.dataset.available_textures for name in textures))
+        if not groups:
+            return self.reconstruction(gt, pred, weights, statistics)
+        args = (gt, pred, weights)
+        layout = tuple((tuple(x.shape), x.stride(), x.dtype, x.device) for x in args)
+        key = (layout, groups, statistics)
+        # A graph owns static buffers. A second loss of the same shape before
+        # backward must not overwrite the first loss's saved forward values.
+        if key in self._pending_reconstruction_graphs:
+            return self.reconstruction(gt, pred, weights, statistics)
+        graph = self._reconstruction_graphs.get(key)
+        if graph is None:
+            def objective(target, prediction, loss_weights):
+                loss, stats = self.reconstruction(target, prediction, loss_weights, statistics)
+                diagnostics = tuple(stats[group][name] for group in groups
+                                    for name in ('loss', 'raw_loss', 'weight')) if statistics else ()
+                return (loss, *diagnostics)
+            with torch.enable_grad():
+                samples = tuple(x.detach().clone().requires_grad_(i == 1) for i,x in enumerate(args))
+                graph = make_graphed_callables(objective, samples)
+            self._reconstruction_graphs[key] = graph
+        outputs = graph(*args)
+        self._pending_reconstruction_graphs.add(key)
+        outputs[0].grad_fn.register_hook(lambda *unused: self._pending_reconstruction_graphs.discard(key))
+        stats = {}
+        if statistics:
+            stats = {group: None for group in self.dataset.texture_packing}
+            for index,group in enumerate(groups):
+                stats[group] = dict(zip(('loss', 'raw_loss', 'weight'),outputs[1+3*index:4+3*index]))
+        return outputs[0], stats

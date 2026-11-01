@@ -47,13 +47,13 @@ class BC1AlphaProxyGrid(nn.Module):
         if not binary_seed:
             # Offline proposals encode the candidate alpha values faithfully;
             # the sparse exploration mask belongs only to training startup.
-            from Common.Block_Compression.bc import BC1Codec
+            from Common.Block_Compression.bc import BCCodec
 
-            codec = BC1Codec()
+            codec = BCCodec()
             blocks = []
             for start in range(0, c, 4):
                 rgba = (image[..., start:start+4].detach().clamp(0, 1)*255).round().byte().cpu().numpy()
-                blocks.append(codec.encode_rgba(rgba)[128:])
+                blocks.append(codec.encode_blocks(rgba))
             packed = np.frombuffer(b''.join(blocks), dtype=np.dtype([
                 ('a', '<u2'), ('b', '<u2'), ('bits', '<u4')]))
             words = torch.tensor(np.stack((packed['a'], packed['b']), 1).astype(np.int64), device=image.device)
@@ -141,7 +141,6 @@ class BC1AlphaProxyGrid(nn.Module):
         return (self.weights / temp).softmax(-1), (self.modes / temp).softmax(-1)
 
     def decode_image(self):
-        selectors, modes = self.probabilities()
         palettes = self._palettes()
         rows = torch.arange(len(palettes), device=palettes.device)
         hard_palette = palettes[rows, self.modes.argmax(-1)]
@@ -150,9 +149,12 @@ class BC1AlphaProxyGrid(nn.Module):
         # gradients use the JOINT soft expectation: separate hard STE factors
         # can trap an opaque block with selector!=3 because neither factor on
         # its own exposes alpha. The joint surrogate lets it discover both.
-        soft_palette = (palettes.detach() * modes[:, :, None, None]).sum(1)
-        soft_pixels = (soft_palette[:, None] * selectors[..., None]).sum(2)
-        pixels = _ExactSTE.apply(hard_pixels + soft_pixels, hard_pixels.detach())
+        pixels = hard_pixels
+        if torch.is_grad_enabled():
+            selectors, modes = self.probabilities()
+            soft_palette = (palettes.detach() * modes[:, :, None, None]).sum(1)
+            soft_pixels = (soft_palette[:, None] * selectors[..., None]).sum(2)
+            pixels = _ExactSTE.apply(hard_pixels + soft_pixels, hard_pixels.detach())
         h, w = self._image_shape
         bh, bw = math.ceil(h / 4), math.ceil(w / 4)
         return (
@@ -184,10 +186,15 @@ class BC1AlphaProxyGrid(nn.Module):
 
     @torch.no_grad()
     def usage_stats(self):
-        pixels = self.decode_image().reshape(*self._image_shape, self.channels // 4, 4)
+        h, w = self._image_shape
+        bh, bw = math.ceil(h / 4), math.ceil(w / 4)
+        punchthrough = self.modes.argmax(-1) == 0
+        transparent = punchthrough[:, None] & (self.weights.argmax(-1) == 3)
+        transparent = (transparent.reshape(-1, bh, bw, 4, 4).permute(0, 1, 3, 2, 4)
+                       .reshape(-1, bh * 4, bw * 4)[:, :h, :w])
         return {
-            "alpha_zero_fraction": (pixels[..., 3] == 0).float().mean().item(),
-            "punchthrough_block_fraction": (self.modes.argmax(-1) == 0).float().mean().item(),
+            "alpha_zero_fraction": transparent.float().mean(),
+            "punchthrough_block_fraction": punchthrough.float().mean(),
         }
 
     @torch.no_grad()

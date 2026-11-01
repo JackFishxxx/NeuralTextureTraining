@@ -1,4 +1,4 @@
-"""Multi-stage training for ASTC: representation learning, decoder fitting and layout refitting.
+"""Multi-stage FNTC training: representation learning, decoder fitting and layout refitting.
 
 Run as a module or through train.py with the same CLI/YAML options:
     python -m Core.Multi_Stage_Training.multi_stage_training --data_dir data/test
@@ -68,22 +68,21 @@ def _record_stage(trainer, name, start_iteration, details, status='completed'):
     iteration = int(model.current_iter)
     trainer._metrics_phase = name
     trainer.progress.stage = name
-    deployment = trainer.deployment_metrics()
-    astc = trainer.run_astc_comparison(curr_iter=iteration) if trainer.enable_astc_compare else None
-    pbr = (trainer.run_pbr_comparison(curr_iter=iteration, return_metrics=True)[1]
-           if trainer.enable_pbr_compare else None)
+    material, pbr = trainer.run_comparison_reports(iteration)
+    deployment = material[trainer.primary_method] if material is not None else trainer.deployment_metrics()
     record = {
         "name": name, "status": status,
         "start_iteration": start_iteration, "end_iteration": iteration,
         "checkpoint": os.path.join(trainer.model_path, f"train_result_{iteration}", "model.pth"),
         "model": {"hidden_layers": model.n_hidden_layers, "neurons": model.n_neurons,
                   "pe_frequencies": model.n_frequencies,
-                  "feature_gradient_count": model.feature_gradient_count,
+                  "feature_grid_gradient_counts": [spec.feature_gradient_count for spec in model.feature_grid_specs],
                   "material_cnn_enable": model.material_cnn is not None},
-        "metrics": {"deployment": deployment, "astc": astc, "pbr": pbr}, "details": details,
+        "primary_method": trainer.primary_method,
+        "metrics": {"deployment": deployment, "material": material, "pbr": pbr}, "details": details,
         "metric_reports": {
-            "astc": os.path.join(trainer.media_path, f'Compare_ASTC{trainer.astc_block.lower()}',
-                                  f'iter_{iteration:08d}', 'metrics.json') if trainer.enable_astc_compare else None,
+            "material": os.path.join(trainer.media_path, 'Compare_Material',
+                                  f'iter_{iteration:08d}', 'metrics.json') if trainer.enable_material_compare else None,
             "pbr": os.path.join(trainer.media_path, 'Compare_PBRScene', f'iter_{iteration:08d}', 'metrics.json')
                    if trainer.enable_pbr_compare else None,
         },
@@ -171,7 +170,7 @@ def run_multi_stage_training(params, config=None):
     """Run representation, decoder and optional layout stages without numeric stage names."""
     target = config if config is not None else Config(params)
     if not target.mip0_only or target.direct_diffuse_infer_mode != "disable":
-        raise ValueError("Multi-stage ASTC training requires Mip0 and direct diffuse disabled")
+        raise ValueError("Multi-stage FNTC training requires Mip0 and direct diffuse disabled")
     if target.n_hidden_layers < 0 or target.multi_stage_training_decoder_steps < 1:
         raise ValueError("Decoder stage requires nonnegative hidden layers and positive fitting steps")
     if target.early_stop and (target.early_stop_interval <= 0
@@ -188,7 +187,9 @@ def run_multi_stage_training(params, config=None):
             return _resume_material_cnn(params, target, progress, checkpoint)
     config = phase_config(target, checkpoint) if checkpoint else copy.deepcopy(target)
     if checkpoint is None:
-        config.n_hidden_layers = config.n_frequencies = config.feature_gradient_count = 0
+        config.n_hidden_layers = config.n_frequencies = 0
+        for grid in config.feature_grid_configs:
+            grid['feature_gradient_count'] = 0
         config.material_cnn_enable = False
     trainer = Trainer(params, config_override=config, deployment_config=target, checkpoint=checkpoint)
     if checkpoint is None:
@@ -243,11 +244,11 @@ def _create_decoder(trainer, target):
     with torch.no_grad():
         for old, new in zip(source.feature_grids, decoder.feature_grids):
             new.params.copy_(old.params)
-    decoder.astc_proxy = copy.deepcopy(source.astc_proxy)
+    decoder.grid_proxies = copy.deepcopy(source.grid_proxies)
     freeze_proxies(decoder)
     decoder.current_iter = source.current_iter
     trainer.model, trainer.configs = decoder, config
-    trainer._astc_block_optimizer = trainer._phase_control = None
+    trainer._grid_compression_optimizer = trainer._phase_control = None
     trainer.progress.stage, trainer.progress.status = 'decoder', 'running'
     trainer._write_resolved_config(config)
 

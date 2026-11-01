@@ -12,14 +12,11 @@ from typing import Dict, Iterable, Tuple
 
 import numpy as np
 import torch
-from Core.Feature_Grid.compression import compressed_method
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 
 from Core.Material_Encoding.normal_encoding import decode_normal, encode_normal, normal_vectors
-from Common.comparison_astc import (comparison_label_color, method_label, metric_records, write_metrics,
-                             cached_astc_base, comparison_reference, log_comparison_storage)
-from Common.material_reconstruction import comparison_material_size, make_deployment_model, _render_model_mip0
+from .material import baseline_method, comparison_label_color, load_overlay_font, metric_records, write_metrics, log_comparison_storage
 
 
 def _normalize(x: np.ndarray) -> np.ndarray:
@@ -56,18 +53,6 @@ def _perspective_uv_derivatives(projected, uv, interpolated_uv, invz, denominato
     uv_over_z = uv * reciprocal_z[:, None]
     return tuple((db @ uv_over_z - interpolated_uv * (db @ reciprocal_z)) / invz[:, None]
                  for db in (dbdx, dbdy))
-
-
-def _load_overlay_font(panel_height: int):
-    # Pillow's default bitmap font is roughly 10-11 px. Use a 22 px TrueType
-    # font at normal output sizes to make comparison metrics about twice as large.
-    font_size = max(18, min(28, int(round(panel_height * 22.0 / 512.0))))
-    for name in ("segoeui.ttf", "arial.ttf", "DejaVuSans.ttf"):
-        try:
-            return ImageFont.truetype(name, font_size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
 
 
 def _quad(a, b, c, d, uv_scale=(1.0, 1.0)):
@@ -406,35 +391,14 @@ def _render_crop_bounds(gt):
     return y0, y1, x0, x1
 
 
-def _crop_render_triplet(fntc: np.ndarray, astc: np.ndarray, gt: np.ndarray):
-    """Remove the deterministic clear-color border using one shared GT crop."""
-    y0, y1, x0, x1 = _render_crop_bounds(gt)
-    return fntc[y0:y1, x0:x1], astc[y0:y1, x0:x1], gt[y0:y1, x0:x1]
-
-
-def _resize_render_triplet_height(fntc: np.ndarray, astc: np.ndarray, gt: np.ndarray,
-                                  target_height: int):
-    """Resize a shared crop to the configured final height without changing aspect ratio."""
-    source_h, source_w = gt.shape[:2]
-    if source_h == target_height:
-        return fntc, astc, gt
-    target_w = max(1, int(round(source_w * target_height / float(source_h))))
-
-    def resize(image):
-        tensor = torch.from_numpy(image).permute(2, 0, 1)[None]
-        resized = F.interpolate(tensor, size=(target_height, target_w), mode="area")
-        return resized[0].permute(1, 2, 0).numpy()
-
-    return resize(fntc), resize(astc), resize(gt)
-
-
 def _annotated_render(image, name, metric=None):
     panel = Image.fromarray(np.clip(image * 255.0 + 0.5, 0, 255).astype(np.uint8)).convert('RGBA')
     overlay = Image.new('RGBA', panel.size)
     draw = ImageDraw.Draw(overlay)
     label = (f'{name}\nPSNR {metric[0]:.3f}  SSIM {metric[1]:.4f}  LPIPS {metric[2]:.4f}'
              if metric is not None else 'GT\nReference: PSNR inf  SSIM 1.0000  LPIPS 0.0000')
-    font = _load_overlay_font(panel.height)
+    font_size = max(18, min(28, int(round(panel.height * 22.0 / 512.0))))
+    font = load_overlay_font(font_size, ("segoeui.ttf", "arial.ttf", "DejaVuSans.ttf"))
     # Keep annotations inside small diagnostic renders as well as 1K outputs.
     while draw.multiline_textbbox((0, 0), label, font=font, spacing=3)[2] > panel.width - 44 and getattr(font, 'size', 10) > 10:
         font = ImageFont.truetype(font.path, font.size - 1)
@@ -446,174 +410,104 @@ def _annotated_render(image, name, metric=None):
     return Image.alpha_composite(panel, overlay).convert('RGB')
 
 
-def _save_render_panels(images, metrics, block, directory, comparison_path, prefix='', fntc_label=None):
-    os.makedirs(directory, exist_ok=True)
-    names = (fntc_label or f'FNTC_{block}', f'ASTC_{block}', 'GT')
-    panels = [_annotated_render(image, name, metric) for image, name, metric in
-              zip(images, names, (metrics['fntc'], metrics['astc'], None))]
-    canvas = Image.new('RGB', (panels[0].width * 3, panels[0].height))
-    for index, (panel, name) in enumerate(zip(panels, names)):
-        panel.save(os.path.join(directory, prefix + name + '.png'))
-        canvas.paste(panel, (index * panel.width, 0))
-    canvas.save(comparison_path)
+def _save_render_panels(images, metrics, directory, path, prefix):
+    panels = [_annotated_render(image, name, metrics.get(name)) for name,image in images.items()]
+    canvas = Image.new('RGB', (sum(p.width for p in panels), panels[0].height))
+    x = 0
+    for (name,image),panel in zip(images.items(),panels):
+        panel.save(os.path.join(directory, prefix+name+'.png'))
+        canvas.paste(panel,(x,0))
+        x += panel.width
+    canvas.save(path)
 
 
 @torch.no_grad()
-def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_texture: torch.Tensor,
-                        gt_texture: torch.Tensor, dataset, output_root: str,
-                        curr_iter: int = None, resolution: int = 512,
-                        astc_block: str = "6x6", ssim_metric=None,
-                        lpips_metric=None, mip_lod_bias: float = -1.0,
-                        lighting=None, detail_center=(0.5, 0.62), detail_zoom: float = 4.0,
-                        reference_cache=None,
-                        report_context=None,
-                        detail_resolution: int = 2048,
-                        save_outputs=True,
-                        include_detail_metrics=False,
-                        ) -> Tuple[str, Dict[str, Tuple[float, float, float]]]:
-    """Render FNTC-ASTC, traditional ASTC, and GT texture sets in one scene."""
-    fntc_label = (report_context or {}).get('fntc_label', f'FNTC_{astc_block}')
-    available = getattr(dataset, "available_textures", None)
-    if detail_resolution < 64:
-        raise ValueError('PBR detail resolution must be at least 64')
-    if (not math.isfinite(detail_zoom) or detail_zoom <= 1 or len(detail_center) != 2
-            or any(not math.isfinite(v) or not 0 <= v <= 1 for v in detail_center)):
-        raise ValueError('Detail zoom must be finite and > 1; center must be two coordinates in [0,1]')
-    if ssim_metric is None or lpips_metric is None:
-        raise ValueError("ssim_metric and lpips_metric are required for PBR comparison metrics")
-    # The Cornell box occupies about 56% of the square camera raster vertically.
-    # Rasterize above the requested size so `resolution` describes the final,
-    # cropped scene height rather than the temporary square framebuffer.
-    raster_resolution = int(math.ceil(int(resolution) / 0.56))
-    cache = {} if reference_cache is None else reference_cache
-    sources = (gt_texture, traditional_astc_texture)
-    key = (tuple((id(t), t._version, tuple(t.shape)) for t in sources),
-           tuple((name, tuple(bounds)) for name, bounds in dataset.canonical_channel_slices.items()),
-           dataset.normal_encoding, None if available is None else tuple(available),
-           resolution, detail_resolution, mip_lod_bias, json.dumps(lighting, sort_keys=True), tuple(detail_center), detail_zoom)
+def run_pbr_comparison_pipeline(trainer, evaluation, output_root, *, curr_iter=None,
+                                report_context=None, save_outputs=True, include_detail_metrics=False):
+    """One comparison per view: uncompressed FNTC, recompressed FNTC, baseline, GT."""
+    config, dataset = trainer.configs, trainer.dataset
+    compression = trainer.material_compression
+    primary = trainer.primary_method
+    reference = evaluation.reference
+    if reference is None:
+        raise ValueError('PBR comparisons require baseline and GT materials')
+    cache = reference['pbr']
+    key = (config.pbr_render_resolution, config.pbr_detail_resolution, config.pbr_mip_lod_bias,
+           json.dumps(trainer.pbr_lighting,sort_keys=True),tuple(config.pbr_detail_center),config.pbr_detail_zoom)
     if cache.get('key') != key:
         cache.clear()
-        cache.update(key=key, sources=sources, metrics={})
-    fntc_astc = render_pbr_scene(
-        fntc_astc_texture, dataset.canonical_channel_slices, dataset.normal_encoding,
-        raster_resolution, available, mip_lod_bias, lighting
-    )
-    if 'full' not in cache:
-        traditional_astc, gt = [render_pbr_scene(
-            texture, dataset.canonical_channel_slices, dataset.normal_encoding,
-            raster_resolution, available, mip_lod_bias, lighting
-        ) for texture in (traditional_astc_texture, gt_texture)]
-        cache['crop'] = _render_crop_bounds(gt)
-        _, traditional_astc, gt = _resize_render_triplet_height(
-            *_crop_render_triplet(traditional_astc, traditional_astc, gt), int(resolution))
-        cache['full'] = (traditional_astc, gt)
-    traditional_astc, gt = cache['full']
-    y0, y1, x0, x1 = cache['crop']
-    # The baseline crop is fixed by GT, and only the current FNTC image is resized.
-    crop = fntc_astc[y0:y1, x0:x1]
-    if crop.shape[0] != int(resolution):
-        h, w = crop.shape[:2]
-        tensor = torch.from_numpy(crop).permute(2, 0, 1)[None]
-        crop = F.interpolate(tensor, size=(int(resolution), max(1, round(w * resolution / h))),
-                             mode='area')[0].permute(1, 2, 0).numpy()
-    fntc_astc = crop
-    metric_key = (id(ssim_metric), id(lpips_metric), str(fntc_astc_texture.device))
-    fixed_metrics = cache['metrics'].setdefault(metric_key, {})
-    if 'full' not in fixed_metrics:
-        fixed_metrics['full'] = _render_metrics(traditional_astc, gt, fntc_astc_texture.device, ssim_metric, lpips_metric)
-    metrics = {
-        "fntc": _render_metrics(fntc_astc, gt, fntc_astc_texture.device, ssim_metric, lpips_metric),
-        "astc": fixed_metrics['full'],
-    }
-    if not save_outputs and not include_detail_metrics:
-        return None, metrics
-    out_dir = os.path.join(output_root, "Compare_PBRScene")
+        cache['key'] = key
+    out_dir = os.path.join(output_root,'Compare_PBRScene')
     if curr_iter is not None:
-        out_dir = os.path.join(out_dir, f'iter_{curr_iter:08d}')
-    path = os.path.join(out_dir, 'comparison_strip.png')
+        out_dir = os.path.join(out_dir,f'iter_{curr_iter:08d}')
+    path = os.path.join(out_dir,'comparison_strip.png')
     if save_outputs:
-        os.makedirs(out_dir, exist_ok=True)
-        _save_render_panels((fntc_astc, traditional_astc, gt), metrics, astc_block,
-                            out_dir, path, prefix='Scene_', fntc_label=fntc_label)
-
-    # A fresh narrow viewport changes rasterization and UV derivatives/LOD.
-    # These are new samples and shading evaluations, never resized full-frame crops.
-    detail_fntc = render_pbr_scene(fntc_astc_texture, dataset.canonical_channel_slices, dataset.normal_encoding,
-                                 int(detail_resolution), available, mip_lod_bias, lighting,
-                                 view_center=detail_center, view_zoom=detail_zoom)
-    if 'detail' not in cache:
-        cache['detail'] = [render_pbr_scene(texture, dataset.canonical_channel_slices, dataset.normal_encoding,
-                                          int(detail_resolution), available, mip_lod_bias, lighting,
-                                          view_center=detail_center, view_zoom=detail_zoom)
-                           for texture in (traditional_astc_texture, gt_texture)]
-    detail = [detail_fntc, *cache['detail']]
-    if 'detail' not in fixed_metrics:
-        fixed_metrics['detail'] = _render_metrics(detail[1], detail[2], fntc_astc_texture.device, ssim_metric, lpips_metric)
-    detail_metrics = {
-        'fntc': _render_metrics(detail[0], detail[2], fntc_astc_texture.device, ssim_metric, lpips_metric),
-        'astc': fixed_metrics['detail'],
-    }
-    if not save_outputs:
-        return None, dict(metrics, fntc_detail=detail_metrics['fntc'])
-    _save_render_panels(detail, detail_metrics, astc_block, out_dir,
-                        os.path.join(out_dir, 'comparison_strip_detail.png'), prefix='detail_', fntc_label=fntc_label)
-    context = report_context or {}
-    records = [row for view, scores in (('Scene', metrics), ('Scene Detail', detail_metrics))
-               for method, values in scores.items()
-               for row in metric_records({'image': values}, (fntc_label if method == 'fntc' else method_label(method, astc_block)), view=view,
-                                         storage_bytes=context.get('storage_bytes', {}).get((fntc_label if method == 'fntc' else method_label(method, astc_block))))]
-    write_metrics(out_dir, records, evaluation='pbr', iteration=curr_iter,
-                  metadata=dict(context, astc_block=astc_block, normal_encoding=dataset.normal_encoding,
-                                render_sizes={'Scene': list(gt.shape[:2]), 'Scene Detail': list(detail[2].shape[:2])},
-                                mip_lod_bias=mip_lod_bias, lighting=lighting,
-                                detail_view={'center': list(detail_center), 'zoom': detail_zoom,
-                                             'resolution': int(detail_resolution), 'rendered_separately': True}))
-    labels = (fntc_label, f'ASTC_{astc_block.lower()}')
-    label_width = max(map(len, labels))
-    for view, scores, image_path in (
-            ('Scene', metrics, path),
-            ('Scene Detail', detail_metrics, os.path.join(out_dir, 'comparison_strip_detail.png'))):
-        for method, label in zip(('fntc', 'astc'), labels):
-            psnr, ssim, lpips = scores[method]
-            suffix = f'  output={image_path}' if method == 'astc' else ''
-            print(f'[PBR Test] {view} Iter {curr_iter}: {label:<{label_width}} '
-                  f'PSNR={psnr:8.4f}  SSIM={ssim:7.4f}  LPIPS={lpips:7.4f}{suffix}')
-    return path, dict(metrics, fntc_detail=detail_metrics['fntc']) if include_detail_metrics else metrics
-
-
-@torch.no_grad()
-def run_pbr_comparison_pipeline(model, dataset, codec, config, output_root, *, curr_iter=None,
-                                ssim_metric=None, lpips_metric=None, lighting=None,
-                                report_context=None, save_outputs=True, include_detail_metrics=False,
-                                material_override=None):
-    """Reconstruct deployment materials and produce the scene comparison."""
-    height, width = dataset.texture_height, dataset.texture_width
-    ref_h, ref_w = comparison_material_size(model, height, width, config.ref_astc_resolution)
-    reference = comparison_reference(dataset, codec, ref_h, ref_w)
-    prediction = material_override
-    if prediction is None:
-        decoded = make_deployment_model(model)
-        base = (cached_astc_base(dataset, codec, config.super_resolution_base_resolution, (ref_h, ref_w))
-                if model.super_resolution_enable else None)
-        prediction = _render_model_mip0(
-            decoded, dataset, height, width, dataset.num_mips, config.device,
-            superres_base_override=base, inference_tile=config.eval_inference_tile,
-            inference_size=(ref_h, ref_w))
-        del decoded
-    elif prediction.shape != reference['gt'].shape:
-        raise ValueError('PBR material override must match the canonical GT raster')
-    storage = log_comparison_storage(model, dataset, codec.astc_block, config.ref_astc_resolution, verbose=False)
-    fntc_label = method_label(compressed_method(model))
-    context = dict(report_context or {}, fntc_label=fntc_label, gt_size=[height, width], inference_size=[ref_h, ref_w],
-                   storage_bytes={fntc_label: storage[compressed_method(model)],
-                                  method_label('astc', codec.astc_block): storage[f'ref_astc_{codec.astc_block}'],
-                                  'GT': storage['gt']})
-    return save_pbr_comparison(
-        fntc_astc_texture=prediction, traditional_astc_texture=reference['astc'], gt_texture=reference['gt'],
-        dataset=dataset, output_root=output_root, curr_iter=curr_iter,
-        resolution=config.pbr_render_resolution, detail_resolution=config.pbr_detail_resolution,
-        astc_block=codec.astc_block, ssim_metric=ssim_metric, lpips_metric=lpips_metric,
-        mip_lod_bias=config.pbr_mip_lod_bias, lighting=lighting,
-        detail_center=config.pbr_detail_center, detail_zoom=config.pbr_detail_zoom,
-        reference_cache=reference['pbr'], report_context=context, save_outputs=save_outputs,
-        include_detail_metrics=include_detail_metrics)
+        os.makedirs(out_dir,exist_ok=True)
+    scores = {}
+    sizes = {}
+    # Detail uses a fresh camera viewport, never a resized crop of the main view.
+    views = [('Scene', int(math.ceil(config.pbr_render_resolution/.56)), None, None)]
+    if save_outputs or include_detail_metrics:
+        views.append(('Scene Detail',config.pbr_detail_resolution,config.pbr_detail_center,config.pbr_detail_zoom))
+    baseline_name = baseline_method(compression,dataset)
+    fixed_names = (baseline_name,'GT')
+    for view,resolution,center,zoom in views:
+        fixed = cache.setdefault(view,{})
+        rendered = {}
+        for name,image in evaluation.native_images.items():
+            if name in fixed_names and name in fixed:
+                rendered[name] = fixed[name]
+            else:
+                image_render = render_pbr_scene(image,dataset.canonical_channel_slices,dataset.normal_encoding,
+                                                resolution,dataset.available_textures,config.pbr_mip_lod_bias,
+                                                trainer.pbr_lighting,view_center=center or (.5,.5),view_zoom=zoom or 1.)
+                rendered[name] = image_render
+                if name in fixed_names:
+                    fixed[name] = image_render
+        if view == 'Scene':
+            bounds = _render_crop_bounds(rendered['GT'])
+            y0,y1,x0,x1 = bounds
+            rendered = {name:image[y0:y1,x0:x1] for name,image in rendered.items()}
+            h,w = rendered['GT'].shape[:2]
+            target = (config.pbr_render_resolution,max(1,round(w*config.pbr_render_resolution/h)))
+            if h != target[0]:
+                rendered = {name:F.interpolate(torch.from_numpy(image).permute(2,0,1)[None],size=target,
+                                                 mode='area')[0].permute(1,2,0).numpy()
+                            for name,image in rendered.items()}
+        gt = rendered['GT']
+        sizes[view] = list(gt.shape[:2])
+        fixed_metrics = fixed.setdefault('metrics',{})
+        scores[view] = {}
+        for name,image in rendered.items():
+            if name == 'GT':
+                continue
+            if name == baseline_name and name in fixed_metrics:
+                score = fixed_metrics[name]
+            else:
+                score = _render_metrics(image,gt,config.device,trainer.ssim,trainer.lpips)
+                if name == baseline_name:
+                    fixed_metrics[name] = score
+            scores[view][name] = score
+        if save_outputs:
+            filename = 'comparison_strip.png' if view == 'Scene' else 'comparison_strip_detail.png'
+            _save_render_panels(rendered,scores[view],out_dir,os.path.join(out_dir,filename),
+                                'Scene_' if view == 'Scene' else 'Detail_')
+            for name,metric in scores[view].items():
+                print(f'[PBR Test] {view} Iter {curr_iter}: {name} '
+                      f'PSNR={metric[0]:.4f} SSIM={metric[1]:.4f} LPIPS={metric[2]:.4f}')
+    if save_outputs:
+        storage = log_comparison_storage(trainer.model,dataset,compression,config,verbose=False)
+        records = [row for view,methods in scores.items() for name,values in methods.items()
+                   for row in metric_records({'image':values},name,view=view,storage_bytes=storage[name])]
+        write_metrics(out_dir,records,evaluation='pbr',iteration=curr_iter,
+                      metadata=dict(report_context or {},primary_method=primary,render_sizes=sizes,
+                                    compression_formats=compression.recipe(dataset),storage_bytes=storage,
+                                    fntc_tile_size=config.fntc_tile_size,
+                                    gt_size=[dataset.texture_height,dataset.texture_width],
+                                    inference_size=list(evaluation.size),
+                                    material_sizes={name:list(image.shape[-2:]) for name,image in evaluation.native_images.items()},
+                                    normal_encoding=dataset.normal_encoding,
+                                    mip_lod_bias=config.pbr_mip_lod_bias,lighting=trainer.pbr_lighting,
+                                    detail_view=dict(center=config.pbr_detail_center,zoom=config.pbr_detail_zoom,
+                                                     resolution=config.pbr_detail_resolution,rendered_separately=True)))
+    return path if save_outputs else None,scores

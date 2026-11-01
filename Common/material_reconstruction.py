@@ -1,40 +1,13 @@
-"""Material raster reconstruction and image export shared by training and comparisons."""
+"""Material raster reconstruction and shared SR sources for training and evaluation."""
 import copy
-import os
+import math
 from typing import Optional, Tuple
 import torch
-import torchvision.transforms.functional as TF
 from dataset import material_size, clean_base_image
 from Core.Feature_Grid.sampling import resize_bilinear_repeat, sample_image
 from Core.Material_Encoding.normal_encoding import decode_normal
 from Core.Feature_Grid.compression import apply_latent_compression
-
-
-def _ref_astc_hw_from_side(side: Optional[int], base_h: int, base_w: int) -> Tuple[int, int]:
-    """Scale the longest material edge to side while preserving the GT aspect ratio."""
-    if side is None:
-        return base_h, base_w
-    if side <= 0:
-        raise ValueError(f"ref_astc_resolution must be a positive int (square edge), got {side}")
-    scale = float(side) / float(max(base_h, base_w))
-    return max(1, int(round(base_h * scale))), max(1, int(round(base_w * scale)))
-
-
-def comparison_material_size(model, height: int, width: int, ref_astc_resolution=None):
-    """Shared FNTC/ASTC raster, independent of latent resolution when specified."""
-    edge = ref_astc_resolution or max(material_size(model, height, width))
-    return _ref_astc_hw_from_side(edge, height, width)
-
-
-@torch.no_grad()
-def _render_gt_mip0(dataset, texture_height: int, texture_width: int) -> torch.Tensor:
-    mip = 0
-    mip_height = texture_height // (2 ** mip)
-    mip_width = texture_width // (2 ** mip)
-    gt_slice = dataset.mip_cache[mip]
-    gt_canonical = dataset.expand_to_canonical(gt_slice.reshape(-1, gt_slice.shape[-1]))
-    gt_canonical = gt_canonical.reshape(mip_height, mip_width, -1)
-    return gt_canonical.permute(2, 0, 1)[None, ...]
+from Core.Material_Encoding.compression import MaterialCompression
 
 
 @torch.no_grad()
@@ -86,7 +59,7 @@ def _render_model_mip0(model, dataset, texture_height: int, texture_width: int, 
     hwc = torch.nan_to_num(hwc, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     image = hwc.permute(2, 0, 1)[None, ...]
     if model.material_cnn is not None:
-        image = model.material_cnn.tiled(image, inference_tile)
+        image = model.material_cnn(image)
     return resize_bilinear_repeat(image, target_size) if (H, W) != target_size else image
 
 
@@ -96,56 +69,27 @@ def make_deployment_model(model):
     decoded.simulate_quantize()
     apply_latent_compression(decoded)
     decoded._decoder_adaptation_features = None
-    decoded._compressed_material = True
     return decoded
 
 
-def mip_plane_tile(
-    h0: int, h1: int, w0: int, w1: int, plane_h: int, plane_w: int, mip_f: float, device: str
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """[N,3] batch and (row,col) indices; UV=(col+0.5)/W, (row+0.5)/H."""
-    rr, cc = torch.meshgrid(
-        torch.arange(h0, h1, device=device),
-        torch.arange(w0, w1, device=device),
-        indexing="ij",
-    )
-    z = torch.full_like(rr, mip_f, dtype=torch.float32)
-    inp = torch.stack(((cc + 0.5) / plane_w, (rr + 0.5) / plane_h, z), dim=-1).reshape(-1, 3)
-    return inp, rr.reshape(-1).long(), cc.reshape(-1).long()
-
-
 @torch.no_grad()
-def render_material_mip(model, dataset, mip, mip_height, mip_width, *, num_mips, device, inference_tile=512, ref_astc_resolution=None, superres_base_override=None) -> torch.Tensor:
-    """Tiled full-plane forward (caps tcnn batch size; scatter by row/col to avoid layout bugs)."""
-    if mip == 0:
-        size = comparison_material_size(model, mip_height, mip_width, ref_astc_resolution)
-        return _render_model_mip0(model, dataset, mip_height, mip_width, num_mips,
-                                 device, superres_base_override=superres_base_override,
-                                 inference_tile=inference_tile,
-                                 inference_size=size)[0].permute(1, 2, 0)
-    c = model.num_channels
-    out = torch.empty(mip_height, mip_width, c, device=device, dtype=torch.float32)
-    step = max(1, inference_tile or max(mip_height, mip_width))
-    mip_f = 0.0 if num_mips <= 1 else float(mip) / float(num_mips - 1)
-    for h0 in range(0, mip_height, step):
-        h1 = min(h0 + step, mip_height)
-        for w0 in range(0, mip_width, step):
-            w1 = min(w0 + step, mip_width)
-            inp, fr, fc = mip_plane_tile(h0, h1, w0, w1, mip_height, mip_width, mip_f, device)
-            if getattr(model, 'super_resolution_enable', False):
-                local_indices = torch.stack([fr, fc, torch.full_like(fr, mip)], dim=1)
-                local_indices[:, :2] *= 2 ** mip
-                base = dataset.get_superres_base(local_indices)
-                base = dataset.expand_to_canonical(base).float()
-                residual = model(torch.cat([inp, base], dim=1)).float()
-                out[fr, fc, :] = (base + residual).clamp(0.0, 1.0)
-            else:
-                out[fr, fc, :] = model(inp).float()
-    if getattr(model, "direct_diffuse_enabled", False) and "diffuse" in dataset.available_textures:
-        s, e = dataset.canonical_channel_slices["diffuse"]
-        direct = model.render_direct_diffuse_mip(mip, mip_height, mip_width)
-        out[:, :, s:e] = direct.squeeze(0).permute(1, 2, 0).to(out.dtype)
-    return out
+def cached_astc_base(dataset, codec, base_resolution, output_size):
+    """Compress the shared SR source mip once, independently of material output formats."""
+    formats = {group: 'ASTC'+codec.astc_block for group in dataset.texture_packing}
+    key = (tuple((id(t),t._version) for t in dataset.mip_cache),tuple(output_size),
+           tuple((g,tuple(names)) for g,names in dataset.texture_packing.items()),dataset.normal_encoding,
+           codec.astcenc_path,codec.astcenc_quality,codec.astc_block,base_resolution)
+    previous = getattr(dataset,'_sr_base_cache',None)
+    if previous is None or previous[0] != key:
+        ratio = max(dataset.texture_height,dataset.texture_width)/base_resolution
+        mip = min(max(0,round(math.log2(ratio))),dataset.num_mips-1)
+        source = canonical_gt_mip(dataset,mip).float()
+        compression = MaterialCompression(formats,codec.astcenc_path,codec.astcenc_quality)
+        image = compression.roundtrip(source,dataset)
+        if tuple(image.shape[-2:]) != tuple(output_size):
+            image = resize_bilinear_repeat(image,output_size)
+        dataset._sr_base_cache = (key,image.cpu())
+    return dataset._sr_base_cache[1].to(dataset.mip_cache[0].device)
 
 
 def postprocess_material(image: torch.Tensor, vis_mode: str, normal_encoding='xyz') -> torch.Tensor:
@@ -171,12 +115,3 @@ def postprocess_material(image: torch.Tensor, vis_mode: str, normal_encoding='xy
 def canonical_gt_mip(dataset, mip):
     level = dataset.mip_cache[mip]
     return dataset.expand_to_canonical(level).permute(2, 0, 1)[None]
-
-
-def save_material_visuals(pred, gt, output_root, filename, vis_configs, normal_encoding):
-    image = torch.cat([pred, gt], dim=3)[0]
-    for config in vis_configs:
-        start, end = config['canonical_channel_slice']
-        directory = os.path.join(output_root, config['display_name'])
-        os.makedirs(directory, exist_ok=True)
-        TF.to_pil_image(postprocess_material(image[start:end], config['vis_mode'], normal_encoding)).save(os.path.join(directory, filename))

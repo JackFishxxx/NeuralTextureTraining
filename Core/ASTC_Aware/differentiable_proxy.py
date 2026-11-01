@@ -7,37 +7,11 @@ transforms. Block layouts remain fixed between validated CPU projections.
 
 import math
 
-from pathlib import Path
-import subprocess
-import tempfile
 
 import numpy as np
-from PIL import Image
 import torch
 
 from .build import native_extension
-
-
-def encode_seed(codec, rgba):
-    """Run the full CPU encoder once; preserve its actual 128-bit block choices."""
-    if codec.astc_block != "6x6":
-        raise ValueError("ASTC differentiable proxy currently supports 6x6 LDR blocks")
-    with tempfile.TemporaryDirectory(prefix="fntc_astc_seed_") as directory:
-        source, target = Path(directory) / "input.png", Path(directory) / "seed.astc"
-        Image.fromarray(np.asarray(rgba, dtype=np.uint8)).save(source)
-        subprocess.run(
-            [
-                codec.ensure_executable(),
-                "-cl",
-                str(source),
-                str(target),
-                "6x6",
-                "-" + codec.astcenc_quality,
-            ],
-            check=True,
-            capture_output=True,
-        )
-        return target.read_bytes()
 
 
 class _DecodeASTC(torch.autograd.Function):

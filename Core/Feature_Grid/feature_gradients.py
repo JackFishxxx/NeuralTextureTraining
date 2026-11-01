@@ -6,7 +6,7 @@ from .sampling import bilinear_texel_corners
 
 
 def gradient_directions(count):
-    if count not in (0, 2, 4, 8, 24):
+    if not isinstance(count, int) or isinstance(count, bool) or count not in (0, 2, 4, 8, 24):
         raise ValueError("feature_gradient_count must be 0, 2, 4, 8 or 24")
     if count == 24:
         return tuple((x, y) for y in range(-2, 3) for x in range(-2, 3) if (x, y) != (0, 0))
@@ -14,7 +14,7 @@ def gradient_directions(count):
             (1, 1), (-1, 1), (-1, -1), (1, -1))[:count]
 
 
-def sample_feature_inputs(params, spec, uv, selected_level, gradient_count=0):
+def sample_feature_inputs(params, spec, uv, selected_level):
     """Return center followed by neighbor-minus-center differences.
 
     All samples use bilinear repeat filtering of the same parameter tensor, including decoded ASTC and frozen
@@ -22,7 +22,7 @@ def sample_feature_inputs(params, spec, uv, selected_level, gradient_count=0):
     axial directions, completing the selected mip's 3x3 texel neighborhood.
     Twenty-four directions use the complete 5x5 neighborhood in row-major order.
     """
-    directions = gradient_directions(gradient_count)
+    directions = gradient_directions(spec.feature_gradient_count)
     levels = selected_level.round().long().reshape(-1).clamp(0, spec.n_levels - 1)
     resolution = (spec.base_resolution * 2 ** levels).reshape(-1, 1)
     # Dense levels grow by 4; avoid a GPU table transfer per sampling call.

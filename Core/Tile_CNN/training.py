@@ -10,9 +10,8 @@ from dataclasses import asdict
 import torch
 from torch.nn import functional as F
 
-from Common.comparison_astc import cached_astc_base
-from Common.material_reconstruction import comparison_material_size, make_deployment_model, _render_model_mip0
-from Core.Feature_Grid.sampling import resize_bilinear_repeat
+from Common.material_reconstruction import cached_astc_base, make_deployment_model, _render_model_mip0
+from dataset import material_size
 from .material_cnn import MaterialCNN
 from checkpoint import atomic_torch_save
 
@@ -30,11 +29,11 @@ def _full_quality(trainer, raw, gt, post, weights):
     if post is not None:
         training = post.training
         try:
-            native = post.eval().tiled(raw, 128)
+            native = post.eval()(raw)
         finally:
             post.train(training)
-    prediction = (resize_bilinear_repeat(native, gt.shape[-2:])
-                  if native.shape[-2:] != gt.shape[-2:] else native)
+    evaluation = trainer.material_evaluation(baseline=trainer.enable_pbr_compare, material_override=native)
+    prediction = evaluation.images[trainer.primary_method]
     if not torch.isfinite(prediction).all():
         raise ValueError('Nonfinite material CNN full-image prediction')
     metrics = trainer._compute_material_metrics(prediction, gt)
@@ -49,8 +48,8 @@ def _full_quality(trainer, raw, gt, post, weights):
     if trainer.enable_pbr_compare:
         metrics = trainer.run_pbr_comparison(
             return_metrics=True, save_outputs=False, include_detail_metrics=True,
-            material_override=prediction)[1]
-        quality['pbr'] = dict(scene=metrics['fntc'], detail=metrics['fntc_detail'])
+            evaluation=evaluation)[1]
+        quality['pbr'] = {view: values[trainer.primary_method] for view,values in metrics.items()}
     return quality
 
 
@@ -85,6 +84,7 @@ def _signature(raw, gt, trainer, weights):
     recipe = dict(normal_encoding=trainer.normal_encoding, pbr_loss=trainer.pbr_loss_enable,
                   pbr_weight=trainer.pbr_loss_weight, shape=list(raw.shape), gt_shape=list(gt.shape),
                   texture_packing=trainer.dataset.texture_packing,
+                  tile_size=trainer.configs.fntc_tile_size,
                   cnn_version=MaterialCNN.version)
     digest.update(json.dumps(recipe, sort_keys=True).encode())
     return digest.hexdigest()
@@ -96,8 +96,8 @@ def fit_material_cnn(trainer, steps=50000, validation_interval=1000, resume_stat
     model = trainer.model
     if not trainer.mip0_only or model.material_cnn is not None:
         raise ValueError('Material CNN fitting requires an unfiltered Mip0 decoder')
-    size = comparison_material_size(model, trainer.texture_height, trainer.texture_width,
-                                    trainer.ref_astc_resolution)
+    size = material_size(model,trainer.texture_height,trainer.texture_width,
+                         resolution=trainer.material_compare_resolution)
     gt_size = (trainer.texture_height, trainer.texture_width)
     validate_training_size(gt_size, size)
     infer_h, infer_w = size
@@ -109,40 +109,56 @@ def fit_material_cnn(trainer, steps=50000, validation_interval=1000, resume_stat
                                 trainer.configs.super_resolution_base_resolution, output_size=size)
                 if trainer.super_resolution_enable else None)
         raw = _render_model_mip0(decoded, trainer.dataset, *size, trainer.num_mips, trainer.device,
-                                 superres_base_override=base, inference_tile=128, inference_size=size)
+                                 superres_base_override=base, inference_tile=trainer.configs.eval_inference_tile,
+                                 inference_size=size)
         del decoded, base
-    gt = trainer.dataset.expand_mip_to_canonical_level(
+    gt = trainer.dataset.expand_to_canonical(
         trainer.dataset.mip_cache[0]).permute(2, 0, 1)[None].float()
-    post = MaterialCNN(model.num_channels, inference_size=size).to(trainer.device)
+    tile_size = trainer.configs.fntc_tile_size
+    post = MaterialCNN(model.num_channels, inference_size=size, tile_size=tile_size).to(trainer.device)
     optimizer = torch.optim.Adam(post.parameters(), lr=.001)
     weights = torch.tensor(trainer.output_loss_weights, device=trainer.device)
     signature = _signature(raw, gt, trainer, weights)
-    core, radius = 32, post.halo
-    axis = torch.arange(-radius-1, core+radius+1, device=trainer.device)
-    ty, tx = torch.arange(core*sy, device=trainer.device), torch.arange(core*sx, device=trainer.device)
-    yy, xx = torch.meshgrid((ty+.5)/sy+1, (tx+.5)/sx+1, indexing='ij')
-    grid = torch.stack((2*xx/(core+2)-1, 2*yy/(core+2)-1), -1)
-
     def positions(batch):
-        return torch.stack((torch.randint(infer_h, (batch,), device=trainer.device),
-                            torch.randint(infer_w, (batch,), device=trainer.device)), 1)
+        pixels = torch.stack((torch.randint(infer_h, (batch,), device=trainer.device),
+                              torch.randint(infer_w, (batch,), device=trainer.device)), 1)
+        # Sample tiles proportional to their area, including partial edge tiles.
+        return pixels // tile_size * tile_size
+
+    tile_h, tile_w = min(tile_size, infer_h), min(tile_size, infer_w)
+    patch_y = torch.arange(-1-post.halo, tile_h+1+post.halo, device=trainer.device)
+    patch_x = torch.arange(-1-post.halo, tile_w+1+post.halo, device=trainer.device)
+    ty = torch.arange(tile_h*sy, device=trainer.device)
+    tx = torch.arange(tile_w*sx, device=trainer.device)
+    yy, xx = torch.meshgrid((ty+.5)/sy+1, (tx+.5)/sx+1, indexing='ij')
+    sampling_grid = torch.stack((2*xx/(tile_w+2)-1, 2*yy/(tile_h+2)-1), -1)[None]
+    raw_hwc, gt_hwc = raw[0].permute(1, 2, 0), gt[0].permute(1, 2, 0)
 
     def loss_at(origins):
-        iy = (origins[:, 0, None]+axis) % infer_h
-        ix = (origins[:, 1, None]+axis) % infer_w
-        patches = raw[0, :, iy[:, :, None], ix[:, None, :]].permute(1, 0, 2, 3)
-        filtered = post.valid(patches)
-        prediction = F.grid_sample(filtered, grid[None].expand(len(origins), -1, -1, -1),
-                                   mode='bilinear', align_corners=False)
-        gy = (origins[:, 0, None]*sy+ty) % trainer.texture_height
-        gx = (origins[:, 1, None]*sx+tx) % trainer.texture_width
-        target = gt[0, :, gy[:, :, None], gx[:, None, :]].permute(1, 0, 2, 3)
-        prediction = prediction.permute(0, 2, 3, 1).reshape(-1, model.num_channels)
-        target = target.permute(0, 2, 3, 1).reshape(-1, model.num_channels)
-        loss = trainer._material_objective().reconstruction(target, prediction, weights, statistics=False)[0]
-        if trainer.pbr_loss_enable and trainer.pbr_loss_weight > 0:
-            loss += trainer.pbr_loss_weight * trainer._compute_pbr_render_loss(target, prediction)
-        return loss
+        losses = []
+        # Bound validation memory to the training batch size. Partial tiles use
+        # the same repeat halo and a mask that preserves each tile's mean loss.
+        for batch in origins.split(4):
+            y, x = batch.unbind(1)
+            iy = (y[:, None]+patch_y) % infer_h
+            ix = (x[:, None]+patch_x) % infer_w
+            patches = raw_hwc[iy[:, :, None], ix[:, None, :]].permute(0, 3, 1, 2)
+            filtered = post.valid(patches)
+            prediction = F.grid_sample(filtered, sampling_grid.expand(len(batch), -1, -1, -1),
+                                       mode='bilinear', align_corners=False)
+            gy = (y[:, None]*sy+ty) % gt_size[0]
+            gx = (x[:, None]*sx+tx) % gt_size[1]
+            target = gt_hwc[gy[:, :, None], gx[:, None, :]].reshape(-1, model.num_channels)
+            prediction = prediction.permute(0,2,3,1).reshape(-1,model.num_channels)
+            loss = trainer._material_objective().per_sample(target, prediction, weights)
+            if trainer.pbr_loss_enable and trainer.pbr_loss_weight > 0:
+                loss = loss + trainer.pbr_loss_weight * trainer._material_objective().pbr(
+                    target, prediction, reduction='none')
+            mask = ((ty[None, :, None] < (infer_h-y)[:, None, None]*sy)
+                    & (tx[None, None, :] < (infer_w-x)[:, None, None]*sx))
+            loss = loss.reshape(len(batch), len(ty), len(tx))
+            losses.append((loss*mask).sum((1, 2)) / mask.sum((1, 2)))
+        return torch.cat(losses).mean()
 
     progress_path = os.path.join(trainer.model_path, 'material_cnn_training.pth')
     device = torch.device(trainer.device)
@@ -194,12 +210,13 @@ def fit_material_cnn(trainer, steps=50000, validation_interval=1000, resume_stat
         optimizer.param_groups[0]['lr'] = lr
         optimizer.zero_grad(set_to_none=True)
         loss = loss_at(positions(4))
-        if not torch.isfinite(loss):
+        loss_value = float(loss.detach())
+        if not math.isfinite(loss_value):
             raise RuntimeError('Nonfinite material CNN training loss')
         loss.backward()
         optimizer.step()
         completed = step
-        trainer.writer.add_scalar('MaterialCNN/train_loss', float(loss.detach()), step)
+        trainer.writer.add_scalar('MaterialCNN/train_loss', loss_value, step)
         if step % interval == 0 or step == steps:
             with torch.no_grad():
                 value = float(loss_at(validation))
@@ -228,6 +245,7 @@ def fit_material_cnn(trainer, steps=50000, validation_interval=1000, resume_stat
     print(f'[Tile CNN] accepted={accepted}: {reason}', flush=True)
     return dict(steps=steps, best_step=best_step, best_validation_loss=best, accepted=accepted,
                 reason=reason, baseline=before, candidate=after, inference_size=list(size),
-                gt_size=list(gt_size), parameters=sum(p.numel() for p in post.parameters()) if accepted else 0,
+                gt_size=list(gt_size), tile_size=tile_size,
+                parameters=sum(p.numel() for p in post.parameters()) if accepted else 0,
                 seconds=time.perf_counter()-started, history=history,
                 progress_checkpoint=progress_path)

@@ -16,9 +16,8 @@ from Core.Material_Encoding.normal_encoding import NORMAL_XY_MIN_Z
 from Core.Feature_Grid.optimization import make_scheduler
 
 
-from utils import write_dds_r8g8b8a8
 from Core.Feature_Grid.feature_grid import (
-    FeatureGridSpec, enforce_wrap_boundary_constraint_inplace, feature_tensor_to_int,
+    FeatureGridSpec, enforce_wrap_boundary_constraint_inplace,
     feature_to_unorm, qat_noise_multiplier, quantize_feature_ste, quantize_feature_tensor,
     unorm_to_feature,
 )
@@ -39,16 +38,6 @@ class TCNNModel(torch.nn.Module):
 
         self.device = config.device
         self.quantize = config.quantize
-        self.quantize_bits = config.quantize_bits
-        self.save_bits = config.save_bits
-
-        self.N_k = 2 ** self.quantize_bits
-        self.Q_k = 1 / self.N_k
-        self.min_quantize_range = - (self.N_k - 1) / 2 * self.Q_k
-        # self.N_k / 2 * self.Q_k = 1 / 2
-        self.max_quantize_range = 1 / 2
-        self.noise_range = 1 / 2 * self.Q_k
-
         self.max_iter = max(1, int(config.max_iter))
         self._qat_noise_schedule = str(getattr(config, "qat_noise_schedule", "none")).strip().lower()
         self._qat_noise_mult_start = float(getattr(config, "qat_noise_mult_start", 1.0))
@@ -56,6 +45,7 @@ class TCNNModel(torch.nn.Module):
         self._qat_noise_warmup_frac = float(getattr(config, "qat_noise_warmup_frac", 0.0))
         self._qat_param_cache = {}
         self._qat_param_cache_iter = None
+        self._pending_grid_sync = set()
 
         self.current_iter = 0
 
@@ -64,15 +54,15 @@ class TCNNModel(torch.nn.Module):
         self.n_frequencies = config.n_frequencies
         self.n_neurons = config.n_neurons
         self.n_hidden_layers = config.n_hidden_layers
-        self.feature_gradient_count = config.feature_gradient_count
         self.output_activation = getattr(config, "output_activation", "hard_swish")
         self.grid_compressions = config.grid_compressions
         self.astcenc_path = config.astcenc_path
         self.astcenc_quality = config.astcenc_quality
+        self.fntc_tile_size = config.fntc_tile_size
         self.astc_codec_backend = config.astc_codec_backend
-        self.astc_codec_branch_enabled = False
+        self.codec_branch_enabled = False
         self._decoder_adaptation_features = None
-        self.astc_proxy = torch.nn.ModuleList()
+        self.grid_proxies = torch.nn.ModuleList()
         # Network output matches the selected canonical texture layout.
         self.normal_encoding = str(getattr(config, "normal_encoding", "xyz")).lower()
         self.num_channels = get_canonical_num_channels(self.normal_encoding)
@@ -103,22 +93,11 @@ class TCNNModel(torch.nn.Module):
         # Constrain only the highest K levels (1 = highest level only).
         self.wrap_boundary_levels = max(1, int(getattr(config, "wrap_boundary_levels", 1)))
 
-        self.feature_grid_learning_rates = []
-        for grid_idx, grid_cfg in enumerate(config.feature_grid_configs):
-            self.feature_grid_learning_rates.append(
-                grid_cfg.get("learning_rate", config.learning_rate)
-            )
-
         self.init_model(config)
         from Core.Feature_Grid.serialization import refresh_inference_contract
         refresh_inference_contract(self)
         if checkpoint is not None or config.load_dir is not None:
             self.load_ckpt(config, checkpoint)
-
-    @property
-    def latent_format(self):
-        families={r.format for r in self.grid_compressions}
-        return next(iter(families)) if len(families)==1 else 'mixed'
 
     def init_model(self, config: Config) -> None:
 
@@ -143,22 +122,16 @@ class TCNNModel(torch.nn.Module):
 
         # Support heterogeneous feature grid configs from configs.py.
         self.feature_grids = torch.nn.ModuleList()
-        self.feature_grid_base_res = []       # per-grid base_resolution
-        self.feature_grid_n_levels = []       # per-grid n_levels
-        self.feature_grid_n_features_per_level = []  # per-grid n_features_per_level
-        self.feature_grid_quantize_bits = []  # per-grid quantize bits (fallback to global)
-        self.feature_grid_save_bits = []      # per-grid save bits (fallback to global)
         self.feature_grid_specs = []
 
-        for grid_idx, grid_cfg in enumerate(config.feature_grid_configs):
-            spec = FeatureGridSpec.from_config(grid_cfg, self.quantize_bits, self.save_bits, config.learning_rate)
+        for grid_cfg in config.feature_grid_configs:
+            spec = FeatureGridSpec.from_config(grid_cfg, config.quantize_bits, config.learning_rate)
             if self.mip0_only:
                 spec = FeatureGridSpec(**{**spec.__dict__, 'n_levels': 1, 'base_resolution': spec.max_resolution})
             self.feature_grid_specs.append(spec)
             max_res = spec.max_resolution
             n_levels = spec.n_levels
             qbits = spec.quantize_bits
-            sbits = spec.save_bits
             n_feature_per_level = spec.n_features_per_level
             base_res = spec.base_resolution
 
@@ -176,29 +149,23 @@ class TCNNModel(torch.nn.Module):
                 encoding_config=feature_grid_config
             )
             self.feature_grids.append(feature_grid)
-            self.feature_grid_base_res.append(int(base_res))
-            self.feature_grid_n_levels.append(int(n_levels))
-            self.feature_grid_n_features_per_level.append(int(n_feature_per_level))
-            self.feature_grid_quantize_bits.append(int(qbits))
-            self.feature_grid_save_bits.append(int(sbits))
 
-            print(f"Initialized feature grid: max_res={max_res}, base_res={base_res}, n_levels={n_levels}, n_features_per_level={n_feature_per_level}, quantize_bits={qbits}, save_bits={sbits}, interpolation={spec.interpolation}")
+            print(f"Initialized feature grid: max_res={max_res}, base_res={base_res}, n_levels={n_levels}, n_features_per_level={n_feature_per_level}, quantize_bits={qbits}, interpolation={spec.interpolation}")
 
-        total_grid_features = sum(self.feature_grid_n_features_per_level) * self.num_sampled_mips
-        total_grid_features *= 1 + self.feature_gradient_count
         self.material_cnn = None
         if getattr(config, 'material_cnn_enable', False):
             if not self.mip0_only:
                 raise ValueError('Material CNN requires Mip0')
             size = getattr(config, 'material_cnn_inference_size', None)
-            self.material_cnn = MaterialCNN(self.num_channels, inference_size=size).to(self.device)
+            self.material_cnn = MaterialCNN(self.num_channels, inference_size=size,
+                                            tile_size=config.fntc_tile_size).to(self.device)
         if self.direct_diffuse_enabled:
-            if not self.feature_grid_n_features_per_level or self.feature_grid_n_features_per_level[0] < 3:
+            if self.feature_grid_specs[0].n_features_per_level < 3:
                 raise ValueError("direct_diffuse_infer_mode requires feature grid 0 to have at least 3 channels")
         # tiny-cuda-nn CutlassMLP exposes one flat weight tensor and ignores
         # use_bias. Append a constant input explicitly to provide a real bias.
         self.network = self._create_decoder(config, self.positional_encoding.n_output_dims)
-        print(f"total_grid_features={total_grid_features}, n_input_dims={self.network.n_input_dims}")
+        print(f"n_input_dims={self.network.n_input_dims}")
         # CutlassMLP ignores `use_bias` in this tiny-cuda-nn build. The constant
         # input supplies first-layer bias; this parameter supplies output bias.
         self.decoder_output_bias = torch.nn.Parameter(
@@ -208,16 +175,16 @@ class TCNNModel(torch.nn.Module):
         # add optimizer params config
         optimizer_params = [{'params': [*self.network.parameters(), self.decoder_output_bias],
                              'lr': getattr(config, 'network_learning_rate', 0.002)}]
-        for idx, feature_grid in enumerate(self.feature_grids):
-            lr = self.feature_grid_learning_rates[idx]
-            optimizer_params.append({'params': feature_grid.parameters(), 'lr': lr})
+        for feature_grid, spec in zip(self.feature_grids, self.feature_grid_specs):
+            optimizer_params.append({'params': feature_grid.parameters(), 'lr': spec.learning_rate})
         self.optimizer = torch.optim.Adam(optimizer_params, betas=(config.momentum, .999),
                                           weight_decay=config.weight_decay)
         self.scheduler = make_scheduler(self.optimizer, config.lr_scheduler, self.max_iter)
 
     def _create_decoder(self, config, positional_dims):
-        features = sum(self.feature_grid_n_features_per_level) * self.num_sampled_mips
-        inputs = positional_dims + features * (1 + config.feature_gradient_count) + 2
+        features = sum(grid['n_features_per_level'] * (1 + grid['feature_gradient_count'])
+                       for grid in config.feature_grid_configs)
+        inputs = positional_dims + features * self.num_sampled_mips + 2
         if config.super_resolution_enable:
             inputs += self.num_channels
         return tcnn.Network(inputs, self.num_channels, {
@@ -281,14 +248,16 @@ class TCNNModel(torch.nn.Module):
             self._qat_param_cache.clear()
             self._qat_param_cache_iter = self.current_iter
 
-        if self.astc_codec_branch_enabled and len(self.astc_proxy):
+        if self.codec_branch_enabled and len(self.grid_proxies):
             from Core.Feature_Grid.compression import sample_proxy_grid
             return sample_proxy_grid(self, grid_idx, feature_grid)
 
         return self._source_qat_grid_params(grid_idx, feature_grid)
 
     def _source_qat_grid_params(self, grid_idx, feature_grid):
-        params = self._get_grid_params_tensor(feature_grid)
+        if grid_idx in self._pending_grid_sync:
+            self._sync_pending_grid_sources()
+        params = feature_grid.params
         key = (int(grid_idx), 'source')
         cached = self._qat_param_cache.get(key)
         if cached is not None and cached[0] == params._version:
@@ -301,6 +270,11 @@ class TCNNModel(torch.nn.Module):
         quantized = quantize_feature_ste(noisy_params, self.feature_grid_specs[grid_idx])
         self._qat_param_cache[key] = (params._version, quantized)
         return quantized
+
+    def _sync_pending_grid_sources(self):
+        if self._pending_grid_sync:
+            from Core.Feature_Grid.compression import sync_grid_sources
+            sync_grid_sources(self, self._pending_grid_sync)
 
     def clear_codec_cache(self):
         """Refresh codec candidates while retaining this batch's source QAT noise."""
@@ -344,9 +318,9 @@ class TCNNModel(torch.nn.Module):
 
         s, e = dataset.channel_slices["diffuse"]
         diffuse = dataset.textures[:, :, s:e].to(self.device).float().permute(2, 0, 1)[None]
-        params = self._get_grid_params_tensor(self.feature_grids[0])
-        base_res, n_levels = self.feature_grid_base_res[0], self.feature_grid_n_levels[0]
-        n_fpl = self.feature_grid_n_features_per_level[0]
+        params = self.feature_grids[0].params
+        spec = self.feature_grid_specs[0]
+        base_res, n_levels, n_fpl = spec.base_resolution, spec.n_levels, spec.n_features_per_level
         values, mask, offset = torch.zeros_like(params), torch.zeros_like(params, dtype=torch.bool), 0
 
         for level in range(n_levels):
@@ -370,7 +344,7 @@ class TCNNModel(torch.nn.Module):
     @torch.no_grad()
     def _restore_direct_diffuse(self) -> None:
         if self.direct_diffuse_enabled and self._direct_diffuse_mask.numel():
-            p = self._get_grid_params_tensor(self.feature_grids[0])
+            p = self.feature_grids[0].params
             m = self._direct_diffuse_mask.to(p.device)
             p.data[m] = self._direct_diffuse_values.to(p.device)[m]
 
@@ -384,22 +358,17 @@ class TCNNModel(torch.nn.Module):
         if not self.direct_diffuse_enabled:
             raise RuntimeError("render_direct_diffuse_mip requires direct_diffuse_infer_mode != disable")
 
-        grid_levels = self.feature_grid_n_levels[0]
-        grid_fpl = self.feature_grid_n_features_per_level[0]
-        base_res = self.feature_grid_base_res[0]
+        spec = self.feature_grid_specs[0]
+        grid_levels, grid_fpl = spec.n_levels, spec.n_features_per_level
         mip_f = 0.0 if self.num_mips <= 1 else float(mip) / float(self.num_mips - 1)
         selected_level = int(round(grid_levels - self.num_sampled_mips - min(
             mip_f * (self.num_mips - self.num_sampled_mips),
             grid_levels - self.num_sampled_mips,
         )))
         selected_level = max(0, min(grid_levels - 1, selected_level))
-        res = base_res * (2 ** selected_level)
-
-        offset = 0
-        for level in range(selected_level):
-            level_res = base_res * (2 ** level)
-            offset += level_res * level_res * grid_fpl
-        params = self._get_grid_params_tensor(self.feature_grids[0])
+        res = spec.level_resolution(selected_level)
+        offset = spec.level_offset(selected_level)
+        params = self.feature_grids[0].params
         sampled = params[offset: offset + res * res * grid_fpl].view(-1, grid_fpl)
         tex = self._decode_direct_diffuse_features(sampled).reshape(res, res, 3)
         tex = tex.permute(2, 0, 1)[None].contiguous()
@@ -413,6 +382,8 @@ class TCNNModel(torch.nn.Module):
         expected_dims = 3 + (self.num_channels if self.super_resolution_enable else 0)
         if x.shape[1] != expected_dims:
             raise ValueError(f"Expected model input with {expected_dims} columns, got {x.shape[1]}")
+        if not self.training and self._decoder_adaptation_features is None:
+            self._sync_pending_grid_sources()
 
         # Explicit wrap to [0,1), so train/eval behavior matches repeat sampling at inference.
         uvs = torch.remainder(x[:, 0:2], 1.0)
@@ -428,8 +399,7 @@ class TCNNModel(torch.nn.Module):
         features = []
         direct_diffuse = None
         for idx, feature_grid in enumerate(self.feature_grids):
-            grid_levels = self.feature_grid_n_levels[idx]
-            grid_fpl = self.feature_grid_n_features_per_level[idx]
+            grid_levels = self.feature_grid_specs[idx].n_levels
             clipped_mips = torch.clamp(mips, max=grid_levels - num_sampled_mips)
             selected_level_f = grid_levels - num_sampled_mips - clipped_mips
             active_params = None
@@ -437,15 +407,14 @@ class TCNNModel(torch.nn.Module):
                 active_params = self._decoder_adaptation_features[idx]
             elif self.quantize and self.training:
                 active_params = self._get_qat_grid_params(idx, feature_grid)
-            params = active_params if active_params is not None else self._get_grid_params_tensor(feature_grid)
+            params = active_params if active_params is not None else feature_grid.params
             sampled_features = sample_feature_inputs(
-                params, self.feature_grid_specs[idx], uvs, selected_level_f, self.feature_gradient_count
+                params, self.feature_grid_specs[idx], uvs, selected_level_f
             ).to(feature_grid.dtype)
 
             if self.direct_diffuse_enabled and idx == 0:
-                # The center occupies the first grid_fpl channels, followed by
-                # feature differences. Reuse its bilinear sample for direct RGB.
-                direct_diffuse = self._decode_direct_diffuse_features(sampled_features[:, :grid_fpl])
+                # Center channels come first, before the feature differences.
+                direct_diffuse = self._decode_direct_diffuse_features(sampled_features)
 
             features.append(sampled_features)
         features = torch.cat(features, dim=1)
@@ -491,32 +460,22 @@ class TCNNModel(torch.nn.Module):
 
         with torch.no_grad():
             for idx, feature_grid in enumerate(self.feature_grids):
-                qbits = self.feature_grid_quantize_bits[idx]
-                N_k = 2 ** qbits
-                Q_k = 1.0 / N_k
-                min_q = -(N_k - 1) / 2 * Q_k
-                max_q = 0.5
+                spec = self.feature_grid_specs[idx]
 
-                params = self._get_grid_params_tensor(feature_grid)
-                params.clamp_(min=min_q, max=max_q)
+                params = feature_grid.params
+                params.clamp_(min=spec.quant_min, max=spec.quant_max)
 
                 if apply_wrap:
                     enforce_wrap_boundary_constraint_inplace(
                         params,
-                        base_res=int(self.feature_grid_base_res[idx]),
-                        n_levels=int(self.feature_grid_n_levels[idx]),
-                        n_features_per_level=int(self.feature_grid_n_features_per_level[idx]),
+                        base_res=spec.base_resolution,
+                        n_levels=spec.n_levels,
+                        n_features_per_level=spec.n_features_per_level,
                         strength=self.wrap_boundary_strength,
                         highest_k_levels=self.wrap_boundary_levels,
                     )
         self._restore_direct_diffuse()
 
-    def _get_grid_params_tensor(self, feature_grid: torch.nn.Module) -> torch.nn.Parameter:
-        # tiny-cuda-nn grid usually exposes a single parameter named "params".
-        for name, p in feature_grid.named_parameters():
-            if name == 'params':
-                return p
-        return next(feature_grid.parameters())
 
     def get_model_info(self) -> np.array:
 
@@ -524,13 +483,10 @@ class TCNNModel(torch.nn.Module):
         # include number of feature grids
         num_grids = len(self.feature_grids)
         info.append(int(num_grids))
-        # for each grid: base_resolution, n_levels, n_features_per_level, quantize_bits, save_bits
-        for i in range(num_grids):
-            info.append(int(self.feature_grid_base_res[i]))
-            info.append(int(self.feature_grid_n_levels[i]))
-            info.append(int(self.feature_grid_n_features_per_level[i]))
-            info.append(int(self.feature_grid_quantize_bits[i]))
-            info.append(int(self.feature_grid_save_bits[i]))
+        # for each grid: base_resolution, n_levels, n_features_per_level, quantize_bits
+        for spec in self.feature_grid_specs:
+            info.extend((spec.base_resolution, spec.n_levels, spec.n_features_per_level,
+                         spec.quantize_bits))
 
         # keep network summary info
         info.append(int(self.n_frequencies))
@@ -549,9 +505,12 @@ class TCNNModel(torch.nn.Module):
 
         validate_contract(self, state_dict)
         restore_proxies(self, state_dict)
-        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        self._pending_grid_sync.clear()
+        return result
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
+        self._sync_pending_grid_sources()
         super()._save_to_state_dict(destination, prefix, keep_vars)
         from Core.Feature_Grid.serialization import proxy_layout_tensor
         destination[prefix+'_grid_proxy_kinds'] = proxy_layout_tensor(self)
@@ -580,7 +539,7 @@ class TCNNModel(torch.nn.Module):
             # ----------------------------------------------------------------------------------
 
             # generate model infos
-            info = self.get_model_info()
+            info = save_model.get_model_info()
 
             save_kwargs = {
                 "info": info,
@@ -594,7 +553,6 @@ class TCNNModel(torch.nn.Module):
                 "pos_encoding_reference_size": np.array(
                     self.pos_encoding_reference_size, dtype=np.int32
                 ),
-                "feature_gradient_count": np.array(self.feature_gradient_count, dtype=np.int32),
                 "network": save_model.network.state_dict()["params"].numpy(),
                 "decoder_output_bias": save_model.decoder_output_bias.detach().numpy(),
             }
@@ -605,59 +563,8 @@ class TCNNModel(torch.nn.Module):
             network_data_path = os.path.join(save_path, f"network_data.npz")
             if save_model.material_cnn is not None:
                 save_kwargs.update(save_model.material_cnn.export_arrays())
-            # Save parameters to npz (features moved to DDS files)
+            # Network data and compressed surfaces share the same deployment manifest.
             np.savez(network_data_path, **save_kwargs)
             from Core.Feature_Grid.compression import export_latents
 
             export_latents(save_model, save_path)
-
-            # ----------------------------------------------------------------------------------
-            # - process the range of feature textures
-            # ----------------------------------------------------------------------------------
-
-            # Collect per-grid quantized integer features (one entry per feature).
-            quant_ints_list = []
-            matching_indices = []
-            for i, feature_grid in enumerate(save_model.feature_grids):
-                qbits = int(save_model.feature_grid_quantize_bits[i])
-                sbits = int(save_model.feature_grid_save_bits[i])
-                features = feature_grid.state_dict()["params"]
-                ints = feature_tensor_to_int(features, save_model.feature_grid_specs[i])
-                quant_ints_list.append(ints)
-                matching_indices.append(i)
-
-            # Convert packed features to uint8 for R8G8B8A8 format
-            # Packed features are in the range [0, 2^quantize_bits - 1]
-            # We need to scale them to [0, 255] for uint8
-            # For each matching grid, extract highest-resolution level and form a single R8G8B8A8 DDS
-            for idx, ints in enumerate(quant_ints_list):
-                orig_i = matching_indices[idx]
-                scale_factor = 255.0 / (2 ** save_model.feature_grid_quantize_bits[orig_i] - 1)
-                ints_np = ints.cpu().numpy()
-                base_res = int(self.feature_grid_base_res[orig_i])
-                n_levels = int(self.feature_grid_n_levels[orig_i])
-                n_fpl = int(self.feature_grid_n_features_per_level[orig_i])
-
-                # compute offset to the highest resolution level (in feature units)
-                offset = 0
-                for level in range(n_levels - 1):
-                    feature_size = base_res * (2 ** level)
-                    offset += n_fpl * feature_size ** 2
-
-                max_res_size = base_res * (2 ** (n_levels - 1))
-                max_res_features = n_fpl * max_res_size ** 2
-
-                level_features = ints_np[offset: offset + max_res_features]
-                # reshape into [H, W, n_fpl]
-                try:
-                    level_features = level_features.reshape(max_res_size, max_res_size, n_fpl)
-                except Exception:
-                    raise ValueError(f"Cannot reshape grid {orig_i} features of length {level_features.size} into ({max_res_size},{max_res_size},{n_fpl})")
-
-                for surface, channel_start in enumerate(range(0, n_fpl, 4)):
-                    rgba = np.zeros((max_res_size, max_res_size, 4), dtype=np.uint8)
-                    active = min(4, n_fpl-channel_start)
-                    rgba[..., :active] = np.clip(np.round(level_features[..., channel_start:channel_start+active]*scale_factor), 0, 255).astype(np.uint8)
-                    suffix = '' if n_fpl <= 4 else f'_rgba8_{surface}'
-                    dds_path = os.path.join(save_path, f'feature_grid_{orig_i}{suffix}.dds')
-                    write_dds_r8g8b8a8(dds_path, max_res_size, max_res_size, rgba)

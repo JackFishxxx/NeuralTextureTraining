@@ -23,21 +23,12 @@ class SourceGrid(nn.Module):
     proxy_kind = "source"
 
 
-def grid_recipes(model):
-    return model.grid_compressions
-
-
-def compressed_method(model):
-    tags = {r.tag for r in grid_recipes(model)}
-    return "fntc_" + next(iter(tags)) if len(tags) == 1 else "fntc_mixed"
-
-
 def plans_for(model, index):
     from .layout import surface_plan
 
     return surface_plan(
         model.feature_grid_specs[index],
-        grid_recipes(model)[index],
+        model.grid_compressions[index],
         getattr(model, "direct_diffuse_enabled", False) and index == 0,
     )
 
@@ -53,7 +44,7 @@ def latent_payload_bytes(model):
 def grid_image(model, index):
     spec = model.feature_grid_specs[index]
     offset, count, res = spec.highest_level_slice()
-    source = model._get_grid_params_tensor(model.feature_grids[index]).detach()[
+    source = model.feature_grids[index].params.detach()[
         offset : offset + count
     ]
     return feature_to_unorm(quantize_feature_tensor(source, spec), spec).reshape(
@@ -62,16 +53,12 @@ def grid_image(model, index):
 
 
 def astc_codec_for(model, index):
-    recipe = grid_recipes(model)[index]
+    recipe = model.grid_compressions[index]
     return ASTCCodec(
         model.astcenc_path,
         model.astcenc_quality,
         recipe.astc_block,
     )
-
-
-def proxy_kind(proxy):
-    return proxy.proxy_kind
 
 
 def initialize_grid_proxy(model, index, *, training_seed=True):
@@ -80,7 +67,7 @@ def initialize_grid_proxy(model, index, *, training_seed=True):
 
 def proxy_from_image(model, index, image, *, training_seed=True):
     """Construct a codec representation using this grid's format and packing."""
-    recipe = grid_recipes(model)[index]
+    recipe = model.grid_compressions[index]
     if recipe.format == "bc1":
         from Core.BCn_Aware.alpha_proxy import BC1AlphaProxyGrid
         return BC1AlphaProxyGrid.from_image(image, binary_seed=training_seed)
@@ -92,10 +79,10 @@ def proxy_from_image(model, index, image, *, training_seed=True):
         and len(plans) == 1
         and getattr(model, "astc_codec_backend", "") == "astc_differentiable_proxy"
     ):
-        from Core.ASTC_Aware.differentiable_proxy import ASTCProxyGrid, encode_seed
+        from Core.ASTC_Aware.differentiable_proxy import ASTCProxyGrid
 
         return ASTCProxyGrid.from_astc(
-            encode_seed(codec, (image * 255).round().byte().cpu().numpy()), model.device
+            codec.encode_rgba((image * 255).round().byte().cpu().numpy()), model.device
         )
     from Core.ASTC_Aware.roundtrip_proxy import ASTCRoundtripGrid, PackedASTCRoundtripGrid
 
@@ -111,7 +98,7 @@ class EncodedGrid:
 
 
 def proxy_streams(proxy):
-    if proxy_kind(proxy) == 'bc1_rgba':
+    if proxy.proxy_kind == 'bc1_rgba':
         return tuple(proxy.export_blocks())
     if hasattr(proxy, 'export_surfaces'):
         return proxy.export_surfaces()
@@ -119,13 +106,13 @@ def proxy_streams(proxy):
 
 
 def encode_grid(model, index):
-    recipe = grid_recipes(model)[index]
-    proxies = getattr(model, "astc_proxy", ())
+    recipe = model.grid_compressions[index]
+    proxies = getattr(model, "grid_proxies", ())
     proxy = proxies[index] if len(proxies) > index else SourceGrid()
-    if proxy_kind(proxy) != "source":
+    if proxy.proxy_kind != "source":
         return EncodedGrid(proxy_streams(proxy), proxy.decode_cpu_image())
     if recipe.format == "bc1":
-        proxy = initialize_grid_proxy(model, index)
+        proxy = initialize_grid_proxy(model, index, training_seed=False)
         return EncodedGrid(tuple(proxy.export_blocks()), proxy.decode_cpu_image())
     image = grid_image(model, index)
     codec = astc_codec_for(model, index)
@@ -151,6 +138,23 @@ def apply_latent_compression(model):
         grid.params[offset : offset + count].copy_(
             quantize_feature_tensor(unorm_to_feature(image.reshape(-1), spec), spec)
         )
+    model._pending_grid_sync.clear()
+
+
+@torch.no_grad()
+def sync_grid_sources(model, indices):
+    """Refresh source mirrors from authoritative proxies at a consumer boundary."""
+    indices = tuple(indices)
+    for index in indices:
+        proxy = model.grid_proxies[index]
+        if proxy.proxy_kind == 'source':
+            continue
+        spec = model.feature_grid_specs[index]
+        offset, count, _ = spec.highest_level_slice()
+        model.feature_grids[index].params[offset:offset+count].copy_(
+            quantize_feature_tensor(unorm_to_feature(proxy.decode_image().flatten(), spec), spec))
+    model._pending_grid_sync.difference_update(indices)
+    model._qat_param_cache.clear()
 
 
 @torch.no_grad()
@@ -166,7 +170,7 @@ def decoded_feature_grids(model):
 
 
 def export_latents(model, directory):
-    for i, recipe in enumerate(grid_recipes(model)):
+    for i, recipe in enumerate(model.grid_compressions):
         encoded = encode_grid(model, i)
         plans = plans_for(model, i)
         if len(encoded.streams) != len(plans):
@@ -190,33 +194,33 @@ def export_latents(model, directory):
 
 
 def clamp_proxies(model):
-    for proxy in model.astc_proxy:
-        if proxy_kind(proxy) != "source" and any(p.requires_grad for p in proxy.parameters()):
+    for proxy in model.grid_proxies:
+        if proxy.proxy_kind != "source" and any(p.requires_grad for p in proxy.parameters()):
             proxy.clamp_parameters()
 
 
 def freeze_proxies(model):
     # Prepare all encoded surfaces before committing any freeze flags or modules.
-    proxies = list(model.astc_proxy) or [SourceGrid() for _ in grid_recipes(model)]
+    proxies = list(model.grid_proxies) or [SourceGrid() for _ in model.grid_compressions]
     for i, proxy in enumerate(proxies):
-        if proxy_kind(proxy) == "source":
+        if proxy.proxy_kind == "source":
             proxies[i] = proxy = initialize_grid_proxy(model, i, training_seed=False)
-        if proxy_kind(proxy) == 'astc_roundtrip':
+        if proxy.proxy_kind == 'astc_roundtrip':
             proxy_streams(proxy)
     for proxy in proxies:
-        if proxy_kind(proxy) == "astc_roundtrip":
+        if proxy.proxy_kind == "astc_roundtrip":
             proxy.freeze()
         else:
             proxy.requires_grad_(False)
-    model.astc_proxy = torch.nn.ModuleList(proxies)
+    model.grid_proxies = torch.nn.ModuleList(proxies)
     model._codec_active_grids = tuple(range(len(proxies)))
 
 
 def sample_proxy_grid(model, grid_idx, feature_grid):
-    proxy = model.astc_proxy[grid_idx]
+    proxy = model.grid_proxies[grid_idx]
     spec = model.feature_grid_specs[grid_idx]
     active = getattr(model, '_codec_active_grids', None)
-    if proxy_kind(proxy) == "source" or (active is not None and grid_idx not in active):
+    if proxy.proxy_kind == "source" or (active is not None and grid_idx not in active):
         return model._source_qat_grid_params(grid_idx, feature_grid)
     version = tuple(p._version for p in proxy.parameters())
     key = (grid_idx, "codec")
@@ -229,7 +233,7 @@ def sample_proxy_grid(model, grid_idx, feature_grid):
         + spec.quant_min,
         spec,
     )
-    source = model._get_grid_params_tensor(feature_grid).detach()
+    source = feature_grid.params.detach()
     active = torch.cat((source[:offset], decoded, source[offset + count :]))
     model._qat_param_cache[key] = (version, active)
     return active

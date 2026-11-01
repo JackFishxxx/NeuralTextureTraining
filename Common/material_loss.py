@@ -24,8 +24,10 @@ class MaterialLoss:
         self._loss_group_indices[key] = indices
         return indices
 
-    def pbr(self, gt: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
+    def pbr(self, gt: torch.Tensor, pred: torch.Tensor, reduction='mean') -> torch.Tensor:
         """Differentiable shaded-RGB loss for PBR-sensitive material channels."""
+        if reduction not in ('mean', 'none'):
+            raise ValueError('PBR loss reduction must be mean or none')
         slices = self.dataset.canonical_channel_slices
         def get_pair(name, channels=1, default=0.0):
             if name not in self.dataset.available_textures:
@@ -78,7 +80,8 @@ class MaterialLoss:
             return torch.nan_to_num(shaded, nan=0.0, posinf=1.0, neginf=0.0)
         pred_shaded = shade(pr_diff, pr_n, pr_rough, pr_metal, pr_spec)
         gt_shaded = shade(gt_diff, gt_n, gt_rough, gt_metal, gt_spec).detach()
-        return torch.nan_to_num(torch.nn.functional.smooth_l1_loss(pred_shaded, gt_shaded),
+        loss = torch.nn.functional.smooth_l1_loss(pred_shaded, gt_shaded, reduction=reduction)
+        return torch.nan_to_num(loss.mean(1) if reduction == 'none' else loss,
                                 nan=0.0, posinf=1.0, neginf=0.0)
 
     def _group_losses(self, gt_texture, predict_texture, loss_weights):
@@ -120,8 +123,8 @@ class MaterialLoss:
             total = total + value
             if statistics:
                 stats[group] = {
-                    'loss': value.detach().item(),
-                    'raw_loss': raw.mean().detach().item(),
-                    'weight': weight.detach().item(),
+                    'loss': value.detach(),
+                    'raw_loss': raw.mean().detach(),
+                    'weight': weight.detach(),
                 }
         return total, stats

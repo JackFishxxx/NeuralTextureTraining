@@ -28,9 +28,10 @@ def _passes(before, after):
 
 @torch.no_grad()
 def _select(trainer, proposal, grid_index=0):
-    model, grid = trainer.model, trainer.model.astc_proxy[grid_index]
+    model, grid = trainer.model, trainer.model.grid_proxies[grid_index]
     height, width = grid._image_shape
-    halo = 1 + max((max(abs(x), abs(y)) for x, y in gradient_directions(model.feature_gradient_count)), default=0)
+    halo = 1 + max((max(abs(x), abs(y)) for x, y in gradient_directions(
+        model.feature_grid_specs[grid_index].feature_gradient_count)), default=0)
     scale_y, scale_x = trainer.texture_height // height, trainer.texture_width // width
     # Output interpolation expands each block's influence by another native texel.
     if (scale_y, scale_x) != (1, 1):
@@ -51,7 +52,7 @@ def _select(trainer, proposal, grid_index=0):
     names = ('endpoints', 'weights', 'metadata', 'partitions', 'indices', 'coefficients')
     weights = torch.tensor(trainer.output_loss_weights, device=model.device)
     accepted = 0
-    model.astc_codec_branch_enabled = True
+    model.codec_branch_enabled = True
     for group in groups.values():
         for start in range(0, len(group), 64):
             rows = torch.tensor(group[start:start + 64], device=model.device)
@@ -102,9 +103,7 @@ def refit_layout(trainer, steps):
     whole-grid proposals; all formats share the full-image acceptance gate.
     Rejection and exceptions restore every grid together.
     """
-    from Core.Feature_Grid.compression import (
-        freeze_proxies, proxy_from_image, proxy_kind,
-    )
+    from Core.Feature_Grid.compression import freeze_proxies, proxy_from_image
 
     model = trainer.model
     if steps < 0:
@@ -116,7 +115,7 @@ def refit_layout(trainer, steps):
         return {'applied': False, 'reason': 'requires quantized Mip0 outside direct diffuse/adaptation'}
     if trainer.super_resolution_enable and trainer.astc_superres_base_mip0 is None:
         raise ValueError('Layout refitting requires the deployment SR base')
-    original_proxies = torch.nn.ModuleList(list(model.astc_proxy))
+    original_proxies = torch.nn.ModuleList(list(model.grid_proxies))
     saved_codecs = [{k: v.detach().clone() for k, v in proxy.state_dict().items()}
                     for proxy in original_proxies]
     sources = [grid.params for grid in model.feature_grids]
@@ -124,7 +123,7 @@ def refit_layout(trainer, steps):
     flags = [(p, p.requires_grad) for p in model.parameters()]
     proxy_flags = [dict((name, p.requires_grad) for name, p in proxy.named_parameters())
                    for proxy in original_proxies]
-    training, branch = model.training, model.astc_codec_branch_enabled
+    training, branch = model.training, model.codec_branch_enabled
     active = getattr(model, '_codec_active_grids', None)
     previous_phase = getattr(trainer, '_metrics_phase', None)
     device = torch.device(model.device)
@@ -136,20 +135,21 @@ def refit_layout(trainer, steps):
     try:
         freeze_proxies(model)
         trainer._metrics_phase = 'layout_refit'
-        saved_streams = [proxy_streams(proxy) for proxy in model.astc_proxy]
+        saved_streams = [proxy_streams(proxy) for proxy in model.grid_proxies]
         before = trainer.deployment_metrics()['average']
-        before_pbr = trainer.run_pbr_comparison(curr_iter=model.current_iter, return_metrics=True, save_outputs=False)[1] if trainer.enable_pbr_compare else None
+        before_pbr = trainer.run_pbr_comparison(curr_iter=model.current_iter, return_metrics=True,
+                                                save_outputs=False, include_detail_metrics=True)[1] if trainer.enable_pbr_compare else None
         best_material, best_pbr = before, before_pbr
-        best_proxies = copy.deepcopy(model.astc_proxy)
+        best_proxies = copy.deepcopy(model.grid_proxies)
         fields = [source.detach().clone() for source in sources]
-        for field, spec, proxy in zip(fields, model.feature_grid_specs, model.astc_proxy):
+        for field, spec, proxy in zip(fields, model.feature_grid_specs, model.grid_proxies):
             offset, count, _ = spec.highest_level_slice()
             field[offset:offset+count] = unorm_to_feature(proxy.decode_image().detach().flatten(), spec)
             field.requires_grad_(True)
         for p, _ in flags:
             p.requires_grad_(False)
         model.train()
-        model.astc_codec_branch_enabled = False
+        model.codec_branch_enabled = False
         model._decoder_adaptation_features = fields
         optimizer = torch.optim.Adam(fields, lr=.0003)
         height, width = trainer.texture_height, trainer.texture_width
@@ -163,7 +163,7 @@ def refit_layout(trainer, steps):
             if base is not None:
                 inputs = torch.cat((inputs, base), 1)
             prediction = trainer._predict_material(inputs)
-            loss = trainer._compute_astc_reconstruction_loss(target, prediction, base, weights)
+            loss = trainer._compute_material_reconstruction_loss(target, prediction, base, weights)
             if trainer.pbr_loss_enable and trainer.pbr_loss_weight > 0:
                 material = prediction.float() if base is None else prediction.float()+base.float()
                 loss += trainer.pbr_loss_weight * trainer._compute_pbr_render_loss(target.float(), material.clamp(0, 1))
@@ -181,32 +181,34 @@ def refit_layout(trainer, steps):
                         resolution, resolution, spec.n_features_per_level), spec)
                     proposal = proxy_from_image(model, index, image, training_seed=False)
                     proposal.requires_grad_(False)
-                    if (proxy_kind(proposal) == 'astc_native'
+                    if (proposal.proxy_kind == 'astc_native'
                             and not height % resolution and not width % resolution):
                         local_accepted[index] = _select(trainer, proposal, index)
                     else:
-                        if proxy_kind(proposal) == 'astc_roundtrip':
+                        if proposal.proxy_kind == 'astc_roundtrip':
                             proposal.freeze()
-                        model.astc_proxy[index] = proposal
-                trainer._sync_astc_source()
+                        model.grid_proxies[index] = proposal
+                trainer._sync_grid_sources()
                 iteration = model.current_iter + step
                 after = trainer.deployment_metrics()['average']
                 after_pbr = trainer.run_pbr_comparison(curr_iter=iteration, return_metrics=True,
-                                                      save_outputs=False)[1] if before_pbr is not None else None
+                                                      save_outputs=False, include_detail_metrics=True)[1] if before_pbr is not None else None
                 changed = sum(_changed_blocks(old, proxy_streams(proxy), recipe.format)
-                              for old, proxy, recipe in zip(saved_streams, model.astc_proxy, model.grid_compressions))
+                              for old, proxy, recipe in zip(saved_streams, model.grid_proxies, model.grid_compressions))
                 accepted = (_passes(best_material, after)
-                            and (best_pbr is None or _passes(best_pbr['fntc'], after_pbr['fntc'])))
+                            and (best_pbr is None or all(_passes(values[trainer.primary_method],
+                                                               after_pbr[view][trainer.primary_method])
+                                                        for view,values in best_pbr.items())))
                 stats['checks'].append({'step': step, 'material': list(after), 'pbr': after_pbr,
                                         'local_accepted_blocks': local_accepted, 'accepted': accepted})
                 if accepted and changed:
-                    best_proxies = copy.deepcopy(model.astc_proxy)
+                    best_proxies = copy.deepcopy(model.grid_proxies)
                     best_material, best_pbr = after, after_pbr
                     stats.update(accepted=True, best_step=step, changed_blocks=changed)
-                model.astc_proxy = copy.deepcopy(best_proxies)
-                trainer._sync_astc_source()
+                model.grid_proxies = copy.deepcopy(best_proxies)
+                trainer._sync_grid_sources()
                 model.train()
-                model.astc_codec_branch_enabled = False
+                model.codec_branch_enabled = False
                 model._decoder_adaptation_features = fields
                 model._qat_param_cache.clear()
             print(f"[Layout refit] step {step}/{steps}: PSNR={after[0]:.4f}, "
@@ -220,7 +222,7 @@ def refit_layout(trainer, steps):
                 loss = reconstruction(ids)
                 if trainer.subpixel_sampling_enable and trainer.subpixel_sampling_ratio > 0:
                     inputs, target, base = trainer._sample_astc_subpixel_batch(proxy=True)
-                    loss += trainer.subpixel_sampling_ratio * trainer._compute_astc_reconstruction_loss(
+                    loss += trainer.subpixel_sampling_ratio * trainer._compute_material_reconstruction_loss(
                         target, trainer._predict_material(inputs), base, weights)
                 loss.backward()
                 if not torch.isfinite(loss) or any(field.grad is None or not torch.isfinite(field.grad).all() for field in fields):
@@ -233,33 +235,33 @@ def refit_layout(trainer, steps):
                 if (step+1) % 100 == 0 or step+1 == steps:
                     evaluate(step+1)
         model._decoder_adaptation_features = None
-        model.astc_proxy = best_proxies
-        trainer._sync_astc_source()
+        model.grid_proxies = best_proxies
+        trainer._sync_grid_sources()
         stats.update(before=list(before), candidate=list(best_material),
                      before_pbr=before_pbr, candidate_pbr=best_pbr)
         completed = True
         return stats
     finally:
         if not completed or not stats['accepted']:
-            model.astc_proxy = original_proxies
+            model.grid_proxies = original_proxies
             for proxy, saved in zip(original_proxies, saved_codecs):
                 proxy.load_state_dict(saved)
             with torch.no_grad():
                 for source, saved in zip(sources, saved_sources):
                     source.copy_(saved)
         model._decoder_adaptation_features = None
-        model.astc_codec_branch_enabled = branch
+        model.codec_branch_enabled = branch
         model._codec_active_grids = active
         model.train(training)
         for p, flag in flags:
             p.requires_grad_(flag)
-        for i, proxy in enumerate(model.astc_proxy):
+        for i, proxy in enumerate(model.grid_proxies):
             for name, p in proxy.named_parameters():
                 p.requires_grad_(proxy_flags[i].get(name, False) if i < len(proxy_flags) else False)
         model._qat_param_cache.clear()
         trainer._metrics_phase = previous_phase
         if completed and stats['accepted']:
-            trainer._astc_block_optimizer = None
+            trainer._grid_compression_optimizer = None
 
 
 def _changed_blocks(before, after, latent_format):

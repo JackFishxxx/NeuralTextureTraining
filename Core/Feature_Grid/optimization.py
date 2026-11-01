@@ -3,8 +3,6 @@
 import torch
 from Core.Feature_Grid.compression import (
     initialize_grid_proxy,
-    grid_recipes,
-    proxy_kind,
     SourceGrid,
 )
 
@@ -27,9 +25,9 @@ class GridCompressionOptimizer:
     def __init__(self, trainer):
         self.trainer = trainer
         model = trainer.model
-        recipes = grid_recipes(model)
-        if not len(model.astc_proxy):
-            model.astc_proxy = torch.nn.ModuleList([SourceGrid() for _ in recipes])
+        recipes = model.grid_compressions
+        if not len(model.grid_proxies):
+            model.grid_proxies = torch.nn.ModuleList([SourceGrid() for _ in recipes])
         self.optimizers = [None for _ in recipes]
         self.updates = [0 for _ in recipes]
         self.iteration = 0
@@ -42,25 +40,25 @@ class GridCompressionOptimizer:
         if active is None:
             active = range(len(self.optimizers))
         progress = min(1., max(0., model.current_iter/max(1, trainer.configs.max_iter-1)))
-        for i, recipe in enumerate(grid_recipes(model)):
+        for i, recipe in enumerate(model.grid_compressions):
             enabled = trainer.configs.bcn_aware_enable if recipe.format == 'bc1' else trainer.configs.astc_aware_enable
             if not enabled:
-                if proxy_kind(model.astc_proxy[i]) != 'source':
-                    model.astc_proxy[i] = SourceGrid()
+                if model.grid_proxies[i].proxy_kind != 'source':
+                    model.grid_proxies[i] = SourceGrid()
                 self.optimizers[i] = None
                 continue
             if i not in active:
                 continue
-            proxy = model.astc_proxy[i]
+            proxy = model.grid_proxies[i]
             if self.optimizers[i] is None:
-                if proxy_kind(proxy) == 'source':
+                if proxy.proxy_kind == 'source':
                     proxy = initialize_grid_proxy(model, i)
-                    model.astc_proxy[i] = proxy
-                if proxy_kind(proxy) == 'astc_roundtrip':
+                    model.grid_proxies[i] = proxy
+                if proxy.proxy_kind == 'astc_roundtrip':
                     proxy.thaw()
                 else:
                     proxy.requires_grad_(True)
-                if proxy_kind(proxy) == 'astc_native':
+                if proxy.proxy_kind == 'astc_native':
                     from Core.ASTC_Aware.differentiable_proxy import ASTCBlockAdam
                     opt = ASTCBlockAdam(torch.nn.ModuleList([proxy]), trainer.configs.astc_learning_rate,
                                         trainer.configs.astc_learning_rate, fused=True,
@@ -69,7 +67,7 @@ class GridCompressionOptimizer:
                     lr = trainer.configs.bcn_learning_rate if recipe.format == 'bc1' else trainer.configs.astc_learning_rate
                     opt = torch.optim.Adam(proxy.parameters(), lr=lr)
                 self.optimizers[i] = opt
-            if proxy_kind(proxy) == 'bc1_rgba':
+            if proxy.proxy_kind == 'bc1_rgba':
                 proxy.temperature.fill_(.25**progress)
 
     def zero_grad(self):
@@ -84,21 +82,20 @@ class GridCompressionOptimizer:
                 continue
             if isinstance(opt, torch.optim.Optimizer):
                 opt.step()
-            elif self.updates[index] % 100 == 0 and hasattr(self.trainer, "_astc_proxy_batches"):
-                proxy = self.trainer.model.astc_proxy[index]
+            elif self.updates[index] % 100 == 0 and hasattr(self.trainer, "_codec_batches"):
+                proxy = self.trainer.model.grid_proxies[index]
                 touched = torch.where(
                     (proxy.endpoints.grad.abs().sum(1) + proxy.weights.grad.abs().sum(1)) > 0
                 )[0]
-                opt.step({0: touched}, objective=self.trainer._astc_proxy_objective)
+                opt.step({0: touched}, objective=self.trainer._codec_objective)
             else:
                 opt.step_full_grid()
             self.updates[index] += 1
         self.trainer.model._qat_param_cache.clear()
         self.iteration += 1
-        self.trainer._astc_codec_pass_count = self.iteration
         interval = self.trainer.configs.astc_decoder_projection_interval
         if (interval > 0 and self.iteration % interval == 0
-                and any(i in due and proxy_kind(p) == 'astc_native' for i, p in enumerate(self.trainer.model.astc_proxy))
+                and any(i in due and p.proxy_kind == 'astc_native' for i, p in enumerate(self.trainer.model.grid_proxies))
                 and self.trainer._supports_astc_projection()):
             self.trainer._project_astc_decoder_target()
 

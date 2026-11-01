@@ -1,4 +1,3 @@
-from torch.utils.data import Dataset
 from configs import Config
 from typing import Dict, List, Optional, Tuple, Union
 from torchtyping import TensorType
@@ -24,24 +23,33 @@ from Core.Material_Encoding.normal_encoding import (
 ROMSD_TYPES = ('roughness', 'occlusion', 'metallic', 'specular', 'displacement')
 
 
-def build_texture_packing(available_textures) -> Dict[str, List[str]]:
-    """Dataset storage policy; each list fills RGBA in order, with padding set to one."""
+def build_texture_packing(available_textures, romsd_format: str) -> Dict[str, List[str]]:
+    """Pack actual maps in R/O/M/S/D priority, excluding BC1's binary alpha."""
     available = set(available_textures)
     groups = {name: [name] for name in ('diffuse', 'normal') if name in available}
     scalars = [name for name in ROMSD_TYPES if name in available]
     if scalars:
-        # D is last: remove it only when all five scalar maps are present.
-        groups['romsd'] = scalars[:4]
+        capacity = 3 if romsd_format == 'BC1' else 4
+        groups['romsd'] = scalars[:capacity]
     return groups
 
 
-def material_size(model, height, width):
-    """Decode at the largest latent edge, capped by the source texture size."""
-    if hasattr(model, 'feature_grid_specs'):
-        edge = max(spec.max_resolution for spec in model.feature_grid_specs)
-    else:
-        edge = max(spec['max_resolution'] for spec in model.feature_grid_configs)
-    scale = min(1., edge / max(height, width))
+def material_size(model, height, width, *, resolution=None):
+    """Use the configured material raster consistently in fitting and deployment."""
+    edge = resolution if resolution is not None else getattr(model,'material_compare_resolution',None)
+    if edge is not None and edge <= 0:
+        raise ValueError('Material resolution must be positive')
+    if edge is None:
+        inference_size = getattr(model,'inference_size',())
+        if inference_size:
+            return tuple(inference_size)
+    if edge is None:
+        if hasattr(model,'feature_grid_specs'):
+            edge = max(spec.max_resolution for spec in model.feature_grid_specs)
+        else:
+            edge = max(spec['max_resolution'] for spec in model.feature_grid_configs)
+        edge = min(edge,max(height,width))
+    scale = edge / max(height,width)
     return max(1, round(height * scale)), max(1, round(width * scale))
 
 
@@ -49,7 +57,7 @@ def prefiltered_material(dataset, size):
     """Reuse the same material-aware mip for ASTC inputs and projection seeds."""
     for level in dataset.mip_cache:
         if tuple(level.shape[:2]) == tuple(size):
-            return dataset.expand_mip_to_canonical_level(level).permute(2, 0, 1)[None].float()
+            return dataset.expand_to_canonical(level).permute(2, 0, 1)[None].float()
     source = dataset.mip_cache[0]
     result = source.new_zeros((*size, dataset.canonical_num_channels))
     for name in dataset.available_textures:
@@ -64,7 +72,7 @@ def clean_base_image(dataset, size):
     """Sample the actual low-resolution SR source directly onto the native raster."""
     ratio = max(dataset.texture_height, dataset.texture_width) / dataset.super_resolution_base_resolution
     level = min(max(0, round(math.log2(ratio))) if ratio > 1 else 0, dataset.num_mips - 1)
-    image = dataset.expand_mip_to_canonical_level(dataset.mip_cache[level]).permute(2, 0, 1)[None].float()
+    image = dataset.expand_to_canonical(dataset.mip_cache[level]).permute(2, 0, 1)[None].float()
     return resize_bilinear_repeat(image, size) if tuple(image.shape[-2:]) != tuple(size) else image
 
 
@@ -187,36 +195,6 @@ class TextureDataset(torch.nn.Module):
         self.superres_base_cache = self.generate_superres_base() if self.super_resolution_enable else None
     
     @torch.no_grad()
-    def forward(
-            self, 
-            batch_index: TensorType["batch_size", 3]
-        ) -> List[TensorType["batch_size", "num_channels"]]:
-
-        # mip_cache stores one compact [H_mip, W_mip, C] tensor per level.
-        # batch_index: [batch_size, 3]
-
-        batch_size = batch_index.shape[0]
-        ys = batch_index[:, 0]
-        xs = batch_index[:, 1]
-        mips = batch_index[:, 2]
-
-        # use mips to scale the pixel position
-        mip_scale = 2 ** mips
-        scaled_xs = xs // mip_scale
-        scaled_ys = ys // mip_scale
-
-        batch_data = torch.empty(
-            (batch_index.shape[0], self.num_channels),
-            device=self.mip_cache[0].device,
-            dtype=self.mip_cache[0].dtype,
-        )
-        for mip, level in enumerate(self.mip_cache):
-            mask = mips == mip
-            batch_data[mask] = level[scaled_ys[mask], scaled_xs[mask]]
-
-        return batch_data
-
-    @torch.no_grad()
     def sample_continuous(self, sample_xy: torch.Tensor, mips: Union[torch.Tensor, int],
                           cache: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Bilinear repeat sampling; an integer mip avoids dynamic GPU masking."""
@@ -255,28 +233,6 @@ class TextureDataset(torch.nn.Module):
         if self.superres_base_cache is None:
             raise RuntimeError("Super-resolution is not enabled")
         return self.sample_continuous(sample_xy, mips, cache=self.superres_base_cache)
-
-    @torch.no_grad()
-    def get_superres_base(
-            self,
-            batch_index: TensorType["batch_size", 3]
-        ) -> TensorType["batch_size", "num_channels"]:
-        """Sample the feature-grid-relative low-resolution texture at training positions."""
-        if self.superres_base_cache is None:
-            raise RuntimeError("Super-resolution is not enabled for this dataset")
-        ys, xs, mips = batch_index[:, 0], batch_index[:, 1], batch_index[:, 2]
-        mip_scale = 2 ** mips
-        out = torch.empty(
-            (batch_index.shape[0], self.num_channels),
-            device=self.superres_base_cache[0].device,
-            dtype=self.superres_base_cache[0].dtype,
-        )
-        scaled_ys, scaled_xs = ys // mip_scale, xs // mip_scale
-        for mip, level in enumerate(self.superres_base_cache):
-            mask = mips == mip
-            out[mask] = level[scaled_ys[mask], scaled_xs[mask]]
-        return out
-        
 
     @staticmethod
     def _is_single_channel_content(tensor: torch.Tensor, atol: float = 1.0 / 255.0) -> bool:
@@ -379,12 +335,13 @@ class TextureDataset(torch.nn.Module):
 
             textures[texture_type] = tensor
 
-        self.texture_packing = build_texture_packing(textures)
+        romsd_format = self.config.material_compression_formats['romsd']
+        self.texture_packing = build_texture_packing(textures, romsd_format)
         active = {name for names in self.texture_packing.values() for name in names}
         for name in list(textures):
             if name not in active:
                 del textures[name]
-                print(f'[Texture Packing] dropping {name}: exceeds RGBA capacity')
+                print(f'[Texture Packing] dropping {name}: does not fit {romsd_format} ROMSD packing')
         print(f'[Texture Packing] {self.texture_packing}')
         
         # Determine target resolution from the first available texture
@@ -513,31 +470,11 @@ class TextureDataset(torch.nn.Module):
             if source_mip == mip:
                 base_cache.append(self.mip_cache[mip].clone())
                 continue
-            low_h = self.texture_height // (2 ** source_mip)
-            low_w = self.texture_width // (2 ** source_mip)
             low = self.mip_cache[source_mip].permute(2, 0, 1)[None].float()
             upsampled = resize_bilinear_repeat(low, (out_h, out_w))
             base_cache.append(upsampled.squeeze(0).permute(1, 2, 0))
         return base_cache
     
-    def get_output_loss_weights(self, config_weights: Optional[Dict[str, float]] = None) -> List[float]:
-        """Generate per-channel loss weights based on the actually loaded textures.
-        
-        Args:
-            config_weights: Optional dict mapping texture_type -> loss_weight from config.
-                           If provided, overrides the default weights in texture_configs.
-        """
-        weights = []
-        for tex_type in self.available_textures:
-            cfg = self.texture_configs[tex_type]
-            n_ch = cfg['expected_channels']
-            # Priority: config_weights > texture_configs
-            if config_weights and tex_type in config_weights:
-                w = config_weights[tex_type]
-            else:
-                w = cfg.get('loss_weight', 1.0)
-            weights.extend([w] * n_ch)
-        return weights
 
     def expand_to_canonical(self, x: torch.Tensor) -> torch.Tensor:
         """Expand the last dimension to canonical channels, filling absent textures with 0."""
@@ -548,14 +485,6 @@ class TextureDataset(torch.nn.Module):
             out[..., canon_start:canon_end] = x[..., ds_start:ds_end]
         return out
 
-    def expand_mip_to_canonical(self, mip_tensor: TensorType["num_mips", "H", "W", "num_channels"]) -> TensorType["num_mips", "H", "W", 11]:
-        """Expand mip_cache [num_mips, H, W, num_channels] to [num_mips, H, W, canonical_channels]; fill missing with 0."""
-        if isinstance(mip_tensor, list):
-            return [self.expand_to_canonical(level) for level in mip_tensor]
-        return self.expand_to_canonical(mip_tensor)
-
-    def expand_mip_to_canonical_level(self, mip_tensor: torch.Tensor) -> torch.Tensor:
-        return self.expand_to_canonical(mip_tensor)
 
     def get_canonical_loss_weights(self, config_weights: Optional[Dict[str, float]] = None) -> List[float]:
         """Return per-channel loss weights of canonical length; channels for missing textures are 0."""

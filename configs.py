@@ -3,42 +3,19 @@ import json
 import difflib
 import math
 import os
-import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
 import yaml
 from Core.Feature_Grid.feature_grid import FeatureGridSpec
+from Core.Material_Encoding.compression import DEFAULT_FORMATS, parse_material_formats
 
 
 def _normalize_astc_block(value: str) -> tuple[str, tuple[int, int]]:
     from Common.Block_Compression.astc import normalize_astc_block
     block=normalize_astc_block(value)
     return block,tuple(map(int,block.split('x')))
-
-
-def mip_sampling_probabilities(num_mips: int, mip0_only: bool, device: str = "cpu") -> torch.Tensor:
-    if num_mips < 1:
-        raise ValueError("num_mips must be at least 1")
-    if mip0_only:
-        probabilities = torch.zeros(num_mips, device=device)
-        probabilities[0] = 1.0
-        return probabilities
-
-    probabilities = []
-    current_prob = 1.0
-    for _ in range(num_mips):
-        current_prob /= 4.0
-        probabilities.append(max(current_prob, 0.05))
-    result = torch.tensor(probabilities, device=device)
-    return result / result.sum()
-
-
-def inference_mips(num_mips: int, mip0_only: bool) -> range:
-    if num_mips < 1:
-        raise ValueError("num_mips must be at least 1")
-    return range(1) if mip0_only else range(num_mips)
 
 
 def _load_yaml_defaults(config_path=None):
@@ -178,7 +155,6 @@ class Config():
         ### ---------- quantization configs ---------- ###
         self.quantize = True
         self.quantize_bits = params.quantize_bits
-        self.save_bits = params.save_bits
         # Feature-grid QAT: multiplicative noise schedule (ANA-style cosine anneal)
         self.qat_noise_schedule = str(getattr(params, "qat_noise_schedule", "cosine")).strip().lower()
         if self.qat_noise_schedule not in ("none", "cosine"):
@@ -214,10 +190,10 @@ class Config():
         self.astc_aware_enable = bool(params.astc_aware_enable)
         self.astc_codec_backend = backend
         self.astc_learning_rate = lr
-        ### ---------- feature gradient configs ---------- ###
-        self.feature_gradient_count = int(params.feature_gradient_count)
-        if self.feature_gradient_count not in (0, 2, 4, 8, 24):
-            raise ValueError("feature_gradient_count must be 0, 2, 4, 8 or 24")
+        ### ---------- FNTC tile configs ---------- ###
+        self.fntc_tile_size = params.fntc_tile_size
+        if self.fntc_tile_size < 1:
+            raise ValueError('fntc_tile_size must be positive')
 
         ### ---------- tile cnn configs ---------- ###
         self.material_cnn_enable = params.material_cnn_enable
@@ -259,7 +235,6 @@ class Config():
         self.eval_interval = params.eval_interval
         self.save_interval = params.save_interval
         self.eval_inference_tile = params.eval_inference_tile
-        self.eval_metrics_max_edge = params.eval_metrics_max_edge
         self.mip0_only = bool(getattr(params, "mip0_only", False))
 
         ### ---------- early stopping configs ---------- ###
@@ -270,7 +245,7 @@ class Config():
                      'n_neurons', 'pos_encoding_tile_size'):
             if getattr(params, name) <= 0:
                 raise ValueError(f'{name} must be positive')
-        for name in ('n_frequencies', 'n_hidden_layers', 'eval_inference_tile', 'eval_metrics_max_edge'):
+        for name in ('n_frequencies', 'n_hidden_layers', 'eval_inference_tile'):
             if getattr(params, name) < 0:
                 raise ValueError(f'{name} must be nonnegative')
         for name in ('learning_rate', 'qat_noise_mult_start', 'qat_noise_mult_end',
@@ -326,8 +301,7 @@ class Config():
 
         # Learned feature grids.
         default_feature_grids = [
-            {"max_resolution": 1024, "format": "astc6x6", "quantize_bits": 8, "save_bits": 32, "learning_rate": 0.005},
-            #{"max_resolution": 512, "quantize_bits": 8, "save_bits": 32, "learning_rate": 0.005},
+            {"max_resolution": 1024, "format": "astc6x6", "quantize_bits": 8, "learning_rate": 0.005},
         ]
         self.feature_grid_configs = default_feature_grids if params.feature_grid_configs is None else params.feature_grid_configs
         if (not isinstance(self.feature_grid_configs, list) or not self.feature_grid_configs
@@ -364,14 +338,21 @@ class Config():
         self.output_loss_weights: Optional[List[float]] = None
         self.network_learning_rate = params.learning_rate
 
-        ### ---------- ASTC comparison (vs traditional round-trip) ---------- ###
-        self.enable_astc_compare = bool(params.enable_astc_compare)
+        ### ---------- material baseline ---------- ###
+        self.enable_material_compare = bool(params.enable_material_compare)
+        self.material_compare_interval = params.material_compare_interval
+        if self.material_compare_interval < 1:
+            raise ValueError('material_compare_interval must be positive')
+        self.material_compression_formats = {group: fmt.name for group,fmt in parse_material_formats(params.material_compression_formats).items()}
         self.astcenc_path = params.astcenc_path
         self.astcenc_quality = params.astcenc_quality
         self.astc_block, _ = _normalize_astc_block(params.astc_block)
-        self.ref_astc_resolution = getattr(params, "ref_astc_resolution", None)
-        if self.ref_astc_resolution is not None and self.ref_astc_resolution <= 0:
-            raise ValueError('ref_astc_resolution must be positive')
+        self.material_compare_resolution = getattr(params, "material_compare_resolution", None)
+        if self.material_compare_resolution is not None and self.material_compare_resolution <= 0:
+            raise ValueError('material_compare_resolution must be positive')
+
+        ### ---------- FNTC tile recompression ---------- ###
+        self.material_recompression_enable = params.material_recompression_enable
 
         ### ---------- PBR scene comparison ---------- ###
         self.enable_pbr_compare = bool(getattr(params, "enable_pbr_compare", False))
@@ -442,6 +423,9 @@ class Config():
             GridCompression.from_config(g)
             for g in raw_grids
         )
+        if not self.mip0_only:
+            raise ValueError('Block-compressed deployment currently requires mip0_only: true; '
+                             'multi-Mip training/export is not implemented')
         processed = []
         for cfg, recipe in zip(raw_grids, recipes):
             cfg = dict(cfg)
@@ -452,7 +436,7 @@ class Config():
             if recipe.format == 'astc':
                 cfg.setdefault('n_features_per_level', 4)
             spec = FeatureGridSpec.from_config(
-                cfg, self.quantize_bits, self.save_bits, self.learning_rate
+                cfg, self.quantize_bits, self.learning_rate
             )
             if (
                 recipe.format == "bc1"
@@ -465,9 +449,9 @@ class Config():
                     n_levels=1 if self.mip0_only else spec.n_levels,
                     n_features_per_level=spec.n_features_per_level,
                     quantize_bits=spec.quantize_bits,
-                    save_bits=spec.save_bits,
                     learning_rate=spec.learning_rate,
                     interpolation=spec.interpolation,
+                    feature_gradient_count=spec.feature_gradient_count,
                     **recipe.as_config(),
                 )
             )
@@ -504,15 +488,6 @@ class Config():
             and g["n_features_per_level"] == 4
             and not (i == 0 and self.direct_diffuse_infer_mode != "disable")
         )
-
-    @property
-    def native_astc_only(self):
-        return len(self.native_astc_grids) == len(self.grid_compressions)
-
-    @property
-    def latent_format(self):
-        families = {r.format for r in self.grid_compressions}
-        return next(iter(families)) if len(families) == 1 else "mixed"
 
     def make_group_config(self, group_name: str) -> "Config":
         """Create a shallow copy of this Config with data_dir and save_dir
@@ -579,9 +554,6 @@ def get_args():
     parser.add_argument('--bcn_aware_enable', dest='bcn_aware_enable', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--bcn_learning_rate', dest='bcn_learning_rate', type=float, default=0.01,
                         help='Adam learning rate in RGB565/selector code units')
-    parser.add_argument('--save_bits', type=int, default=32,
-                        help='choose the bits to quantize',
-                        choices=[8, 16, 32])
     parser.add_argument(
         '--qat_noise_schedule',
         type=str,
@@ -621,11 +593,9 @@ def get_args():
     group.add_argument("--astc_decoder_projection_interval", type=int, default=500,
                         help="proxy material projection interval; 0 disables it")
 
-    ### ---------- feature gradient configs ---------- ###
-    group = parser.add_argument_group("feature gradient configs")
-    group.add_argument('--feature_gradient_count', type=int, choices=[0, 2, 4, 8, 24], default=0,
-                       help='feature differences: 0 off, 2 right/down, 4 axial, 8 3x3, 24 5x5; '
-                            'multi-stage training applies them during decoder fitting')
+    ### ---------- FNTC tile configs ---------- ###
+    parser.add_argument('--fntc_tile_size', type=int, default=128,
+                        help='material tile edge in inference texels, shared by CNN fitting/inference and tile compression')
 
     ### ---------- tile cnn configs ---------- ###
     group = parser.add_argument_group("tile cnn configs")
@@ -666,12 +636,10 @@ def get_args():
                         help='iteration interval for saving model')
     parser.add_argument('--eval_inference_tile', type=int, default=512,
                         help='eval/infer: tile edge in pixels (0 = one batch over full plane, may OOM)')
-    parser.add_argument('--eval_metrics_max_edge', type=int, default=0,
-                        help='area-downsample to this max(H,W) before PSNR/SSIM/LPIPS (0 = full res)')
     parser.add_argument('--mip0_only', action=argparse.BooleanOptionalAction, default=False,
                         help='restrict training samples, loss, inference metrics, and comparisons to Mip0')
     parser.add_argument('--feature_grid_configs', type=yaml.safe_load, default=None,
-                        help='YAML list of learned feature-grid configs')
+                        help='YAML list of feature grids; each accepts feature_gradient_count: 0, 2, 4, 8 or 24')
     parser.add_argument('--texture_loss_weights', type=yaml.safe_load, default=None,
                         help='YAML mapping of per-texture loss/eval weights')
 
@@ -683,18 +651,27 @@ def get_args():
     parser.add_argument('--early_stop_psnr_threshold', type=float, default=0.01,
                         help='minimum PSNR improvement (in dB) between two consecutive segments; training stops if improvement is below this value')
 
-    ### ---------- ASTC comparison configs ---------- ###
-    parser.add_argument('--enable_astc_compare', action=argparse.BooleanOptionalAction, default=True,
-                        help='enable ASTC comparison (official astcenc roundtrip)')
+    ### ---------- material baseline configs ---------- ###
+    parser.add_argument('--enable_material_compare', action=argparse.BooleanOptionalAction, default=True,
+                        help='report FNTC material and conventional per-group compression metrics')
+    parser.add_argument('--material_compare_interval', type=int, default=5000,
+                        help='iteration interval for material comparisons, independent of checkpoint saving')
+    parser.add_argument('--material_compression_formats', type=yaml.safe_load,
+                        default=DEFAULT_FORMATS.copy(),
+                        help='per-group baseline and FNTC tile formats: diffuse, normal, romsd')
     parser.add_argument('--astcenc_path', type=str, default='tools/astcenc',
                         help='astcenc executable path or directory. If path does not exist, astcenc will be auto-downloaded there')
     parser.add_argument('--astcenc_quality', type=str, default='medium',
                         choices=['fastest', 'fast', 'medium', 'thorough', 'exhaustive'],
-                        help='astcenc quality preset for ASTC comparison')
+                        help='quality preset for ASTC latent, SR base and ASTC material formats')
     parser.add_argument('--astc_block', type=str, default='6x6',
-                        help='ASTC block size, e.g. 4x4 / 6x6 / 8x8')
-    parser.add_argument('--ref_astc_resolution', type=int, default=None,
-                        help='shared FNTC inference / ASTC source max edge; omit to use the native material size')
+                        help='shared SR base ASTC block size, independent of material and latent formats')
+    parser.add_argument('--material_compare_resolution', type=int, default=None,
+                        help='shared FNTC tile and baseline source max edge; omit to use the native material size')
+
+    ### ---------- FNTC tile recompression configs ---------- ###
+    parser.add_argument('--material_recompression_enable', action=argparse.BooleanOptionalAction, default=True,
+                        help='compress inferred FNTC tiles using the same formats as the baseline; selects the core metric')
 
     ### ---------- PBR scene comparison configs ---------- ###
     parser.add_argument('--enable_pbr_compare', action=argparse.BooleanOptionalAction, default=False,
@@ -770,7 +747,7 @@ def write_resolved_config(configs, directory) -> None:
     """Persist scalar/list/dict config values so log analyzers can recover run settings."""
     out = {}
     for key, value in vars(configs).items():
-        if key.startswith("_") or key in ("grid_compressions", "grid_training"):
+        if key.startswith("_") or key in ('grid_compressions', 'grid_training'):
             continue
         if isinstance(value, (str, int, float, bool)) or value is None:
             out[key] = value

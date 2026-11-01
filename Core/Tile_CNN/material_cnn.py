@@ -3,18 +3,22 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+from Core.Feature_Grid.sampling import tile_regions
 
 
 class MaterialCNN(nn.Module):
-    version = 2
+    version = 3
     mode = 'native_material_residual_leaky_relu_0.01_repeat_clamp'
 
-    def __init__(self, channels=10, hidden=16, rounds=2, inference_size=None):
+    def __init__(self, channels=10, hidden=16, rounds=2, inference_size=None, tile_size=128):
         super().__init__()
         if channels not in (10, 11) or hidden < 1 or rounds not in (1, 2):
             raise ValueError('MaterialCNN requires 10/11 canonical channels, positive hidden width and 1/2 rounds')
         self.channels, self.hidden, self.rounds = channels, hidden, rounds
         self.halo = rounds
+        if not isinstance(tile_size, int) or isinstance(tile_size, bool) or tile_size < 1:
+            raise ValueError('Material CNN tile size must be a positive integer')
+        self.register_buffer('tile_size', torch.tensor(tile_size, dtype=torch.int64))
         if inference_size is not None and (len(inference_size) != 2 or any(n < 1 for n in inference_size)):
             raise ValueError('Material CNN inference size must contain two positive dimensions')
         self.register_buffer('inference_size', torch.tensor(inference_size or (0, 0), dtype=torch.int64))
@@ -40,6 +44,9 @@ class MaterialCNN(nn.Module):
                              'use the original inference resolution or refit the CNN')
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        tile = state_dict.get(prefix+'tile_size')
+        if tile is None or tile.ndim != 0 or tile.dtype != torch.int64 or int(tile) != int(self.tile_size):
+            raise ValueError('Material CNN checkpoint tile size does not match configuration')
         key = prefix + 'inference_size'
         if key in state_dict:
             self.validate_size(tuple(state_dict[key].tolist()))
@@ -51,21 +58,13 @@ class MaterialCNN(nn.Module):
         ix = torch.arange(x-radius, x+width+radius, device=image.device) % image.shape[-1]
         return image[..., iy[:, None], ix[None, :]]
 
+
     def forward(self, image):
         self.validate_size(image.shape[-2:])
-        return self.valid(self._patch(image, 0, 0, *image.shape[-2:], self.halo))
-
-    def tiled(self, image, tile_size=128):
-        self.validate_size(image.shape[-2:])
-        if tile_size < 1:
-            return self(image)
         height, width = image.shape[-2:]
         result = torch.empty_like(image)
-        for y in range(0, height, tile_size):
-            h = min(tile_size, height-y)
-            for x in range(0, width, tile_size):
-                w = min(tile_size, width-x)
-                result[..., y:y+h, x:x+w] = self.valid(self._patch(image, y, x, h, w, self.halo))
+        for y,x,h,w in tile_regions(height,width,int(self.tile_size)):
+            result[..., y:y+h, x:x+w] = self.valid(self._patch(image, y, x, h, w, self.halo))
         return result
 
     def export_arrays(self):
@@ -78,7 +77,7 @@ class MaterialCNN(nn.Module):
 
     @classmethod
     def from_arrays(cls, arrays):
-        model = cls(*map(int, arrays['material_cnn_shape']))
+        model = cls(*map(int, arrays['material_cnn_shape']), tile_size=int(arrays['material_cnn_tile_size']))
         if (int(arrays['material_cnn_version']) != cls.version
                 or str(arrays['material_cnn_mode']) != cls.mode):
             raise ValueError('Unsupported material CNN export')

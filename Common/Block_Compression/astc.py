@@ -91,50 +91,9 @@ class ASTCCodec:
             return np.array(Image.open(target).convert("RGBA"), dtype=np.uint8, copy=True)
 
     def roundtrip_rgba(self, rgba: np.ndarray) -> np.ndarray:
-        return astc_roundtrip_rgba(
-            rgba=rgba,
-            astcenc_executable=self.ensure_executable(),
-            astcenc_quality=self.astcenc_quality,
-            astc_block=self.astc_block,
-        )
-
-
-def astc_roundtrip_rgba(
-    rgba: np.ndarray,
-    astcenc_executable: str,
-    astcenc_quality: str,
-    astc_block: str,
-) -> np.ndarray:
-    h, w, c = rgba.shape
-    if c != 4:
-        raise ValueError(f"Expected RGBA input with 4 channels, got {c}.")
-    rgba_u8 = np.asarray(rgba, dtype=np.uint8)
-    block = normalize_astc_block(astc_block)
-
-    with tempfile.TemporaryDirectory(prefix=f"astc_{block}_") as tmp_dir:
-        input_png = os.path.join(tmp_dir, "input_rgba.png")
-        output_astc = os.path.join(tmp_dir, f"output_{block}.astc")
-        output_png = os.path.join(tmp_dir, "output_rgba.png")
-
-        Image.fromarray(rgba_u8).save(input_png)
-        enc_cmd = [astcenc_executable, "-cl", input_png, output_astc, block, f"-{astcenc_quality}"]
-        dec_cmd = [astcenc_executable, "-dl", output_astc, output_png]
-
-        try:
-            subprocess.run(enc_cmd, check=True, capture_output=True, text=True)
-            subprocess.run(dec_cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as exc:
-            stderr_msg = (exc.stderr or "").strip()
-            stdout_msg = (exc.stdout or "").strip()
-            details = stderr_msg if stderr_msg else stdout_msg
-            raise RuntimeError(
-                f"astcenc roundtrip failed with command '{' '.join(exc.cmd)}'. Details: {details}"
-            ) from exc
-
-        decoded = np.array(Image.open(output_png).convert("RGBA"), dtype=np.uint8, copy=True)
-        if decoded.shape[0] != h or decoded.shape[1] != w:
-            decoded = decoded[:h, :w, :]
-        return decoded
+        if rgba.ndim != 3 or rgba.shape[-1] != 4:
+            raise ValueError('Expected an HWC RGBA image')
+        return self.decode_bytes(self.encode_rgba(rgba))
 
 
 def resolve_astcenc_executable(astcenc_path: str) -> str:

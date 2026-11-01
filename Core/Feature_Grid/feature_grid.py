@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Dict
 
 import torch
+from .feature_gradients import gradient_directions
 
 
 @dataclass(frozen=True)
@@ -19,23 +20,24 @@ class FeatureGridSpec:
     n_levels: int
     n_features_per_level: int
     quantize_bits: int
-    save_bits: int
     learning_rate: float
     interpolation: str = "Linear"
     base_resolution: int = 1
+    feature_gradient_count: int = 0
 
     def __post_init__(self):
+        gradient_directions(self.feature_gradient_count)
         if self.interpolation != 'Linear':
             raise ValueError('FNTC only supports bilinear feature sampling; use interpolation: Linear '
                              'or omit interpolation')
 
     @classmethod
-    def from_config(cls, cfg: Dict, default_quantize_bits: int, default_save_bits: int, default_lr: float) -> "FeatureGridSpec":
-        unknown = set(cfg) - {'max_resolution', 'n_levels', 'n_features_per_level', 'quantize_bits', 'save_bits',
-                              'learning_rate', 'interpolation', 'format'}
+    def from_config(cls, cfg: Dict, default_quantize_bits: int, default_lr: float) -> "FeatureGridSpec":
+        unknown = set(cfg) - {'max_resolution', 'n_levels', 'n_features_per_level', 'quantize_bits',
+                              'learning_rate', 'interpolation', 'format', 'feature_gradient_count'}
         if unknown:
             raise ValueError(f'Unknown feature_grid_configs keys: {sorted(unknown)}')
-        for name in ('max_resolution', 'n_levels', 'n_features_per_level', 'quantize_bits', 'save_bits'):
+        for name in ('max_resolution', 'n_levels', 'n_features_per_level', 'quantize_bits'):
             if name in cfg and (not isinstance(cfg[name], int) or isinstance(cfg[name], bool)):
                 raise ValueError(f'feature_grid_configs.{name} must be an integer')
         lr = cfg.get('learning_rate', default_lr)
@@ -47,17 +49,12 @@ class FeatureGridSpec:
         default_levels = max(1, max_res.bit_length() - 2)
         n_levels = int(cfg.get("n_levels", default_levels))
         qbits = int(cfg.get("quantize_bits", default_quantize_bits))
-        sbits = int(cfg.get("save_bits", default_save_bits))
         if n_levels <= 0 or n_levels > max_res.bit_length():
             raise ValueError(
                 f"n_levels must be in [1, {max_res.bit_length()}] for max_resolution={max_res}"
             )
         if qbits not in (2, 4, 8):
-            raise ValueError("quantize_bits must be one of 2, 4, 8 for RGBA8 DDS export")
-        if sbits not in (8, 16, 32) or sbits < qbits:
-            raise ValueError("save_bits must be one of 8, 16, 32 and >= quantize_bits")
-        if sbits % qbits != 0:
-            raise ValueError("save_bits must be divisible by quantize_bits")
+            raise ValueError("quantize_bits must be one of 2, 4, 8")
         channels = int(cfg.get('n_features_per_level', 4))
         if channels not in (1, 2, 4, 8):
             raise ValueError('n_features_per_level must be 1, 2, 4 or 8 (tiny-cuda-nn supported sizes)')
@@ -67,10 +64,10 @@ class FeatureGridSpec:
             n_levels=n_levels,
             n_features_per_level=channels,
             quantize_bits=qbits,
-            save_bits=sbits,
             learning_rate=float(cfg.get("learning_rate", default_lr)),
             interpolation=str(cfg.get("interpolation", "Linear")),
             base_resolution=base_res,
+            feature_gradient_count=cfg.get('feature_gradient_count', 0),
         )
 
     def level_resolution(self, level: int) -> int:
@@ -115,18 +112,6 @@ def quantize_feature_ste(params: torch.Tensor, spec: FeatureGridSpec) -> torch.T
     """Use export's quantization grid in forward and identity gradients in backward."""
     quantized = quantize_feature_tensor(params, spec)
     return params + (quantized - params).detach()
-
-
-def feature_tensor_to_int(params: torch.Tensor, spec: FeatureGridSpec) -> torch.Tensor:
-    """Map feature floats to integer quantization codes [0, 2^qbits - 1]."""
-    n = spec.quant_step_count
-    ints = torch.round((params - spec.quant_min) * n)
-    return torch.clamp(ints, min=0.0, max=float(n - 1)).to(torch.int64)
-
-
-def int_to_feature_tensor(values: torch.Tensor, spec: FeatureGridSpec) -> torch.Tensor:
-    """Map integer quantization codes back to feature-space floats."""
-    return torch.clamp(values.float() / float(spec.quant_step_count) + spec.quant_min, min=spec.quant_min, max=spec.quant_max)
 
 
 def feature_to_unorm(x: torch.Tensor, spec: FeatureGridSpec) -> torch.Tensor:

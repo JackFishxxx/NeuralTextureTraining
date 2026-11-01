@@ -66,7 +66,7 @@ class TrainingCheckpoint:
 # Only the saved stage's architecture and resolved raster settings override
 # the caller. Reporting, output paths and other run options stay explicit.
 PHASE_CONFIG_KEYS = (
-    'n_hidden_layers', 'n_frequencies', 'feature_gradient_count', 'material_cnn_enable',
+    'n_hidden_layers', 'n_frequencies', 'feature_grid_configs', 'material_cnn_enable',
     'num_mips', 'num_channels', 'pos_encoding_reference_edge',
     'material_cnn_inference_size', 'material_reconstruction_size',
 )
@@ -88,7 +88,7 @@ def training_recipe(config):
     ignored = {'load_dir', 'load_iter', 'save_dir', 'data_dir', 'mode', 'device', 'warm_start',
                'num_channels', 'num_mips', 'pos_encoding_reference_edge', 'material_reconstruction_size',
                'material_cnn_inference_size', 'output_loss_weights', 'save_interval',
-               'enable_astc_compare', 'eval_inference_tile'}
+               'enable_material_compare', 'material_compare_interval', 'eval_inference_tile'}
     result = {k: v for k, v in config_values(config).items() if k not in ignored and not k.startswith('groups_')}
     result['grid_training'] = [asdict(p) for p in config.grid_training]
     return result
@@ -146,7 +146,7 @@ def save_training_state(trainer, iteration):
         last_training_stats=trainer.last_training_stats,
         optimizer=model.optimizer.state_dict(),
         scheduler=model.scheduler.state_dict() if model.scheduler is not None else None,
-        codec=trainer._astc_block_optimizer.state_dict() if trainer._astc_block_optimizer is not None else None,
+        codec=trainer._grid_compression_optimizer.state_dict() if trainer._grid_compression_optimizer is not None else None,
         frozen_features=model._decoder_adaptation_features is not None,
         decoder_source_grad=getattr(trainer, '_decoder_source_grad', None),
         requires_grad={name: p.requires_grad for name, p in model.named_parameters()},
@@ -169,8 +169,8 @@ def restore_training_state(trainer, state):
     else:
         model.scheduler.load_state_dict(state['scheduler'])
     if state['codec'] is not None:
-        trainer._ensure_astc_proxy()
-        trainer._astc_block_optimizer.load_state_dict(state['codec'])
+        trainer._ensure_grid_proxies()
+        trainer._grid_compression_optimizer.load_state_dict(state['codec'])
     if state['phase'] is not None:
         trainer._reset_training_phase(state['phase']['phase'], state['phase']['start'])
         trainer._phase_control.load_state_dict(state['phase'])

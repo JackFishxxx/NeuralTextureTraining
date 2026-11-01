@@ -23,13 +23,15 @@ subpixel_jitter: 0.5
 feature_grid_configs:
   - max_resolution: 1024
     format: astc6x6  # astc6x6 | astc4x4 | BC1
+    feature_gradient_count: 0  # 0 off | 2 right/down | 4 axial | 8 3x3 | 24 5x5
     learning_rate: 0.0005
   - max_resolution: 1024
     format: astc6x6
+    feature_gradient_count: 0
     learning_rate: 0.001
 
-# ---------- feature gradient configs ----------
-feature_gradient_count: 0  # 0 off | 2 right/down | 4 axial | 8 3x3 | 24 5x5
+# ---------- FNTC tile configs ----------
+fntc_tile_size: 128  # inference material texels; shared by CNN and tile recompression
 
 # ---------- tile cnn configs ----------
 material_cnn_enable: false  # train after representation -> decoder -> layout_refit; load for inference
@@ -66,8 +68,17 @@ multi_stage_training_decoder_steps: 50000
 multi_stage_training_decoder_lr_multiplier: 1.0
 multi_stage_training_layout_refit_steps: 1000  # offline latent/layout pass; 0 disables
 
-# ---------- ASTC comparison configs ----------
-ref_astc_resolution: 1024
+# ---------- material baseline configs ----------
+enable_material_compare: true
+material_compare_interval: 5000
+material_compare_resolution: 1024
+material_compression_formats:
+  diffuse: BC7
+  normal: BC5
+  romsd: BC1
+
+# ---------- FNTC tile recompression configs ----------
+material_recompression_enable: true  # reuse material_compression_formats from the baseline
 
 # ---------- PBR scene comparison configs ----------
 enable_pbr_compare: true

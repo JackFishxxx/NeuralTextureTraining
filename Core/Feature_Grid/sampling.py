@@ -6,6 +6,15 @@ import torch
 import torch.nn.functional as F
 
 
+def tile_regions(height, width, tile_size):
+    """Yield (y, x, height, width), including partial tiles on the right and bottom."""
+    if not isinstance(tile_size, int) or isinstance(tile_size, bool) or tile_size < 1:
+        raise ValueError('Tile size must be a positive integer')
+    for y in range(0, height, tile_size):
+        for x in range(0, width, tile_size):
+            yield y, x, min(tile_size, height-y), min(tile_size, width-x)
+
+
 def bilinear_texel_corners(uv, resolution):
     resolution = torch.as_tensor(resolution, device=uv.device, dtype=uv.dtype)
     if resolution.ndim < 2:
@@ -18,25 +27,6 @@ def bilinear_texel_corners(uv, resolution):
     tx, ty = fraction.unbind(1)
     weights = torch.stack(((1-tx)*(1-ty), tx*(1-ty), (1-tx)*ty, tx*ty), 1)
     return corners, weights
-
-
-def texel_aligned_grid_uv(uvs: torch.Tensor, selected_level, base_res: int) -> torch.Tensor:
-    """Map texel-center UVs to tiny-cuda-nn dense-grid point coordinates."""
-    if not torch.is_tensor(selected_level):
-        selected_level = torch.full((uvs.shape[0], 1), float(selected_level), device=uvs.device, dtype=uvs.dtype)
-    level_int = torch.round(selected_level).to(torch.int64)
-    res = int(base_res) * torch.pow(
-        torch.full_like(selected_level, 2.0),
-        level_int.to(dtype=selected_level.dtype),
-    )
-    if bool(torch.all(res <= 1)):
-        return torch.zeros_like(uvs)
-    scale = torch.clamp(res - 1.0, min=1.0)
-    # tiny-cuda-nn evaluates grid position = input * (resolution-1) + .5.
-    # Cancel its .5 offset so a texture center samples its stored texel.
-    # The first texel intentionally uses a small negative encoding input;
-    # its resulting grid position is zero, not a wrapped negative index.
-    return ((uvs * res - 0.5).clamp(min=0.0).minimum(res - 1.0) - 0.5) / scale
 
 
 def bilinear_repeat(image: torch.Tensor, uv_grid: torch.Tensor) -> torch.Tensor:

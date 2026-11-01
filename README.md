@@ -1,13 +1,13 @@
 # NeuralTexture Training Code
 
-This project trains FNTC neural texture models with [PyTorch](https://pytorch.org/get-started/locally/) and [tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn), including quantization-aware training and model export. The current FNTC entry requires tiny-cuda-nn and an NVIDIA GPU; this checkout does not include a standalone CPU training implementation.
+This project trains FNTC neural texture models with [PyTorch](https://pytorch.org/get-started/locally/) and [tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn), including quantization-aware training and compressed model export.
 
 ## What is Neural Texture?
 
 Neural Texture (NTC) is a network-based method for texture representation and compression. Unlike traditional formats such as PNG, JPEG, or ASTC, Neural Texture combines a **feature grid** with a small **MLP (multi-layer perceptron)** to compactly store and reconstruct high-resolution texture information, while still supporting random access to texels. Its advantages include:
 
 - **High compression ratio**: preserves more detail at equal or lower storage cost.
-- **Scalability**: supports multi-resolution, Mips, and joint representation with material parameters.
+- **Scalability**: supports multiple latent resolutions and joint representation of material parameters.
 - **Versatility**: applicable not only to albedo maps but also normal maps, roughness maps, and other material textures.
 
 ### Motivation and Tiered Deployment
@@ -15,13 +15,11 @@ Neural Texture (NTC) is a network-based method for texture representation and co
 As real-time content increasingly adopts 2K, 4K, and higher-resolution textures, material maps become a major contributor to game package size, patch bandwidth, and runtime memory usage.
 Simply increasing the compression ratio of conventional texture formats can introduce detail loss, block artifacts, or platform-specific compatibility constraints. This motivates a tiered representation strategy that balances visual quality, hardware coverage, and deployment cost.
 
-This project keeps 1K-and-below textures in established block-compressed formats such as ASTC for compatibility with existing assets, mobile platforms, and performance-constrained devices.
-On higher-end PCs, 2K/4K textures can instead be reconstructed at runtime through neural texture inference rather than stored as complete high-resolution bitmaps. FNTC combines shared texture group features in a feature grid with a low-resolution source mip that is already required by the asset pipeline. 
-The mip provides the low-frequency base after bilinear upsampling, while a small MLP predicts the high-frequency residual that bilinear interpolation cannot recover. Because this low-resolution mip is reused from the existing asset chain, the additional FNTC representation cost is concentrated in the feature texture and network parameters, while the traditional ASTC path remains available as a compatibility fallback.
+FNTC stores a material group as compressed latent textures and a small decoder. Optional residual super-resolution adds a low-resolution source mip for the low-frequency base, with the decoder predicting additional detail. The PC and Mobile presets configure latent formats and training settings for their target platforms; conventional material baselines provide a direct quality and storage comparison.
 
 ### Differences from NVIDIA NTC SDK
 
-In February 2025, NVIDIA open-sourced the [RTXNTC SDK](https://github.com/NVIDIA-RTX/Rtxntc), providing official support for Neural Texture. However, this project differs from RTXNTC in several ways:
+This project differs from NVIDIA's [RTXNTC SDK](https://github.com/NVIDIA-RTX/Rtxntc) in several ways:
 
 - **NTC SDK**
   - Requires specialized GPU primitives such as **CoopVec** and **CoopMat** to accelerate inference.
@@ -29,22 +27,26 @@ In February 2025, NVIDIA open-sourced the [RTXNTC SDK](https://github.com/NVIDIA
 
 - **This project**
   - Does **not** rely on CoopVec or CoopMat. Instead, it is implemented directly with PyTorch and tiny-cuda-nn, making it simpler and easier to understand.
-  - Provides **[full UE5 plugin integration - branch 5.5.1-FNTC](https://github.com/JackFishxxx/UnrealEngine/tree/5.5.1-FNTC) **: Neural Textures can be imported as custom resources (feature grids as R8G8B8A8 DDS textures and network parameters in `network_data.npz`) and directly sampled in the material system.
+  - Exports compressed latent textures and `network_data.npz` for engine integration. See the [UE5 FNTC branch](https://github.com/JackFishxxx/UnrealEngine/tree/5.5.1-FNTC) for engine-side work.
   - Supports the entire pipeline of training, quantization, and export, suitable for both research and production use.
 
 ---
 
 ## Core Modules
 
-`model.py` assembles the feature and encoding modules with the decoder; `train.py` coordinates training with the ASTC-aware and multi-stage modules:
+`model.py` assembles the feature and encoding modules with the decoder; `train.py` coordinates training:
 
 | Directory | Responsibility |
 |---|---|
 | `Core/Feature_Grid/` | Grid layout, quantization/QAT noise, boundary constraints, shared sampling and feature gradients |
 | `Core/Positional_Encoding/` | Periodic UV sin/cos encoding |
-| `Core/Material_Encoding/` | Normal encoding, decoding and angular errors |
+| `Core/Material_Encoding/` | Normal encoding, angular errors and material channel packing/compression |
 | `Core/ASTC_Aware/` | Compression-aware training, latent ASTC round-trips and differentiable ASTC |
+| `Core/BCn_Aware/` | BC1 endpoint, selector and binary-alpha optimization |
+| `Core/Tile_CNN/` | Material CNN inference and fitting |
 | `Core/Multi_Stage_Training/` | Representation training, decoder fitting and layout refitting |
+| `Common/Block_Compression/` | Conventional ASTC and BC codecs |
+| `Common/Comparison/` | Material/PBR evaluation, method labels, metrics and screenshots |
 
 ## Installation
 
@@ -52,7 +54,7 @@ This project is implemented in Python. Please install Python first (we recommend
 
 ### Dependencies
 
-- Python 3.9+
+- Python 3.10+
 - PyTorch (matching your local CUDA version)
 - tiny-cuda-nn (required by the current FNTC model)
 - Others: `numpy`, `Pillow`, `torchvision`, `torchmetrics`, `torchtyping`, `tensorboardX`, `PyYAML`, `ninja`
@@ -79,7 +81,7 @@ pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/to
 Install remaining dependencies:
 
 ```bash
-pip install numpy Pillow torchvision torchmetrics torchtyping tensorboardX PyYAML ninja
+pip install numpy Pillow torchvision torchmetrics torchtyping tensorboardX PyYAML ninja ispc_texcomp==1.0.1 texture2ddecoder==1.0.6
 ```
 
 ---
@@ -123,7 +125,7 @@ For detailed naming conventions, keyword matching, and channel counts, refer to 
 
 ## Running
 
-Run commands from the project root. `configs.py` automatically loads `config_pc.yaml`; `--config path/to/recipe.yaml` selects another YAML, and CLI arguments override its values. PC uses `config_pc.yaml` by default; select Mobile with `--config config_mobile.yaml`. The default recipe enables Mip0, XY normals, residual SR, four feature gradients and multi-stage training. Per-grid entries in `feature_grid_configs` specify their own quantization/export precision.
+Run commands from the project root. `configs.py` loads `config_pc.yaml` by default; select another recipe with `--config`, for example `--config config_mobile.yaml`. CLI arguments override YAML values. The PC preset uses BC1 latent grids, XY normals, residual SR, multi-stage training and a material CNN. Each `feature_grid_configs` entry controls its format, quantization and feature gradients.
 
 ### Training
 
@@ -137,7 +139,7 @@ python train.py \
     --save_dir ./outputs
 ```
 
-To start single-stage training from a completed run's final checkpoint, reuse the YAML/CLI architecture that produced it and disable material projection. This loads model weights and starts new optimizer/scheduler state; it does not resume the multi-stage workflow or restore optimizer/RNG state:
+Use `--load_dir <run> --load_iter -1` with the original training recipe to resume model, optimizer, scheduler, codec, RNG and stage state from `training_state.pth`. Representation and decoder stages rebuild their saved architecture before loading. An interrupted layout pass restarts from the previous completed stage; CNN fitting has its own progress checkpoint. A completed stage is not trained again. To start a new single-stage experiment from weights, use `--warm_start` and the architecture that produced them:
 
 ```bash
 python train.py \
@@ -148,6 +150,7 @@ python train.py \
     --no-multi_stage_training_enable \
     --astc_decoder_projection_interval 0 \
     --load_iter -1 \
+    --warm_start \
     --load_dir outputs/yy_mm_dd_HH_MM_SS
 ```
 
@@ -184,12 +187,8 @@ Available GroupsBatching parameters:
 | `--groups_batching` | `False` | Enable GroupsBatching mode |
 | `--groups_batch_dir` | `data_batch` | Root directory containing texture group subdirectories |
 | `--groups_save_dir` | `save_batch` | Root directory for saving per-group results |
-| `--groups_max_workers` | `1` | Reserved; currently only sequential execution (`1`) is supported |
-| `--groups_verbose` | `False` | Reserved option; the current entry prints per-group logs directly |
 
 ### Evaluation
-
-ROMSD LPIPS is computed independently for each active scalar channel, then averaged.
 
 During training, evaluation metrics are automatically logged. For inference, reuse the architecture and material settings of the selected checkpoint; `--load_dir` is the run directory containing `models/`, and `--load_iter -1` selects its latest completed checkpoint:
 
@@ -218,11 +217,9 @@ tensorboard --logdir ./outputs
 The following metrics are logged automatically during training:
 
 - **Loss/train**: Training loss
-- **PSNR / SSIM / LPIPS**: Image quality metrics per Mip level
+- **PSNR / SSIM / LPIPS**: Mip0 quality metrics per material group; ROMSD LPIPS averages the independently evaluated scalar channels.
 
-Set `mip0_only: true` in `config_pc.yaml` (or pass `--mip0_only`) to restrict training samples and
-loss, inference metrics and visualizations, and comparison inputs to the full-resolution Mip0.
-The bundled `config_pc.yaml` sets this to `true`. Multi-Mip training requires `--no-mip0_only --no-multi_stage_training_enable --no-astc_aware_enable`; native reconstruction below GT resolution additionally requires Mip0.
+Training, block-compressed export and material comparisons use Mip0 (`mip0_only: true`).
 
 ---
 
@@ -236,14 +233,14 @@ The model constructs a canonical layout according to the selected normal encodin
 diffuse(3) | normal(3 or 2) | roughness(1) | occlusion(1) | metallic(1) | specular(1) | displacement(1)
 ```
 
-With the default `normal_encoding: xy`, the canonical layout has 10 channels; datasets that omit
-specular contain 9 active channels. Missing texture types are zero-filled automatically.
+With the default `normal_encoding: xy`, the canonical layout has 10 fixed channel slots.
+Missing or excluded texture types are zero-filled automatically.
 
-The dataset defines `texture_packing` once for diffuse, normal and one RGBA scalar texture (R/O/M/S/D order, unused components set to one); when all five scalars exist, displacement is excluded from data, losses and metrics. ASTC references and the compressed SR base execute this same mapping, exported with canonical channel slices in the run's `texture_packing.json`; network slots stay fixed and visualizations remain separate per active channel. Packed `ROMS` inputs use alpha for specular; `ROMD` inputs use alpha for displacement.
+The dataset defines `texture_packing` once for diffuse, normal and one scalar texture, with R/O/M/S/D priority and unused components set to one. BC1 retains at most three actual scalar maps; when capacity is exceeded, displacement is excluded first, then specular. Other formats retain up to four scalars. Excluded maps do not participate in training, metrics or screenshots. Material baselines and the compressed SR base use this mapping, exported with canonical channel slices in `texture_packing.json`. Network slots stay fixed. Packed `ROMS` inputs use alpha for specular; `ROMD` inputs use alpha for displacement.
 
 ### PSNR-Based Early Stopping
 
-Training compares validation PSNR at `--early_stop_interval` checkpoints, using compressed FNTC PSNR when ASTC comparison is enabled. Two consecutive improvements below the threshold stop an eligible phase; the decoder phase first reduces its learning rate as described below.
+Training selects models using the primary deployment method's weighted PSNR at `--early_stop_interval` checkpoints. `enable_material_compare` controls reports only. Two consecutive improvements below the threshold stop an eligible phase; the decoder phase first reduces its learning rate as described below.
 
 | Argument | Default | Description |
 |----------|:-------:|-------------|
@@ -257,16 +254,16 @@ Each new validation best is saved atomically to `models/best_<phase>.pth`; stand
 
 ### Multi-Stage Training
 
-Multi-stage training is enabled by default (`multi_stage_training_enable`; entry: `python -m Core.Multi_Stage_Training.multi_stage_training`). The default recipe runs:
+The PC preset enables `multi_stage_training_enable`. Run through `train.py` or `python -m Core.Multi_Stage_Training.multi_stage_training`:
 
-1. **Learn the representation (`representation`)**: train the feature grid with an affine decoder, without PE or feature gradients. After warmup, optimize legal ASTC endpoint/weight parameters to learn a compressed representation for material reconstruction.
-2. **Fit the decoder (`decoder`)**: freeze the learned ASTC representation and initialize a new decoder with one hidden layer of width 32 and four axial feature differences. Train the decoder on the decoded features and SR base, with a budget of 50,000 steps (`multi_stage_training_decoder_steps`; LR multiplier: `multi_stage_training_decoder_lr_multiplier`).
-3. **Refit latents and select block layouts (`layout_refit`)**: freeze the final decoder and optimize a temporary latent field, then re-encode it and select legal layouts per ASTC block. Validate at step 0, every 100 steps and the final step, retaining the best bitstream whose material and enabled-PBR PSNR/SSIM/LPIPS do not regress. The default budget is 1,000 steps (`multi_stage_training_layout_refit_steps`; 0 skips refinement), with no added inference cost.
+1. **Learn the representation (`representation`)**: train latent grids with an affine decoder, without PE or feature gradients. Each grid follows its BC1 or ASTC compression-aware training policy.
+2. **Fit the decoder (`decoder`)**: freeze the compressed latents and initialize the configured decoder with each grid's feature gradients and optional PE/SR inputs. `multi_stage_training_decoder_steps` controls the budget; `multi_stage_training_decoder_lr_multiplier` sets its LR multiplier.
+3. **Refit latents and select block layouts (`layout_refit`)**: freeze the decoder, optimize temporary latent fields and re-encode them. Native ASTC uses local block selection at integer GT/grid scales; other formats use whole-grid proposals. Validate at step 0, every 100 steps and the final step, retaining bitstreams whose material and enabled-PBR PSNR/SSIM/LPIPS do not regress. Set `multi_stage_training_layout_refit_steps: 0` to skip this stage.
 4. **Material CNN (`material_cnn`)**: refine reconstructed materials and retain the CNN only when it passes full-image quality validation.
 
 CNN inference must use the native material resolution used for training. Resume an interrupted CNN stage with the same data/configuration and `--mode train --load_dir <run-directory> --load_iter -1`. If the final model excludes the CNN, add `--no-material_cnn_enable` for inference.
 
-Layout refinement requires one RGBA proxy grid, SR and feature gradients, with integer GT/material resolution ratios; unsupported configurations are skipped. `multi_stage_training.json` records each stage's metrics/checkpoint and `final_metrics`.
+Layout refinement jointly accepts or rolls back all grids, including mixed ASTC/BC1 formats and different resolutions. SR and feature gradients are optional. `multi_stage_training.json` records each stage's metrics, checkpoint and `final_metrics`. Material CNN fitting is independent of feature gradients; `material_cnn_steps` controls its budget.
 
 ### Quantization-Aware Training (QAT)
 
@@ -279,17 +276,51 @@ Training simulates quantization error in the forward pass so the model adapts to
 
 - **Straight-Through Estimator (STE) Quantization**: The forward pass uses quantized values while gradients pass through unchanged, accurately simulating inference-time rounding and reducing color bias compared to additive noise.
 
+### Material baselines
+
+```yaml
+enable_material_compare: true
+material_compare_interval: 5000
+material_compare_resolution: 1024
+material_compression_formats:
+  diffuse: BC7
+  normal: BC5
+  romsd: BC1
+```
+
+Each material group accepts BC1/3/4/5/7 or a legal ASTC footprint such as `ASTC6x6`. Continuous channel capacity is validated; BC5 RGB normals reconstruct positive Z from XY. `diffuse` means BaseColor/Albedo. Choose BC3, BC7 or ASTC to retain four continuous scalar maps. This example produces the conventional baseline `Baseline_DiffuseBC7_NormalBC5_RomsdBC1`.
+
+### FNTC tile size
+
+```yaml
+fntc_tile_size: 128
+```
+
+Tile size is measured in inference material texels. CNN training/inference, FNTC recompression and conventional baselines share tile boundaries anchored at the top left. CNN tiles read a real neighbor halo to avoid seams. Right/bottom tiles keep their actual dimensions; each compressed tile is encoded independently and block padding is included in payload accounting. `eval_inference_tile` only limits MLP query batches and does not change material tile boundaries.
+
+Reports record `fntc_tile_size` and `tile_layout`. Multiple tiles export as `Diffuse_tile_<y>_<x>.dds`, etc.; a single tile retains `Diffuse.dds`. CNN checkpoints and NPZ exports preserve tile size and validate it during restoration.
+
+### FNTC tile recompression
+
+```yaml
+material_recompression_enable: true
+```
+
+Recompression uses `material_compression_formats` from the baseline section. Standalone titles include their actual format, e.g. `FNTC_Recompressed_BC7[DIFFUSE]`, with filenames such as `Diffuse_FNTC_Recompressed.png`.
+
+`FNTC_Uncompressed` is inference from compressed latent textures, before material recompression. `FNTC_Recompressed_DiffuseBC7_NormalBC5_RomsdBC1` applies the same per-group formats as `Baseline_DiffuseBC7_NormalBC5_RomsdBC1`. Recompression is enabled by default, making FNTC_Recompressed the primary deployment method; disabling it selects FNTC_Uncompressed. The reconstruction objective trains the decoder; conventional recompression is evaluated without differentiating through the codec.
+
+`[Material Test]` runs every `material_compare_interval` iterations independently of saving, early-stop windows or stage starts, with an additional terminal report. `Compare_Material/iter_<iteration>/` contains `metrics.json`, `metrics.csv`, annotated standalone images and strips; `tiles/<method>/` contains baseline/recompressed DDS or ASTC files. PBR compares all enabled methods under `Compare_PBRScene/iter_<iteration>/`: Scene uses `pbr_render_resolution`, and the separately rendered Scene Detail uses `pbr_detail_resolution`.
+
+For 2048 GT and a 1024 inference/baseline raster, every screenshot is 2048×2048: `Diffuse_GT[1024x1024].png`, `Diffuse_GT[2048x2048].png`, `Diffuse_BC7.png`, `Diffuse_FNTC_Uncompressed.png`, `Diffuse_FNTC_Recompressed.png`. Compression occurs at 1024 before bilinear upsampling and evaluation against full-resolution GT. The low-resolution GT image shows the prefiltered source before conventional compression. Every standalone image has metrics in its upper-left corner.
+
+PBR samples each method's native material raster and builds its mip chain at that resolution. GT retains its own resolution; the GT-sized screenshot images are used only for image metrics and output.
+
+FNTC storage counts compressed latents, decoder and CNN; material tile cache bytes are reported separately. Baseline storage counts compressed material payload. Containers and the shared SR base are excluded.
+
 ### ASTC-Aware Latent Training
 
-Training implementation is in `Core/ASTC_Aware`.
-
-Backends are `astcenc` and `astc_differentiable_proxy`. The latter uses legal ASTC decoding in forward and surrogate gradients in backward, implemented with CUDA. Only current backend names and the `astc_proxy` checkpoint format are supported.
-
-`astcenc` periodically encodes the currently sampled feature blocks on CPU.
-`astc_differentiable_proxy` directly trains legal endpoint/weight parameters on CUDA every step
-after warmup, with validated symbol searches and low-frequency material projection. Both use
-the existing reconstruction/PBR losses; LPIPS remains an evaluation metric. Backend dependencies
-resolve automatically. The default `config_pc.yaml` uses:
+`astcenc` uses periodic CPU encoding and straight-through gradients. `astc_differentiable_proxy` trains legal ASTC endpoint/weight parameters on CUDA after warmup, using exact decoding in forward and surrogate gradients in backward. Both use the material reconstruction/PBR losses; LPIPS is an evaluation metric. Configure ASTC grids with:
 
 ```yaml
 astc_aware_enable: true
@@ -300,57 +331,47 @@ astc_codec_in_loop_interval: 100
 astc_decoder_projection_interval: 500
 ```
 
-The codec interval and optional latent identity STE apply to the CPU backend. Setting the
-projection interval to 0 disables material projection. ASTC comparison uses the existing
-`astcenc_path`, `astcenc_quality` and `astc_block` settings.
+`astc_codec_in_loop_interval` controls CPU encoding frequency; CUDA updates run every step. Set `astc_decoder_projection_interval: 0` to disable material projection. `astcenc_path` and `astcenc_quality` configure ASTC encoding; `astc_block` controls the shared SR base footprint independently of each grid's `format` and the material baseline formats.
 
-ASTC exports under `Compare_ASTC<block>/iter_<iteration>/` (for example, `Compare_ASTC6x6/iter_00001000/`) save annotated `comparison_strip_<texture>.png` containing FNTC-ASTC, ASTC and GT, plus four independent images named `<Type>_Uncompressed_FNTC.png`, `<Type>_FNTC_<block>.png`, `<Type>_ASTC_<block>.png` and `<Type>_GT.png` (for example, `Diffuse_`, `Normal_` and `Roughness_`). All images are directly inside the iteration directory; uncompressed FNTC remains in logs and independent images only. Unannotated strips are no longer generated. PBR exports place all images and `metrics.json` directly in `Compare_PBRScene/iter_<iteration>/`: `comparison_strip.png`, `comparison_strip_detail.png`, full-scene `Scene_FNTC_<block>.png`/`Scene_ASTC_<block>.png`/`Scene_GT.png`, and close-ups `detail_FNTC_<block>.png`/`detail_ASTC_<block>.png`/`detail_GT.png`. Without an iteration, files go directly in `Compare_PBRScene/`. Detail views are rendered again with `pbr_detail_center` (normalized x/y in the original square raster) and `pbr_detail_zoom`; their metrics are computed separately from the full-scene training logs.
+The native proxy supports 6x6 ASTC with four channels per grid and direct diffuse disabled on that grid. Other footprints and eight-channel ASTC grids use conventional ASTC encoding with a round-trip STE; eight channels occupy two surfaces. Native builds download pinned encoder source to `tools/astc_encoder_source/Source` if absent.
 
-Evaluation directories save `metrics.json` and `metrics.csv` with method names matching the logs; storage excludes SR base, and uncomputed metrics are left empty. PBR detail panels render independently at `pbr_detail_resolution` (default 2048), while `pbr_render_resolution` controls the full-scene height.
-
-The proxy requires CUDA-enabled PyTorch, a matching CUDA toolkit, a C++ compiler and ninja.
-It reuses `tools/astc_encoder_source/Source`, downloading the pinned encoder source there if absent.
-It currently supports quantized Mip0 with 6x6 ASTC, four-channel feature grids and direct diffuse disabled.
-Material projection additionally requires one grid and an affine SR decoder without PE or feature gradients; it also supports GT larger than the native material raster. Other single-stage configurations should set `astc_decoder_projection_interval: 0`.
-
-The `decoder` stage freezes the learned bitstream. Checkpoints are loaded from
-`models/train_result_<iteration>/model.pth`; `--load_iter -1` selects the latest completed checkpoint.
+Material projection requires an affine SR decoder without PE or feature gradients. It updates each native ASTC grid while sampling all companion grids, including different resolutions and mixed formats. Other decoder configurations skip projection and use ordinary codec training.
 
 ### Feature Gradient Inputs
 
-Feature gradient options are configured in the `feature gradient configs` section:
+Configure feature gradients independently in each `feature_grid_configs` entry; omitted counts default to `0`:
 
 ```yaml
-feature_gradient_count: 4  # 0 off | 2 right/down | 4 axial | 8 3x3 | 24 5x5
+feature_grid_configs:
+  - max_resolution: 1024
+    format: BC1
+    feature_gradient_count: 4  # 0 off | 2 right/down | 4 axial | 8 3x3 | 24 5x5
+  - max_resolution: 1024
+    format: BC1
+    feature_gradient_count: 0
 ```
 
 `Core/Feature_Grid/feature_gradients.py` uses bilinear repeat addressing to sample the center and selected offsets: one feature texel for 2/4/8 directions, up to two texels for the 24-direction 5x5 stencil. It appends each neighbor-minus-center
 difference to the decoder input. The differences do not add feature bitstream bytes,
 but they increase decoder input size and sampling cost. Checkpoints and
-`network_data.npz` record the direction count; inference must use the same value.
+`network_data.npz` record each grid's direction count; inference must preserve the same counts and grid order.
 
 The multi-stage training entry disables gradient inputs during representation learning and
-enables the configured count during decoder adaptation. In single-stage training,
+enables each grid's configured count during decoder adaptation. In single-stage training,
 gradients participate in representation learning directly; set
 `astc_decoder_projection_interval: 0` because pointwise material projection does
 not support spatial difference inputs.
 
-The default decoder has one hidden layer of width 32 and four axial differences. Larger stencils are supported directly, with larger decoder inputs and greater sampling cost.
-
 ASTC training uses the same differentiably decoded texture for every feature-gradient
 sample; stage two uses frozen decoded features.
-
-`ASTCAwareTrainer.refine_gradient_codec` is an explicit fixed-decoder refinement
-pass that validates legal codec proposals over complete block neighborhoods. It
-is not automatically added to the default training flow.
 
 ### Seamless Tiling (Wrap Boundary Constraint)
 
 The feature grid supports a **wrap boundary constraint**: during training, selected levels' left/right and top/bottom border features (including corners) are tied together to reduce boundary discontinuities. Sampling uses repeat addressing; boundary constraints alone do not guarantee that the reconstructed material is seamless.
 
-### Feature Grid DDS Export
+### Model Export
 
-Each `models/train_result_<iteration>/` contains `model.pth`, feature-grid **DDS files (R8G8B8A8, non-SRGB)** and `network_data.npz`. Proxy models also export `feature_grid_<index>.astc`, preserving the learned bitstream. The run directory contains `resolved_config.json`, `texture_packing.json` and, for multi-stage runs, `representation_config.json` and `multi_stage_training.json`.
+Each `models/train_result_<iteration>/` contains `model.pth`, `training_state.pth`, `network_data.npz` and the compressed latent surfaces declared in its manifest (BC1 DDS or ASTC). The run directory contains `resolved_config.json`, `texture_packing.json` and, for multi-stage runs, `representation_config.json` and `multi_stage_training.json`.
 
 ### Heterogeneous Multi-Feature Grid
 
@@ -358,10 +379,11 @@ The model supports **heterogeneous feature grids** through the `feature_grid_con
 
 | Field | Description |
 |-------|-------------|
+| `format` | Required format: `BC1` or an ASTC footprint such as `astc6x6` / `astc4x4` |
 | `max_resolution` | Maximum resolution of the grid |
-| `n_levels` | Number of grid levels; fixed to 1 when `mip0_only` is enabled |
 | `quantize_bits` | Quantization precision (2 / 4 / 8 bits) |
-| `save_bits` | Feature bits per texel (8 / 16 / 32 bits; at most 4 channels) |
+| `n_features_per_level` | Features per grid: ASTC supports 1/2/4/8, BC1 supports 4/8; default: 4 |
+| `feature_gradient_count` | Neighbor differences: 0/2/4/8/24; default: 0 |
 | `learning_rate` | Per-grid learning rate |
 
 ### Configurable Per-Texture Loss Weights
@@ -387,26 +409,14 @@ for the output layer. In residual SR mode, the decoder output is signed and skip
 
 ### Neural Texture Super-Resolution
 
-Material reconstruction uses the largest latent resolution (capped by GT and preserving aspect ratio). For 1K latent + 512 SR base against 2K GT, FNTC first decodes/clamps a 1K material raster; both FNTC and the default 1K ASTC baseline then use the same texel-centered bilinear-repeat upsampler to 2K. Training differentiates through the four neighboring **material predictions**, rather than querying the decoder directly at 2K coordinates. The base is sampled directly from its source mip onto the 1K raster, avoiding a 512-to-2K-to-1K cascade.
+Set `super_resolution_enable: true` and `super_resolution_base_resolution` to provide an ASTC-compressed source mip alongside the latent features. The decoder predicts a signed residual, combined as `clamp(bilinear_base + predicted_residual, 0, 1)` at native material texel centers. This mode disables direct-diffuse inference.
 
-Training stages share the native reconstruction. Inference and ASTC/PBR evaluation use a shared FNTC/ASTC raster selected by `ref_astc_resolution`, then bilinear-repeat resize to GT only when needed. Layout selection includes all affected GT pixels at integer resolution scales such as 1K-to-2K. Cross-resolution training currently requires `mip0_only: true`. `ref_astc_resolution` defaults to the FNTC material edge; setting it explicitly overrides both FNTC inference and ASTC baseline sizes, independently of feature-grid resolution. Material CNN filtering runs on this inference raster before resizing to GT. Logs and `reconstruction.json` distinguish material/GT sizes and native decoder query counts. Downsampling for the ASTC input and projection proposals shares the material-aware mip prefilter (including normal-vector handling).
+The material raster follows the largest latent resolution, capped by GT and preserving aspect ratio. `material_compare_resolution` overrides FNTC inference and baseline dimensions independently of latent resolution. Material CNN filtering runs on the inference raster before material recompression.
 
-Set `super_resolution_enable: true` and configure `super_resolution_base_resolution` to train
-residual super-resolution. The source mip at that resolution is bilinearly upsampled and provided
-alongside the feature-grid samples. At equal material/GT resolution the residual target is `GT - bilinear_base`; across resolutions the loss supervises the upsampled reconstructed material against GT. Training, inference,
-and ASTC comparison reconstruct `clamp(bilinear_base + predicted_residual, 0, 1)` at native material centers before the shared final upsampling. The same mip-level
-offset is used for lower Mips. Enabling this mode automatically disables direct-diffuse inference,
-whose direct-output semantics conflict with residual prediction.
-
+For a 1K latent and 512 SR base against 2K GT, training reconstructs a 1K material and differentiates through its bilinear-repeat interpolation to GT. The base is sampled directly from its source mip onto the native raster. Baseline preparation and ASTC projection use material-aware prefiltering, including normal-vector handling. PBR samples native rasters as described in the comparison section.
 
 ### BC1 latent textures
 
-Set `format: BC1` on a grid in `feature_grid_configs` to use two BC1 surfaces carrying eight features: `[RGB, binary A] ? 2`. BC1-aware training jointly learns RGB565 endpoints, shared categorical selectors and block modes. Transparent texels have RGB=0 as required by BC1. Alpha is binary before bilinear filtering.
+Each `format: BC1` grid defaults independently to four features on one surface: RGB plus binary alpha. The PC preset uses two such grids for eight features, including two binary components. Set `n_features_per_level: 8` explicitly to pack two surfaces into one logical grid. BC1-aware training jointly learns RGB565 endpoints, shared categorical selectors and block modes. Transparent texels have RGB=0; alpha is binary before bilinear filtering.
 
-BC1 automatically selects the RGB + binary-alpha layout, with a built-in weak usage prior and exact compressed inputs from step zero. The `BCn aware configs` section exposes `bcn_aware_enable` and `bcn_learning_rate`. Historical opaque configurations remain readable. The ASTC SR base/reference remain unchanged; Mip0, decoder adaptation and optional material CNN are supported.
-
-See the [architecture and training contract](docs/BC1_ARCHITECTURE_CN.md). Verify with `python tests/test_bc1_alpha.py`; reproduce comparisons with `python scripts/ab_latent_formats.py`. The [historical report](docs/BC1_AB_20261029_CN.md) describes the previous RGB-only four-feature layout.
-
-[Eight-feature A/B and binary-channel ablations](docs/BC1_RGBA8_AB_20261029_CN.md)
-
-Each feature grid can independently select an ASTC footprint or BC1, including mixed models. See [per-grid configuration and module ownership](docs/PER_GRID_COMPRESSION.md) and the [runnable example](examples/mixed_grid_formats.yaml).
+The `BCn aware configs` section exposes `bcn_aware_enable` and `bcn_learning_rate`. Training uses a weak binary-usage prior controlled by `bcn_usage_weight`. BC1 grids support decoder adaptation and material CNN fitting alongside ASTC grids in mixed models.

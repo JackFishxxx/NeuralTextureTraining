@@ -3,7 +3,7 @@
 import json
 import math
 import torch
-from .compression import SourceGrid, astc_codec_for, grid_recipes, proxy_kind, plans_for
+from .compression import SourceGrid, astc_codec_for, plans_for
 from .layout import surface_filename
 
 
@@ -14,8 +14,9 @@ def inference_spec(model):
     return dict(
         version=1,
         grids=[dict(**recipe.as_config(), resolution=spec.max_resolution, levels=spec.n_levels,
-                    channels=spec.n_features_per_level, quantize_bits=spec.quantize_bits)
-               for recipe, spec in zip(grid_recipes(model), model.feature_grid_specs)],
+                    channels=spec.n_features_per_level, quantize_bits=spec.quantize_bits,
+                    feature_gradient_count=spec.feature_gradient_count)
+               for recipe, spec in zip(model.grid_compressions, model.feature_grid_specs)],
         num_mips=model.num_mips, mip0_only=model.mip0_only,
         normal_encoding=model.normal_encoding, output_channels=model.num_channels,
         output_layout={name: list(bounds) for name, bounds in get_canonical_channel_slices_static(model.normal_encoding).items()},
@@ -32,10 +33,10 @@ def inference_spec(model):
         inference_size=list(model.inference_size),
         input_order=['positional_encoding', 'grid_centers_and_differences', 'normalized_mip']
                     + (['canonical_sr_base'] if model.super_resolution_enable else []) + ['constant_one'],
-        feature_gradient_count=model.feature_gradient_count,
         feature_sampling='bilinear_repeat_texel_center',
         cnn=None if cnn is None else dict(version=cnn.version, mode=cnn.mode, channels=cnn.channels,
                                           hidden=cnn.hidden, rounds=cnn.rounds,
+                                          tile_size=int(cnn.tile_size),
                                           inference_size=cnn.inference_size.tolist()),
     )
 
@@ -78,20 +79,20 @@ def validate_contract(model, state):
 
 
 def proxy_state_kind(proxy):
-    return 'astc_packed' if hasattr(proxy, 'surfaces') else proxy_kind(proxy)
+    return 'astc_packed' if hasattr(proxy, 'surfaces') else proxy.proxy_kind
 
 
 def proxy_layout_tensor(model):
-    return _json_tensor(model, [proxy_state_kind(proxy) for proxy in model.astc_proxy])
+    return _json_tensor(model, [proxy_state_kind(proxy) for proxy in model.grid_proxies])
 
 
 def _validate_proxy(model, index, kind, state):
     """Validate the saved representation against its grid before allocating it."""
     if kind == 'source':
         return
-    spec, recipe = model.feature_grid_specs[index], grid_recipes(model)[index]
+    spec, recipe = model.feature_grid_specs[index], model.grid_compressions[index]
     resolution, channels = spec.max_resolution, spec.n_features_per_level
-    prefix = f'astc_proxy.{index}.'
+    prefix = f'grid_proxies.{index}.'
     plans = plans_for(model, index)
     shapes = {}
     if kind == 'bc1_rgba':
@@ -137,21 +138,21 @@ def restore_proxies(model, state):
     if not all(isinstance(kind, str) for kind in kinds):
         raise ValueError('Checkpoint grid proxy kinds must be a list of names')
     count = len(kinds)
-    if count not in (0, len(grid_recipes(model))):
+    if count not in (0, len(model.grid_compressions)):
         raise ValueError('Checkpoint grid proxy count does not match configuration')
     for index, kind in enumerate(kinds):
-        recipe = grid_recipes(model)[index]
+        recipe = model.grid_compressions[index]
         allowed = ('source', 'bc1_rgba') if recipe.format == 'bc1' else ('source', 'astc_native', 'astc_roundtrip', 'astc_packed')
         if kind not in allowed:
             raise ValueError(f'Unsupported grid proxy kind: {kind}')
         _validate_proxy(model, index, kind, state)
-    if len(model.astc_proxy) == count and all(
-        proxy_state_kind(proxy) == kind for proxy, kind in zip(model.astc_proxy, kinds)
+    if len(model.grid_proxies) == count and all(
+        proxy_state_kind(proxy) == kind for proxy, kind in zip(model.grid_proxies, kinds)
     ):
         return
     result = torch.nn.ModuleList()
     for i, kind in enumerate(kinds):
-        prefix = f"astc_proxy.{i}."
+        prefix = f"grid_proxies.{i}."
         if kind == "source":
             proxy = SourceGrid()
         elif kind == "astc_packed":
@@ -173,12 +174,12 @@ def restore_proxies(model, state):
                 from Core.BCn_Aware.alpha_proxy import BC1AlphaProxyGrid as Proxy
             proxy = Proxy.from_state(state, prefix, model.device)
         result.append(proxy)
-    model.astc_proxy = result
+    model.grid_proxies = result
 
 
 def deployment_arrays(model):
     manifest = []
-    for i, (recipe, spec) in enumerate(zip(grid_recipes(model), model.feature_grid_specs)):
+    for i, (recipe, spec) in enumerate(zip(model.grid_compressions, model.feature_grid_specs)):
         plans = plans_for(model, i)
         manifest.append(
             dict(
@@ -203,6 +204,9 @@ def deployment_arrays(model):
     import numpy as np
 
     return dict(
+        fntc_tile_size=np.array(model.fntc_tile_size, dtype=np.int32),
+        feature_grid_gradient_counts=np.array([spec.feature_gradient_count for spec in model.feature_grid_specs],
+                                              dtype=np.int32),
         compression_schema_version=np.array(2, dtype=np.int32),
         feature_grid_compression=np.array(json.dumps(manifest)),
         latent_color_space=np.array("linear_unorm"),

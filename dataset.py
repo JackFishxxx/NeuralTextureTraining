@@ -10,7 +10,7 @@ import numpy as np
 from PIL import Image
 import torchvision.transforms.functional as TF
 from Core.Feature_Grid.sampling import bilinear_texel_corners, resize_bilinear_repeat, sample_image
-from Core.Material_Encoding.normal_encoding import (
+from Common.Material.normal_encoding import (
     decode_normal,
     encode_normal,
     normal_encoding_channels,

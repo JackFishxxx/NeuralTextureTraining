@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from Common.native_build import prepare_msvc
-from Core.Material_Encoding.normal_encoding import filter_normal
+from Common.Material.normal_encoding import filter_normal
 
 CAMERA_EYE = (0., .55, -4.25)
 CAMERA_TARGET = (0., -.05, 1.15)

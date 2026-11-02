@@ -7,7 +7,7 @@ NORMAL_XY_MIN_Z = 0.01
 
 
 def filter_normal(encoded, size, normal_encoding='xyz'):
-    """Area-filter encoded RGB vectors, then normalize and re-encode (CHW/NCHW)."""
+    """Decode, area-filter and re-encode a CHW/NCHW normal map."""
     value = decode_normal(encoded.float(), normal_encoding)
     batched = value.ndim == 4
     value = F.adaptive_avg_pool2d(value if batched else value[None], size)
@@ -29,16 +29,16 @@ def _take(x: torch.Tensor, start: int, length: int) -> torch.Tensor:
     return x.narrow(_channel_dim(x), start, length)
 
 
+def _normalize(n: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    return n / torch.sqrt(torch.clamp((n ** 2).sum(dim=_channel_dim(n), keepdim=True), min=eps))
+
+
 def normalize_normal_rgb(rgb: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    n = rgb * 2.0 - 1.0
-    cd = _channel_dim(n)
-    return n / torch.sqrt(torch.clamp((n ** 2).sum(dim=cd, keepdim=True), min=eps))
+    return _normalize(rgb * 2.0 - 1.0, eps)
 
 
 def normal_to_rgb(n: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    cd = _channel_dim(n)
-    n = n / torch.sqrt(torch.clamp((n ** 2).sum(dim=cd, keepdim=True), min=eps))
-    return torch.clamp(n * 0.5 + 0.5, 0.0, 1.0)
+    return torch.clamp(_normalize(n, eps) * 0.5 + 0.5, 0.0, 1.0)
 
 
 def encode_normal(normal_rgb: torch.Tensor, normal_encoding: str = 'xyz') -> torch.Tensor:
@@ -49,14 +49,12 @@ def encode_normal(normal_rgb: torch.Tensor, normal_encoding: str = 'xyz') -> tor
         return normal_to_rgb(n)
     if enc == 'xy':
         return torch.clamp(_take(n, 0, 2) * 0.5 + 0.5, 0.0, 1.0)
-    if enc == 'hemi_oct':
-        x = _take(n, 0, 1)
-        y = _take(n, 1, 1)
-        z = torch.clamp(_take(n, 2, 1), min=0.0)
-        denom = torch.clamp(x.abs() + y.abs() + z, min=1e-8)
-        px, py = x / denom, y / denom
-        return torch.clamp(torch.cat([px + py, px - py], dim=cd) * 0.5 + 0.5, 0.0, 1.0)
-    raise ValueError(f'Unsupported normal_encoding: {normal_encoding}')
+    x = _take(n, 0, 1)
+    y = _take(n, 1, 1)
+    z = torch.clamp(_take(n, 2, 1), min=0.0)
+    denom = torch.clamp(x.abs() + y.abs() + z, min=1e-8)
+    px, py = x / denom, y / denom
+    return torch.clamp(torch.cat([px + py, px - py], dim=cd) * 0.5 + 0.5, 0.0, 1.0)
 
 
 def decode_normal(encoded: torch.Tensor, normal_encoding: str = 'xyz') -> torch.Tensor:
@@ -74,18 +72,13 @@ def decode_normal(encoded: torch.Tensor, normal_encoding: str = 'xyz') -> torch.
             max_radius_sq / torch.clamp(xy_sq, min=1e-8), max=1.0
         ))
         xy = xy * scale
-        x = xy.narrow(cd, 0, 1)
-        y = xy.narrow(cd, 1, 1)
         z = torch.sqrt(torch.clamp(1.0 - (xy ** 2).sum(dim=cd, keepdim=True), min=NORMAL_XY_MIN_Z ** 2))
-        return normal_to_rgb(torch.cat([x, y, z], dim=cd))
-    if enc == 'hemi_oct':
-        x = xy.narrow(cd, 0, 1)
-        y = xy.narrow(cd, 1, 1)
-        px = (x + y) * 0.5
-        py = (x - y) * 0.5
-        z = 1.0 - px.abs() - py.abs()
-        return normal_to_rgb(torch.cat([px, py, z], dim=cd))
-    raise ValueError(f'Unsupported normal_encoding: {normal_encoding}')
+        return normal_to_rgb(torch.cat([xy, z], dim=cd))
+    x, y = xy.split(1, dim=cd)
+    px = (x + y) * 0.5
+    py = (x - y) * 0.5
+    z = 1.0 - px.abs() - py.abs()
+    return normal_to_rgb(torch.cat([px, py, z], dim=cd))
 
 
 def normal_vectors(encoded: torch.Tensor, normal_encoding: str = 'xyz') -> torch.Tensor:

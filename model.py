@@ -11,7 +11,7 @@ from Core.Positional_Encoding.positional_encoding import TiledPositionalEncoding
 from Core.Feature_Grid.feature_gradients import sample_feature_inputs, sample_feature_centers
 from Core.Tile_CNN.material_cnn import MaterialCNN
 from Core.Feature_Grid.sampling import resize_bilinear_repeat
-from Core.Material_Encoding.normal_encoding import NORMAL_XY_MIN_Z
+from Common.Material.normal_encoding import NORMAL_XY_MIN_Z
 
 from Core.Feature_Grid.optimization import make_scheduler
 

@@ -19,13 +19,13 @@ import tinycudann as tcnn
 from configs import get_args
 from model import TCNNModel
 from dataset import TextureDataset
-from Common.material_loss import MaterialLoss
-from Common.material_reconstruction import canonical_gt_mip
+from Common.Material.loss import MaterialLoss
+from Common.Material.reconstruction import canonical_gt_mip
 from configs import Config, write_resolved_config
 from Common.Comparison.material import (log_comparison_storage, _compute_group_metrics,
                                         run_material_comparison_pipeline, evaluate_materials, primary_method,
                                         complete_material_evaluation)
-from Core.Material_Encoding.compression import MaterialCompression
+from Common.Material.compression import MaterialCompression
 from Common.Comparison.pbr_scene import run_pbr_comparison_pipeline
 from dataset import material_size
 from Core.Feature_Grid.training import FeatureGridTraining

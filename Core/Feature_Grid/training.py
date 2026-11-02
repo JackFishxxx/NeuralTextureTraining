@@ -5,7 +5,7 @@ ASTC native operations and BC1 endpoint updates remain format-specific.
 
 import torch
 from Common.Block_Compression.astc import ASTCCodec
-from Common.material_reconstruction import cached_astc_base
+from Common.Material.reconstruction import cached_astc_base
 from Common.cuda_graph import make_graphed_callables
 from Core.Feature_Grid.sampling import RepeatImageSampler
 from dataset import material_size, clean_base_image, sample_material, NativeQueryPlan

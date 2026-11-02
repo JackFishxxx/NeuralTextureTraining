@@ -1,8 +1,8 @@
 """Material reconstruction objectives, independent of training and reporting."""
 import torch
 from typing import List
-from Core.Material_Encoding.normal_encoding import normal_vectors
-from .cuda_graph import make_graphed_callables
+from .normal_encoding import normal_vectors
+from Common.cuda_graph import make_graphed_callables
 
 
 class MaterialLoss:
@@ -88,43 +88,40 @@ class MaterialLoss:
                                 nan=0.0, posinf=1.0, neginf=0.0)
 
     def _group_losses(self, gt_texture, predict_texture, loss_weights):
-        """Yield per-texel raw and weighted losses from one material definition."""
+        """Yield group errors and weights; callers choose the required reductions."""
         gt, pred = gt_texture.float(), predict_texture.float()
         for group, textures in self.dataset.texture_packing.items():
             idx = self._group_indices(textures, gt.device)
             if idx.numel() == 0:
-                yield group, None, None, None
+                yield group, None, None
                 continue
             p, g = pred.index_select(1, idx), gt.index_select(1, idx)
             weights = loss_weights.index_select(0, idx).float()
-            errors = (p - g).square()
-            raw = errors.mean(1)
-            weighted = (errors * weights).sum(1)
-            yield group, raw, weighted, weights.mean()
+            yield group, (p - g).square(), weights
 
     def per_sample(self, gt_texture, predict_texture, loss_weights):
         """Material loss per texel for independent ASTC block acceptance."""
         loss = gt_texture.new_zeros(len(gt_texture), dtype=torch.float32)
-        for _, _, weighted, _ in self._group_losses(gt_texture, predict_texture, loss_weights):
-            if weighted is not None:
-                loss = loss + weighted
+        for _, errors, weights in self._group_losses(gt_texture, predict_texture, loss_weights):
+            if errors is not None:
+                loss = loss + (errors * weights).sum(1)
         return loss
 
     def reconstruction(self, gt_texture, predict_texture, loss_weights, statistics=True):
         total = gt_texture.new_zeros((), dtype=torch.float32)
         stats = {}
-        for group, raw, weighted, weight in self._group_losses(gt_texture, predict_texture, loss_weights):
-            if weighted is None:
+        for group, errors, weights in self._group_losses(gt_texture, predict_texture, loss_weights):
+            if errors is None:
                 if statistics:
                     stats[group] = None
                 continue
-            value = weighted.mean()
+            value = (errors * weights).sum(1).mean()
             total = total + value
             if statistics:
                 stats[group] = {
                     'loss': value.detach(),
-                    'raw_loss': raw.mean().detach(),
-                    'weight': weight.detach(),
+                    'raw_loss': errors.mean(1).mean().detach(),
+                    'weight': weights.mean().detach(),
                 }
         return total, stats
 

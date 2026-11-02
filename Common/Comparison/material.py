@@ -10,8 +10,8 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 import torchvision.transforms.functional as TF
 from Core.Feature_Grid.compression import latent_payload_bytes
-from Common.material_reconstruction import (postprocess_material,
-                                            make_deployment_model,_render_model_mip0,cached_astc_base)
+from Common.Material.reconstruction import (postprocess_material,
+                                            make_deployment_model,render_material_mip0,cached_astc_base)
 from Core.Feature_Grid.sampling import resize_bilinear_repeat
 from dataset import prefiltered_material, material_size
 
@@ -77,9 +77,8 @@ def evaluate_materials(model, dataset, config, compression, sr_codec, *, baselin
         decoded = make_deployment_model(model)
         base = (cached_astc_base(dataset, sr_codec, config.super_resolution_base_resolution, size)
                 if model.super_resolution_enable else None)
-        native = _render_model_mip0(decoded, dataset, *size, dataset.num_mips, config.device,
-                                   inference_size=size, superres_base_override=base,
-                                   inference_tile=config.eval_inference_tile)
+        native = render_material_mip0(decoded, size, config.device, superres_base=base,
+                                      inference_tile=config.eval_inference_tile)
     if tuple(native.shape[-2:]) != tuple(size):
         raise ValueError('Material override must use the configured inference tile raster')
     if not torch.isfinite(native).all():

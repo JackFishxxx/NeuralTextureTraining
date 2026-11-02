@@ -104,24 +104,23 @@ class MaterialCompression:
         """Assemble tile blocks; re-encode when tile boundaries cut codec blocks."""
         codec,fmt = self.codecs[group],self.formats[group]
         h,w = rgba.shape[:2]
+        if self.tile_size is None or max(h,w) <= self.tile_size:
+            return codec.encode_rgba(rgba)
         bw,bh = fmt.block
-        blocks = np.empty((math.ceil(h/bh),math.ceil(w/bw),fmt.block_bytes),np.uint8)
-        aligned = (self.tile_size is None or
-                   ((h <= self.tile_size or self.tile_size % bh == 0)
-                    and (w <= self.tile_size or self.tile_size % bw == 0)))
+        aligned = ((h <= self.tile_size or self.tile_size % bh == 0)
+                   and (w <= self.tile_size or self.tile_size % bw == 0))
+        blocks = np.empty((math.ceil(h/bh),math.ceil(w/bw),fmt.block_bytes),np.uint8) if aligned else None
         decoded = np.empty_like(rgba) if not aligned else None
-        first = None
-        regions = list(tile_regions(h,w,self.tile_size or max(h,w)))
+        header = dds_header(w,h,fmt.name) if isinstance(codec,BCCodec) else None
+        offset = len(header) if header is not None else 16
+        regions = list(tile_regions(h,w,self.tile_size))
         def encode(region):
             y,x,th,tw = region
             return codec.encode_rgba(rgba[y:y+th,x:x+tw])
         parallel = fmt.name in ('BC1', 'BC7') and len(regions) > 1 and _physical_core_count() > 1
         encoded = _tile_encoder_pool().map(encode, regions) if parallel else map(encode, regions)
         for (y,x,th,tw),data in zip(regions,encoded):
-            if first is None:
-                first = data
             if aligned:
-                offset = (128 if fmt.name == 'BC1' else 148) if isinstance(codec,BCCodec) else 16
                 rows,cols = math.ceil(th/bh),math.ceil(tw/bw)
                 blocks[y//bh:y//bh+rows,x//bw:x//bw+cols] = np.frombuffer(data[offset:],np.uint8).reshape(rows,cols,fmt.block_bytes)
             else:
@@ -129,10 +128,8 @@ class MaterialCompression:
         if not aligned:
             # A BC/ASTC block cannot represent two separately padded tile blocks.
             return codec.encode_rgba(decoded)
-        if isinstance(codec,BCCodec):
-            header = dds_header(w,h,fmt.name)
-        else:
-            header = first[:7]+w.to_bytes(3,'little')+h.to_bytes(3,'little')+first[13:16]
+        if header is None:
+            header = data[:7]+w.to_bytes(3,'little')+h.to_bytes(3,'little')+data[13:16]
         return header+blocks.tobytes()
 
     @torch.no_grad()
@@ -193,21 +190,23 @@ class MaterialCompression:
             if group == 'normal':
                 encoding = ('xy' if self.formats['normal'].name == 'BC5' and dataset.normal_encoding == 'xyz'
                             else dataset.normal_encoding)
-            if isinstance(codec,BCCodec):
-                levels = codec.decode_mipmaps(data)
+            is_bc = isinstance(codec,BCCodec)
+            levels = codec.decode_mipmaps(data) if is_bc else [codec.decode_bytes(data)]
+            if tuple(levels[0].shape[:2]) != tuple(size):
+                raise ValueError('Compressed material dimensions do not match inference size')
+            if is_bc:
                 if len(levels) == 1 and max(size) > 1:
                     data = codec.with_mipmaps(data,self._material_mipmaps(levels[0],encoding))
                     textures[filename] = data
                     levels = codec.decode_mipmaps(data)
             else:
-                levels = [codec.decode_bytes(data)]
-                for mip,rgba in enumerate(self._material_mipmaps(levels[0],encoding),1):
-                    mip_file = GROUP_NAMES[group]+f'_mip{mip}.astc'
-                    if mip_file not in textures:
-                        textures[mip_file] = self._encode_tiled(rgba,group)
-                    levels.append(codec.decode_bytes(textures[mip_file]))
-            if tuple(levels[0].shape[:2]) != tuple(size):
-                raise ValueError('Compressed material dimensions do not match inference size')
+                mip_files = [GROUP_NAMES[group]+f'_mip{mip}.astc'
+                             for mip in range(1,max(size).bit_length())]
+                if any(name not in textures for name in mip_files):
+                    for name,rgba in zip(mip_files,self._material_mipmaps(levels[0],encoding)):
+                        if name not in textures:
+                            textures[name] = self._encode_tiled(rgba,group)
+                levels.extend(codec.decode_bytes(textures[name]) for name in mip_files)
             if tuple(levels[-1].shape[:2]) != (1,1):
                 raise ValueError('Compressed material requires a complete mip chain')
             result.append((group,levels))

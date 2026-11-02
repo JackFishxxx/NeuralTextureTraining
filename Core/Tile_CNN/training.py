@@ -10,7 +10,7 @@ from dataclasses import asdict
 import torch
 from torch.nn import functional as F
 
-from Common.material_reconstruction import cached_astc_base, make_deployment_model, _render_model_mip0
+from Common.Material.reconstruction import cached_astc_base, make_deployment_model, render_material_mip0
 from dataset import material_size
 from .material_cnn import MaterialCNN
 from checkpoint import atomic_torch_save
@@ -109,9 +109,8 @@ def fit_material_cnn(trainer, steps=50000, validation_interval=1000, resume_stat
         base = (cached_astc_base(trainer.dataset, trainer.astc_codec,
                                 trainer.configs.super_resolution_base_resolution, output_size=size)
                 if trainer.super_resolution_enable else None)
-        raw = _render_model_mip0(decoded, trainer.dataset, *size, trainer.num_mips, trainer.device,
-                                 superres_base_override=base, inference_tile=trainer.configs.eval_inference_tile,
-                                 inference_size=size)
+        raw = render_material_mip0(decoded, size, trainer.device, superres_base=base,
+                                   inference_tile=trainer.configs.eval_inference_tile)
         del decoded, base
     gt = trainer.dataset.expand_to_canonical(
         trainer.dataset.mip_cache[0]).permute(2, 0, 1)[None].float()

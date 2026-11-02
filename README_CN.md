@@ -39,11 +39,11 @@ FNTC 使用压缩 latent 纹理和小型 decoder 表示一组材质。可选的�
 |---|---|
 | `Core/Feature_Grid/` | 网格布局、量化/QAT 噪声、边界约束、共享采样和 feature gradients |
 | `Core/Positional_Encoding/` | UV 周期性 sin/cos 编码 |
-| `Core/Material_Encoding/` | 法线编码及材质通道打包/压缩 |
 | `Core/ASTC_Aware/` | 压缩感知训练、latent ASTC 编解码与可微 ASTC |
 | `Core/BCn_Aware/` | BC1 端点、选择器和二值 alpha 优化 |
 | `Core/Tile_CNN/` | 材质 CNN 推理与拟合 |
 | `Core/Multi_Stage_Training/` | 表示训练、decoder 拟合和布局重拟合 |
+| `Common/Material/` | 法线编码、材质压缩、重建与损失 |
 | `Common/Block_Compression/` | 传统 ASTC 和 BC 编解码 |
 | `Common/Comparison/` | 材质/PBR 评估、方法命名、指标与截图 |
 

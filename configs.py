@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 import torch
 import yaml
 from Core.Feature_Grid.feature_grid import FeatureGridSpec
-from Core.Material_Encoding.compression import DEFAULT_FORMATS, parse_material_formats
+from Common.Material.compression import DEFAULT_FORMATS, parse_material_formats
 
 
 def _normalize_astc_block(value: str) -> tuple[str, tuple[int, int]]:

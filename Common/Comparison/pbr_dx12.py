@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from Common.native_build import prepare_msvc
-from Core.Material_Encoding.normal_encoding import decode_normal, encode_normal
+from Core.Material_Encoding.normal_encoding import filter_normal
 
 CAMERA_EYE = (0., .55, -4.25)
 CAMERA_TARGET = (0., -.05, 1.15)
@@ -105,10 +105,10 @@ def _vertices(meshes, spheres):
 def _mips(source, encoding=None):
     levels = [source]
     while max(levels[-1].shape[-2:]) > 1:
-        value = decode_normal(levels[-1], encoding) if encoding else levels[-1]
-        h, w = value.shape[-2:]
-        value = torch.nn.functional.adaptive_avg_pool2d(value, (max(1, h // 2), max(1, w // 2)))
-        levels.append(encode_normal(value, encoding) if encoding else value)
+        h, w = levels[-1].shape[-2:]
+        size = (max(1, h // 2), max(1, w // 2))
+        levels.append(filter_normal(levels[-1], size, encoding) if encoding else
+                      torch.nn.functional.adaptive_avg_pool2d(levels[-1], size))
     return levels
 
 

@@ -273,9 +273,8 @@ class Trainer(FeatureGridTraining):
         if curr_iter is not None:
             for group, values in stats.items():
                 if values is not None:
-                    name = 'normal_angular' if group == 'normal' else group
                     for prefix, key in (('Loss', 'loss'), ('LossRaw', 'raw_loss'), ('LossWeight', 'weight')):
-                        self._record_training_scalar(f'{prefix}/{name}', values[key])
+                        self._record_training_scalar(f'{prefix}/{group}', values[key])
         return loss
 
     def _record_training_scalar(self, name, value):
@@ -293,13 +292,12 @@ class Trainer(FeatureGridTraining):
     def _loss_stats_str(self) -> str:
         labels = {
             "diffuse": "Weighted diffuse loss",
-            "normal": "Weighted normal angular loss",
+            "normal": "Weighted normal MSE loss",
             "romsd": "Weighted ROMSD loss",
         }
         parts = []
         for group in ("diffuse", "normal", "romsd"):
-            name = 'normal_angular' if group == 'normal' else group
-            loss = self._training_scalars.get(f'Loss/{name}')
+            loss = self._training_scalars.get(f'Loss/{group}')
             value = "-" if loss is None else f"{loss:.6f}"
             parts.append(f"{labels[group]}:{value}")
         return ", ".join(parts)

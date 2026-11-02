@@ -40,7 +40,7 @@ This project differs from NVIDIA's [RTXNTC SDK](https://github.com/NVIDIA-RTX/Rt
 |---|---|
 | `Core/Feature_Grid/` | Grid layout, quantization/QAT noise, boundary constraints, shared sampling and feature gradients |
 | `Core/Positional_Encoding/` | Periodic UV sin/cos encoding |
-| `Core/Material_Encoding/` | Normal encoding, angular errors and material channel packing/compression |
+| `Core/Material_Encoding/` | Normal encoding and material channel packing/compression |
 | `Core/ASTC_Aware/` | Compression-aware training, latent ASTC round-trips and differentiable ASTC |
 | `Core/BCn_Aware/` | BC1 endpoint, selector and binary-alpha optimization |
 | `Core/Tile_CNN/` | Material CNN inference and fitting |

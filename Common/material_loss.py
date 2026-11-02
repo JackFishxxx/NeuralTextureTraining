@@ -1,8 +1,8 @@
 """Material reconstruction objectives, independent of training and reporting."""
 import torch
 from typing import List
+from Core.Material_Encoding.normal_encoding import normal_vectors
 from .cuda_graph import make_graphed_callables
-from Core.Material_Encoding.normal_encoding import normal_angular_loss, normal_vectors
 
 
 class MaterialLoss:
@@ -97,13 +97,9 @@ class MaterialLoss:
                 continue
             p, g = pred.index_select(1, idx), gt.index_select(1, idx)
             weights = loss_weights.index_select(0, idx).float()
-            if group == 'normal':
-                raw = normal_angular_loss(p, g, self.normal_encoding, reduction='none')
-                weighted = raw * weights.sum()
-            else:
-                errors = (p - g).square()
-                raw = errors.mean(1)
-                weighted = (errors * weights).sum(1)
+            errors = (p - g).square()
+            raw = errors.mean(1)
+            weighted = (errors * weights).sum(1)
             yield group, raw, weighted, weights.mean()
 
     def per_sample(self, gt_texture, predict_texture, loss_weights):

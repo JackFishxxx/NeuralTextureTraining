@@ -9,7 +9,6 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 import torchvision.transforms.functional as TF
-from Core.Material_Encoding.normal_encoding import decode_normal, normal_angular_psnr
 from Core.Feature_Grid.compression import latent_payload_bytes
 from Common.material_reconstruction import (postprocess_material,
                                             make_deployment_model,_render_model_mip0,cached_astc_base)
@@ -123,8 +122,7 @@ def metric_records(metrics, method, *, view='Material', mip=0, storage_bytes=Non
     for group, values in metrics.items():
         psnr, ssim, lpips = (float(v) if v is not None and math.isfinite(v) else None for v in values)
         records.append(dict(method=method, view=view, mip=mip, group=group,
-                            psnr_type=('normal_angular' if group == 'normal' else
-                                       'weighted_group_mean' if group == 'average' else 'image_mse'),
+                            psnr_type=('weighted_group_mean' if group == 'average' else 'image_mse'),
                             psnr=psnr, ssim=ssim, lpips=lpips if lpips_available else None,
                             lpips_status=('not_computed' if not lpips_available else
                                           'computed' if lpips is not None else 'nonfinite'),
@@ -137,11 +135,11 @@ def write_metrics(directory, records, *, evaluation, iteration=None, metadata=No
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     records = [dict(row, iteration=iteration) for row in records]
-    report = dict(schema_version=1, evaluation=evaluation, iteration=iteration,
+    report = dict(schema_version=2, evaluation=evaluation, iteration=iteration,
                   storage_scope=dict(unit='bytes', mip=0, sr_base_included=False, container_overhead_included=False),
                   metric_definitions={
-                      'psnr': 'dB; psnr_type distinguishes image MSE, normal angular error and group mean; exact image matches report 120 dB',
-                      'normal': 'PSNR: angular error in degrees (range 180); SSIM/LPIPS: decoded normal RGB',
+                      'psnr': 'dB; image MSE or weighted group mean; exact image matches report 120 dB',
+                      'normal': 'PSNR/SSIM on encoded channels; LPIPS averages scalar channels replicated to RGB',
                       'average': 'weighted mean of group scores, using the sum of effective channel weights',
                       'romsd_lpips': 'mean of per-scalar LPIPS, each scalar replicated to RGB',
                       'lpips_status': 'not_computed is null in JSON and empty in CSV; never a perfect score',
@@ -182,26 +180,20 @@ def _compute_ssim_safe(pred_ref: torch.Tensor, gt_ref: torch.Tensor, ssim_metric
 
 def _compute_metrics_from_refs(
     pred_ref: torch.Tensor, gt_ref: torch.Tensor, psnr_metric, ssim_metric, lpips_metric,
-    is_normal: bool = False, normal_encoding: str = "xyz", scalar_channels: bool = False,
+    scalar_channels: bool = False,
     psnr_only: bool = False,
 ) -> Tuple[float, Optional[float], Optional[float]]:
     pred_ref = torch.nan_to_num(pred_ref.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     gt_ref = torch.nan_to_num(gt_ref.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-    if is_normal:
-        psnr_value = float(normal_angular_psnr(pred_ref, gt_ref, normal_encoding).item())
-    else:
-        psnr_metric.reset()
-        psnr_value = float(psnr_metric(pred_ref, gt_ref).item())
-        psnr_metric.reset()
-        if psnr_value == math.inf:
-            psnr_value = 120.0
+    psnr_metric.reset()
+    psnr_value = float(psnr_metric(pred_ref, gt_ref).item())
+    psnr_metric.reset()
+    if psnr_value == math.inf:
+        psnr_value = 120.0
     if not math.isfinite(psnr_value):
         psnr_value = 0.0
     if psnr_only:
         return psnr_value, None, None
-    if is_normal:
-        pred_ref = decode_normal(pred_ref, normal_encoding)
-        gt_ref = decode_normal(gt_ref, normal_encoding)
     ssim_value = _compute_ssim_safe(pred_ref, gt_ref, ssim_metric)
 
     if pred_ref.shape[-2] >= 128 and pred_ref.shape[-1] >= 128:
@@ -263,9 +255,7 @@ def _compute_group_metrics(pred_image, gt_image, dataset, psnr_metric, ssim_metr
         gt_ref = torch.index_select(gt_image, dim=1, index=ch_idx)
         group_metrics[group_name] = _compute_metrics_from_refs(
             pred_ref, gt_ref, psnr_metric, ssim_metric, lpips_metric,
-            is_normal=(group_name == "normal"),
-            normal_encoding=str(getattr(dataset, "normal_encoding", "xyz")),
-            scalar_channels=(group_name == "romsd"),
+            scalar_channels=(group_name != "diffuse"),
             psnr_only=psnr_only,
         )
 
@@ -286,21 +276,13 @@ def _compute_group_metrics(pred_image, gt_image, dataset, psnr_metric, ssim_metr
 # Comparison strip + annotated tiles
 # ---------------------------------------------------------------------------
 
-def _metric_labels(metric_group: Optional[str] = None) -> Tuple[str, str, str]:
-    if metric_group == "normal":
-        return "AngularPSNR", "SSIM", "LPIPS"
-    return "PSNR", "SSIM", "LPIPS"
-
-
 def _format_metric_triplet(
     metric: Optional[Tuple[float, float, float]],
-    metric_group: Optional[str] = None,
 ) -> str:
-    psnr_label, ssim_label, lpips_label = _metric_labels(metric_group)
     if metric is None:
-        return f"{psnr_label}:{'-':>8}  {ssim_label}:{'-':>7}  {lpips_label}:{'-':>7}"
+        return f"PSNR:{'-':>8}  SSIM:{'-':>7}  LPIPS:{'-':>7}"
     lpips_text = f'{metric[2]:7.4f}' if metric[2] is not None else f'{"N/A":>7}'
-    return f"{psnr_label}:{metric[0]:8.3f}  {ssim_label}:{metric[1]:7.4f}  {lpips_label}:{lpips_text}"
+    return f"PSNR:{metric[0]:8.3f}  SSIM:{metric[1]:7.4f}  LPIPS:{lpips_text}"
 
 
 def _print_comparison_metrics(metrics, curr_iter=None):
@@ -308,7 +290,7 @@ def _print_comparison_metrics(metrics, curr_iter=None):
     for method, values in metrics.items():
         print(f"[Material Test] {method:<{label_width}} Iter {curr_iter}: Weighted {_format_metric_triplet(values.get('average'))} "
               f"(Diffuse {_format_metric_triplet(values.get('diffuse'))}, "
-              f"NormalAngular {_format_metric_triplet(values.get('normal'))}, "
+              f"Normal {_format_metric_triplet(values.get('normal'))}, "
               f"ROMSD {_format_metric_triplet(values.get('romsd'))})")
 
 
@@ -360,12 +342,11 @@ def _make_annotated_tile(
     display_name = method_name
 
     if metric is None:
-        text = f"{display_name}\nReference" if method_name == "GT" else f"{display_name}\n{_format_metric_triplet(None, metric_group)}"
+        text = f"{display_name}\nReference" if method_name == "GT" else f"{display_name}\n{_format_metric_triplet(None)}"
     else:
         selected_group = metric_group if metric_group in metric else "average"
         selected_metric = metric.get(selected_group)
-        group_name = "NORMAL ANGULAR" if selected_group == "normal" else selected_group.upper()
-        text = f"{display_name}[{group_name}]\n{_format_metric_triplet(selected_metric, selected_group)}"
+        text = f"{display_name}[{selected_group.upper()}]\n{_format_metric_triplet(selected_metric)}"
 
     font_size = max(18, min(36, h // 40, w // 28))
     font = load_overlay_font(font_size)
@@ -455,8 +436,7 @@ def save_material_images(evaluation, dataset, compression, metric_objects, direc
                 values = metrics[method][group]
             else:
                 values = _compute_metrics_from_refs(image[:,a:b],gt[:,a:b],*metric_objects,
-                                                    is_normal=(group=='normal'),normal_encoding=dataset.normal_encoding,
-                                                    scalar_channels=(group=='romsd'))
+                                                    scalar_channels=(group!='diffuse'))
             scores = {group: (values[0],values[1],values[2] if min(height,width)>=128 else None)}
             label = f'{filename}_{format_name}' if filename == 'FNTC_Recompressed' else filename
             tile = _make_annotated_tile(visual, label, scores, group)

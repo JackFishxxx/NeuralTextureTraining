@@ -11,7 +11,7 @@ from torch.nn import functional as F
 from Common.Block_Compression.astc import ASTCCodec
 from Common.Block_Compression.bc import BCCodec, dds_header
 from Common.Block_Compression.formats import TextureFormat
-from .normal_encoding import decode_normal, encode_normal
+from .normal_encoding import decode_normal, encode_normal, filter_normal
 from Core.Feature_Grid.sampling import tile_regions
 
 GROUP_NAMES = {'diffuse': 'Diffuse', 'normal': 'Normal', 'romsd': 'Romsd'}
@@ -222,8 +222,7 @@ class MaterialCompression:
             if normal_encoding is None:
                 level = F.interpolate(level,size=size,mode='area')
             else:
-                normal = decode_normal(level[:,:channels],normal_encoding)
-                normal = encode_normal(F.interpolate(normal,size=size,mode='area'),normal_encoding)
+                normal = filter_normal(level[:,:channels],size,normal_encoding)
                 level = F.interpolate(level,size=size,mode='area')
                 level[:,:channels] = normal
             yield (level[0].clamp(0,1)*255).round().byte().permute(1,2,0).numpy()

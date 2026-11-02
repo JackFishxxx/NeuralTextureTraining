@@ -1,8 +1,17 @@
 import warnings
 import torch
+from torch.nn import functional as F
 
 
 NORMAL_XY_MIN_Z = 0.01
+
+
+def filter_normal(encoded, size, normal_encoding='xyz'):
+    """Area-filter encoded RGB vectors, then normalize and re-encode (CHW/NCHW)."""
+    value = decode_normal(encoded.float(), normal_encoding)
+    batched = value.ndim == 4
+    value = F.adaptive_avg_pool2d(value if batched else value[None], size)
+    return encode_normal(value if batched else value[0], normal_encoding)
 
 
 def _enc(normal_encoding):
@@ -83,23 +92,6 @@ def normal_vectors(encoded: torch.Tensor, normal_encoding: str = 'xyz') -> torch
     return normalize_normal_rgb(decode_normal(encoded.float().clamp(0, 1), normal_encoding))
 
 
-def normal_angular_loss(pred_encoded: torch.Tensor, gt_encoded: torch.Tensor, normal_encoding: str = 'xyz',
-                        reduction: str = 'mean') -> torch.Tensor:
-    # Use the deployed UNORM range in forward, but allow out-of-range decoder
-    # channels to recover. A second hard clamp here would strand them forever.
-    pred = pred_encoded.float()
-    bounded = pred + (pred.clamp(0, 1) - pred).detach()
-    pred_n = normalize_normal_rgb(decode_normal(bounded, normal_encoding))
-    gt_n = normal_vectors(gt_encoded, normal_encoding)
-    dot = (pred_n * gt_n).sum(dim=_channel_dim(pred_n)).clamp(-1.0, 1.0)
-    loss = (1.0 - dot) * 0.5
-    if reduction == 'none':
-        return loss
-    if reduction != 'mean':
-        raise ValueError('Normal angular loss reduction must be mean or none')
-    return loss.mean()
-
-
 def prepare_normal_input(rgb, normal_encoding='xyz'):
     """Encode OpenGL source normals, reporting information lost by hemisphere encodings."""
     rgb = rgb.float()
@@ -113,26 +105,6 @@ def prepare_normal_input(rgb, normal_encoding='xyz'):
                    'use normal_encoding: xyz to preserve the source hemisphere')
         warnings.warn(message, UserWarning, stacklevel=2)
     return encode_normal(rgb, normal_encoding)
-
-
-def normal_angular_error_degrees(pred_encoded: torch.Tensor, gt_encoded: torch.Tensor, normal_encoding: str = 'xyz') -> torch.Tensor:
-    pred_n = normal_vectors(pred_encoded, normal_encoding)
-    gt_n = normal_vectors(gt_encoded, normal_encoding)
-    dot = (pred_n * gt_n).sum(dim=_channel_dim(pred_n)).clamp(-1.0, 1.0)
-    return torch.rad2deg(torch.acos(dot))
-
-
-def normal_angular_psnr(
-    pred_encoded: torch.Tensor,
-    gt_encoded: torch.Tensor,
-    normal_encoding: str = 'xyz',
-    max_angle_degrees: float = 180.0,
-    eps: float = 1e-12,
-) -> torch.Tensor:
-    deg = normal_angular_error_degrees(pred_encoded, gt_encoded, normal_encoding)
-    mse = torch.clamp(torch.mean(deg ** 2), min=eps)
-    max_angle = torch.tensor(float(max_angle_degrees), device=mse.device, dtype=mse.dtype)
-    return 20.0 * torch.log10(max_angle) - 10.0 * torch.log10(mse)
 
 
 def normal_encoding_channels(normal_encoding: str) -> int:

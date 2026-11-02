@@ -82,6 +82,7 @@ def _signature(raw, gt, trainer, weights):
     for tensor in (raw, gt, weights):
         digest.update(memoryview(tensor.detach().cpu().contiguous().numpy()))
     recipe = dict(normal_encoding=trainer.normal_encoding, pbr_loss=trainer.pbr_loss_enable,
+                  normal_loss='encoded_mse',
                   pbr_weight=trainer.pbr_loss_weight, shape=list(raw.shape), gt_shape=list(gt.shape),
                   texture_packing=trainer.dataset.texture_packing,
                   tile_size=trainer.configs.fntc_tile_size,

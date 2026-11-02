@@ -314,12 +314,12 @@ class Config():
         # Values: per-channel weight
         default_texture_weights = {
             "diffuse": 1.0,
-            "normal": 0.4,
-            "roughness": 0.4,
-            "occlusion": 0.4,
-            "metallic": 0.4,
-            "specular": 0.4,
-            "displacement": 0.4,
+            "normal": 0.5,
+            "roughness": 0.5,
+            "occlusion": 0.5,
+            "metallic": 0.5,
+            "specular": 0.5,
+            "displacement": 0.5,
         }
         yaml_texture_weights = getattr(params, "texture_loss_weights", None)
         if yaml_texture_weights is not None:

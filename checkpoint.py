@@ -91,6 +91,8 @@ def training_recipe(config):
                'enable_material_compare', 'material_compare_interval', 'eval_inference_tile'}
     result = {k: v for k, v in config_values(config).items() if k not in ignored and not k.startswith('groups_')}
     result['grid_training'] = [asdict(p) for p in config.grid_training]
+    result['normal_loss'] = 'encoded_mse'
+    result['material_metric_space'] = 'encoded_channels'
     return result
 
 

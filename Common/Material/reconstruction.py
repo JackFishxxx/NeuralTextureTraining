@@ -1,11 +1,11 @@
 """Material raster reconstruction and shared SR sources for training and evaluation."""
 import copy
-import math
+import json
+from pathlib import Path
 import torch
 from Core.Feature_Grid.sampling import resize_bilinear_repeat, tile_regions
 from .normal_encoding import decode_normal, normal_to_rgb
 from Core.Feature_Grid.compression import apply_latent_compression
-from .compression import MaterialCompression
 
 
 @torch.no_grad()
@@ -63,25 +63,62 @@ def make_deployment_model(model):
     return decoded
 
 
+def sr_base_source_mip(dataset, base_resolution):
+    """Return the GT mip whose actual maximum edge matches the requested base."""
+    if not isinstance(base_resolution, int) or isinstance(base_resolution, bool) or base_resolution < 1:
+        raise ValueError('SR base resolution must be a positive integer')
+    edges = [max(level.shape[:2]) for level in dataset.mip_cache]
+    if base_resolution not in edges:
+        raise ValueError(f'SR base resolution {base_resolution} must match a GT mip edge; available: {edges}')
+    return edges.index(base_resolution)
+
+
 @torch.no_grad()
-def cached_astc_base(dataset, codec, base_resolution, output_size):
-    """Compress the shared SR source mip once, independently of material output formats."""
-    formats = {group: 'ASTC'+codec.astc_block for group in dataset.texture_packing}
-    key = (tuple((id(t),t._version) for t in dataset.mip_cache),tuple(output_size),
+def _sr_base(dataset, compression, base_resolution):
+    """Cache the actual Baseline-codec bytes and their decoded native raster."""
+    recipe = compression.recipe(dataset)
+    astc = tuple((group, codec.astcenc_path, codec.astcenc_quality)
+                 for group, codec in compression.codecs.items()
+                 if group in recipe and hasattr(codec, 'astcenc_path'))
+    key = (tuple((id(t),t._version) for t in dataset.mip_cache),
            tuple((g,tuple(names)) for g,names in dataset.texture_packing.items()),dataset.normal_encoding,
-           codec.astcenc_path,codec.astcenc_quality,codec.astc_block,base_resolution)
+           tuple(recipe.items()),compression.tile_size,astc,base_resolution)
     previous = getattr(dataset,'_sr_base_cache',None)
     if previous is None or previous[0] != key:
-        ratio = max(dataset.texture_height,dataset.texture_width)/base_resolution
-        mip = min(max(0,round(math.log2(ratio))),dataset.num_mips-1)
+        mip = sr_base_source_mip(dataset, base_resolution)
         source = canonical_gt_mip(dataset,mip).float()
-        compression = MaterialCompression(formats,codec.astcenc_path,codec.astcenc_quality)
-        image = compression.roundtrip(source,dataset)
-        if tuple(image.shape[-2:]) != tuple(output_size):
-            image = resize_bilinear_repeat(image,output_size)
-        # Training and evaluation share this immutable GPU raster.
-        dataset._sr_base_cache = (key,image)
-    return dataset._sr_base_cache[1].to(dataset.mip_cache[0].device)
+        image, textures = compression.compress(source,dataset)
+        dataset._sr_base_cache = (key,image,textures,{})
+    return dataset._sr_base_cache
+
+
+def cached_sr_base(dataset, compression, base_resolution, output_size):
+    """Reuse the same compressed SR base for every training and deployment path."""
+    _, image, _, resized = _sr_base(dataset, compression, base_resolution)
+    size = tuple(output_size)
+    if size == tuple(image.shape[-2:]):
+        return image
+    if size not in resized:
+        resized[size] = resize_bilinear_repeat(image,size)
+    return resized[size]
+
+
+def export_sr_base(dataset, compression, base_resolution, directory):
+    """Export the low-resolution SR base as a single-level texture."""
+    _, image, textures, _ = _sr_base(dataset, compression, base_resolution)
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, data in textures.items():
+        (directory / name).write_bytes(data)
+    metadata = dict(formats=compression.recipe(dataset), size=list(image.shape[-2:]),
+                    source_gt_mip=sr_base_source_mip(dataset,base_resolution),
+                    payload_bytes=compression.payload_bytes(dataset,image.shape[-2:]),
+                    file_bytes=sum(map(len,textures.values())),
+                    normal_encoding=compression.normal_encoding(dataset),
+                    decoded_normal_encoding=dataset.normal_encoding,
+                    sampling='bilinear_repeat_to_native_material_size', mip_count=1)
+    (directory / 'metadata.json').write_text(json.dumps(metadata,indent=2),encoding='utf-8')
+    return metadata
 
 
 def postprocess_material(image: torch.Tensor, vis_mode: str, normal_encoding='xyz') -> torch.Tensor:

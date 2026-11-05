@@ -215,7 +215,6 @@ class Trainer(FeatureGridTraining):
         self.enable_material_compare = bool(configs.enable_material_compare)
         self.astcenc_path = str(configs.astcenc_path)
         self.astcenc_quality = str(getattr(configs, "astcenc_quality", "medium"))
-        self.astc_block = str(getattr(configs, "astc_block", "6x6"))
         self.material_compare_resolution = getattr(configs, "material_compare_resolution", None)
         self.enable_pbr_compare = bool(getattr(configs, "enable_pbr_compare", False))
         self.pbr_compare_interval = int(getattr(configs, "pbr_compare_interval", 5000))
@@ -318,7 +317,7 @@ class Trainer(FeatureGridTraining):
 
     def material_evaluation(self, *, baseline=True, material_override=None, primary_only=False):
         return evaluate_materials(self.model, self.dataset, self.configs, self.material_compression,
-                                  self.astc_codec, baseline=baseline, material_override=material_override,
+                                  baseline=baseline, material_override=material_override,
                                   primary_only=primary_only)
 
     @property
@@ -424,15 +423,10 @@ class Trainer(FeatureGridTraining):
             gt_texture = self.dataset.mip_cache[0][ys[:, 0], xs[:, 0]]
             gt_texture = self.dataset.expand_to_canonical(gt_texture).to(
                 torch.float32 if self.native_reconstruction else torch.float16)
-            superres_base = None
-            if self.super_resolution_enable:
-                superres_base = self.dataset.expand_to_canonical(
-                    self.dataset.superres_base_cache[0][ys[:, 0], xs[:, 0]]
-                ).to(torch.float16)
-
             us = (xs.float() + 0.5) / self.texture_width
             vs = (ys.float() + 0.5) / self.texture_height
             batch_input = torch.cat([us, vs, torch.zeros_like(us)], dim=1)
+            superres_base = self._sr_base_at_uv(batch_input[:, :2]) if self.super_resolution_enable else None
             if superres_base is not None:
                 batch_input = torch.cat([batch_input, superres_base], dim=1)
             total_loss = self._training_batch_loss(

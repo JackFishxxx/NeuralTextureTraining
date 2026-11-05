@@ -68,14 +68,6 @@ def prefiltered_material(dataset, size):
     return result.permute(2, 0, 1)[None].float()
 
 
-def clean_base_image(dataset, size):
-    """Sample the actual low-resolution SR source directly onto the native raster."""
-    ratio = max(dataset.texture_height, dataset.texture_width) / dataset.super_resolution_base_resolution
-    level = min(max(0, round(math.log2(ratio))) if ratio > 1 else 0, dataset.num_mips - 1)
-    image = dataset.expand_to_canonical(dataset.mip_cache[level]).permute(2, 0, 1)[None].float()
-    return resize_bilinear_repeat(image, size) if tuple(image.shape[-2:]) != tuple(size) else image
-
-
 def native_query_uv(uv, size):
     """Prepare shared native corners with fixed or exact output capacity.
 
@@ -228,9 +220,6 @@ class TextureDataset(torch.nn.Module):
         
         self.data_dir = config.data_dir
         self.normal_encoding = str(getattr(config, "normal_encoding", "xyz")).lower()
-        self.super_resolution_enable = bool(getattr(config, "super_resolution_enable", False))
-        self.super_resolution_base_resolution = int(getattr(config, "super_resolution_base_resolution", 512))
-        self.superres_input_max_edge = self.super_resolution_base_resolution
 
         self.keyword_order, self.texture_keywords, self.texture_configs = get_texture_config(self.normal_encoding)
         # mapping from texture type to channel slice [start, end) in current loaded data
@@ -248,13 +237,14 @@ class TextureDataset(torch.nn.Module):
         self.num_mips = int(min(math.log2(self.texture_height), math.log2(self.texture_width))) + 1
 
         self.mip_cache = self.generate_mip()
-        self.superres_base_cache = self.generate_superres_base() if self.super_resolution_enable else None
+        if config.super_resolution_enable:
+            from Common.Material.reconstruction import sr_base_source_mip
+            sr_base_source_mip(self, config.super_resolution_base_resolution)
     
     @torch.no_grad()
-    def sample_continuous(self, sample_xy: torch.Tensor, mips: Union[torch.Tensor, int],
-                          cache: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def sample_continuous(self, sample_xy: torch.Tensor, mips: Union[torch.Tensor, int]) -> torch.Tensor:
         """Bilinear repeat sampling; an integer mip avoids dynamic GPU masking."""
-        source = self.mip_cache if cache is None else cache
+        source = self.mip_cache
         fixed_mip = isinstance(mips, int)
         if fixed_mip:
             level = source[mips]
@@ -283,12 +273,6 @@ class TextureDataset(torch.nn.Module):
                 c01[mask], c11[mask] = level[y1[mask], x0[mask]], level[y1[mask], x1[mask]]
         return ((1-tx[:,None])*(1-ty[:,None])*c00 + tx[:,None]*(1-ty[:,None])*c10
                 + (1-tx[:,None])*ty[:,None]*c01 + tx[:,None]*ty[:,None]*c11)
-
-    @torch.no_grad()
-    def get_superres_base_continuous(self, sample_xy, mips):
-        if self.superres_base_cache is None:
-            raise RuntimeError("Super-resolution is not enabled")
-        return self.sample_continuous(sample_xy, mips, cache=self.superres_base_cache)
 
     @staticmethod
     def _is_single_channel_content(tensor: torch.Tensor, atol: float = 1.0 / 255.0) -> bool:
@@ -507,30 +491,6 @@ class TextureDataset(torch.nn.Module):
         mip_cache = [m.to(self.device) for m in mip_cache]
 
         return mip_cache
-
-    def generate_superres_base(self) -> TensorType["num_mips", "H", "W", "num_channels"]:
-        """Build baselines from a texture half the maximum feature-grid resolution."""
-        base_cache = []
-        texture_max_edge = max(self.texture_height, self.texture_width)
-        ratio = texture_max_edge / float(self.superres_input_max_edge)
-        source_mip_offset = max(0, int(round(math.log2(ratio)))) if ratio > 1.0 else 0
-        actual_source_edge = texture_max_edge // (2 ** source_mip_offset)
-        print(
-            f"[SuperResolution] feature_grid_max={self.superres_input_max_edge * 2}, "
-            f"input_texture_max={actual_source_edge}, source_mip_offset={source_mip_offset}"
-        )
-        for mip in range(self.num_mips):
-            out_h = self.texture_height // (2 ** mip)
-            out_w = self.texture_width // (2 ** mip)
-            source_mip = min(mip + source_mip_offset, self.num_mips - 1)
-            if source_mip == mip:
-                base_cache.append(self.mip_cache[mip].clone())
-                continue
-            low = self.mip_cache[source_mip].permute(2, 0, 1)[None].float()
-            upsampled = resize_bilinear_repeat(low, (out_h, out_w))
-            base_cache.append(upsampled.squeeze(0).permute(1, 2, 0))
-        return base_cache
-    
 
     def expand_to_canonical(self, x: torch.Tensor) -> torch.Tensor:
         """Expand the last dimension to canonical channels, filling absent textures with 0."""

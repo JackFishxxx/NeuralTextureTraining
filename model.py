@@ -12,6 +12,7 @@ from Core.Feature_Grid.feature_gradients import sample_feature_inputs, sample_fe
 from Core.Tile_CNN.material_cnn import MaterialCNN
 from Core.Feature_Grid.sampling import resize_bilinear_repeat
 from Common.Material.normal_encoding import NORMAL_XY_MIN_Z
+from Common.Material.compression import compressed_normal_encoding
 
 from Core.Feature_Grid.optimization import make_scheduler
 
@@ -70,7 +71,13 @@ class TCNNModel(torch.nn.Module):
         self.super_resolution_base_resolution = config.super_resolution_base_resolution
         self.material_reconstruction_size = tuple(getattr(config, 'material_reconstruction_size', ()))
         self.inference_size = tuple(getattr(config, 'material_cnn_inference_size', self.material_reconstruction_size))
-        self.sr_base_codec = dict(format='astc'+config.astc_block, quality=config.astcenc_quality)
+        self.sr_base_codec = None
+        if self.super_resolution_enable:
+            formats = config.material_compression_formats
+            self.sr_base_codec = dict(formats=formats.copy(), tile_size=config.fntc_tile_size,
+                                     normal_encoding=compressed_normal_encoding(self.normal_encoding, formats['normal']))
+            if any(name.startswith('ASTC') for name in formats.values()):
+                self.sr_base_codec['quality'] = config.astcenc_quality
         self.direct_diffuse_infer_mode = str(
             getattr(config, "direct_diffuse_infer_mode", "disable")
         ).lower()

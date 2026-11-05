@@ -12,12 +12,6 @@ from Core.Feature_Grid.feature_grid import FeatureGridSpec
 from Common.Material.compression import DEFAULT_FORMATS, parse_material_formats
 
 
-def _normalize_astc_block(value: str) -> tuple[str, tuple[int, int]]:
-    from Common.Block_Compression.astc import normalize_astc_block
-    block=normalize_astc_block(value)
-    return block,tuple(map(int,block.split('x')))
-
-
 def _load_yaml_defaults(config_path=None):
     """Load YAML config file as a dict of default values.
 
@@ -346,7 +340,6 @@ class Config():
         self.material_compression_formats = {group: fmt.name for group,fmt in parse_material_formats(params.material_compression_formats).items()}
         self.astcenc_path = params.astcenc_path
         self.astcenc_quality = params.astcenc_quality
-        self.astc_block, _ = _normalize_astc_block(params.astc_block)
         self.material_compare_resolution = getattr(params, "material_compare_resolution", None)
         if self.material_compare_resolution is not None and self.material_compare_resolution <= 0:
             raise ValueError('material_compare_resolution must be positive')
@@ -664,8 +657,6 @@ def get_args():
     parser.add_argument('--astcenc_quality', type=str, default='medium',
                         choices=['fastest', 'fast', 'medium', 'thorough', 'exhaustive'],
                         help='quality preset for ASTC latent, SR base and ASTC material formats')
-    parser.add_argument('--astc_block', type=str, default='6x6',
-                        help='shared SR base ASTC block size, independent of material and latent formats')
     parser.add_argument('--material_compare_resolution', type=int, default=None,
                         help='shared FNTC tile and baseline source max edge; omit to use the native material size')
 
@@ -718,7 +709,7 @@ def get_args():
     parser.add_argument('--super_resolution_enable', action=argparse.BooleanOptionalAction, default=False,
                         help='enable residual super-resolution from a lower-resolution texture mip')
     parser.add_argument('--super_resolution_base_resolution', type=int, default=512,
-                        help='base texture edge used for super-resolution residual input')
+                        help='exact maximum edge of a source GT mip used for the SR base')
     parser.add_argument('--n_neurons', type=int, default=16,
                         help='MLP hidden-layer width (keep a multiple of 16 for CutlassMLP)')
     parser.add_argument('--n_hidden_layers', type=int, default=0,

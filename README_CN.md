@@ -321,7 +321,7 @@ Scene 与 Detail 共用设备、几何、管线和阴影，每种材质只准备
 
 场景包含两个顶置平滑球体的方体。相机略微俯视，默认 Detail 视口（`center: [0.76, 0.59]`、`zoom: 3.5`）拉近到右侧球体与方体的局部，同时保留墙面、地面和投影。数据集加载时已将颜色转为线性，因此渲染器直接使用线性材质值及压缩 mip 纹素，避免重复 gamma 转换。OpenGL 源法线按对应的绿色通道约定解释。平行光、点光源均采用缓存的 1024 像素阴影贴图与 PCF 过滤。默认使用室内点光源；可选的室外平行光也会被天花板遮挡。着色采用 Cook-Torrance GGX、少量环境补光、Reinhard 色调映射及 sRGB 输出，不模拟全局光照。本次渲染修改后的 PBR 指标不能直接与旧报告比较。
 
-FNTC 存储统计计压缩 latent、decoder 和 CNN；材质 tile cache 大小单列。基线统计压缩材质 payload，不含容器头或共享 SR base。
+FNTC 存储统计计压缩 latent、decoder、CNN 和启用的 SR base；材质 tile cache 大小单列。基线统计压缩材质 payload，容器头均不计入。SR base 的实际 payload 与容器文件大小分别记录在导出的 `SR_Base/metadata.json`。
 
 ### ASTC 感知 Latent 训练
 
@@ -336,7 +336,7 @@ astc_codec_in_loop_interval: 100
 astc_decoder_projection_interval: 500
 ```
 
-`astc_codec_in_loop_interval` 控制 CPU 编码频率，CUDA 每步更新。`astc_decoder_projection_interval: 0` 关闭材质投影。`astcenc_path`、`astcenc_quality` 配置 ASTC 编码；`astc_block` 控制共享 SR base 的块尺寸，与各 grid 的 `format` 及材质基线格式独立。
+`astc_codec_in_loop_interval` 控制 CPU 编码频率，CUDA 每步更新。`astc_decoder_projection_interval: 0` 关闭材质投影。`astcenc_path`、`astcenc_quality` 配置实际使用的 ASTC 编码。SR base 严格复用 `material_compression_formats`；latent 块尺寸由各 grid 的 `format` 决定。
 
 原生可微代理支持 6x6 ASTC、每 grid 四通道，且该 grid 不承担 direct diffuse。其他块尺寸及八通道 ASTC grid 使用传统编码配合 round-trip STE；八通道占用两张 surface。本地构建所需的固定版本编码器源码会在缺失时下载到 `tools/astc_encoder_source/Source`。
 
@@ -408,11 +408,13 @@ bias，并增加 `decoder_output_bias` 作为输出层 bias。残差超分模式
 
 ### 神经纹理超分
 
-设置 `super_resolution_enable: true` 和 `super_resolution_base_resolution`，可将 ASTC 压缩的源 mip 与 latent 特征一起输入 decoder。decoder 预测有符号残差，在原生材质纹素中心计算 `clamp(bilinear_base + predicted_residual, 0, 1)`。此模式关闭 direct diffuse 推理。
+设置 `super_resolution_enable: true` 和 `super_resolution_base_resolution`，可将使用 Baseline 相同编码器、格式、打包及 tile 规则压缩的源 mip 与 latent 特征一起输入 decoder。默认 PC 的 base 为 BC7 diffuse / BC5 normal / BC1 ROMSD。表征、codec 优化、decoder、CNN、评估及推理共用该压缩 base。decoder 预测有符号残差，在原生材质纹素中心计算 `clamp(bilinear_base + predicted_residual, 0, 1)`。此模式关闭 direct diffuse 推理。
+
+`super_resolution_base_resolution` 必须匹配源 GT 某一级 mip 的实际最长边。材质报告和推理在 `Compare_Material/SR_Base/` 将该低分辨率 base 导出为单级纹理及元数据。元数据记录源 GT mip，模型 inference contract 记录格式与法线编码。
 
 材质栅格默认采用最大 latent 分辨率，不超过 GT 并保持宽高比。`material_compare_resolution` 可独立于 latent 分辨率覆盖 FNTC 推理及基线尺寸。材质 CNN 在推理栅格上运行，之后执行材质二次压缩。
 
-例如 1K latent＋512 SR base 对齐 2K GT，训练先重建 1K 材质，再通过其 bilinear-repeat 插值对 GT 计算损失并反传。base 从源 mip 直接采样到原生栅格。基线准备及 ASTC 投影使用材质专用预滤波，包含法线向量处理。PBR 按对比章节所述直接采样原生栅格。
+例如 1K latent＋512 SR base 对齐 2K GT，输出材质的 mip0 为 1K，base 对应它的 mip1、GT 的 mip2。训练先重建 1K 材质，再通过其 bilinear-repeat 插值对 GT 计算损失并反传。base 从源 mip 直接采样到原生栅格。基线准备及 ASTC 投影使用材质专用预滤波，包含法线向量处理。PBR 按对比章节所述直接采样原生栅格。
 
 ### BC1 latent 纹理
 

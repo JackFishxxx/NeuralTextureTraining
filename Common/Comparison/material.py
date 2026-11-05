@@ -11,7 +11,8 @@ from PIL import Image, ImageDraw, ImageFont
 import torchvision.transforms.functional as TF
 from Core.Feature_Grid.compression import latent_payload_bytes
 from Common.Material.reconstruction import (postprocess_material,
-                                            make_deployment_model,render_material_mip0,cached_astc_base)
+                                            make_deployment_model,render_material_mip0,cached_sr_base,
+                                            sr_base_source_mip,export_sr_base)
 from Core.Feature_Grid.sampling import resize_bilinear_repeat
 from dataset import prefiltered_material, material_size
 
@@ -68,14 +69,14 @@ class MaterialEvaluation:
 
 
 @torch.no_grad()
-def evaluate_materials(model, dataset, config, compression, sr_codec, *, baseline=True,
+def evaluate_materials(model, dataset, config, compression, *, baseline=True,
                        material_override=None, primary_only=False):
     size = material_size(model,dataset.texture_height,dataset.texture_width,
                          resolution=config.material_compare_resolution)
     native = material_override
     if native is None:
         decoded = make_deployment_model(model)
-        base = (cached_astc_base(dataset, sr_codec, config.super_resolution_base_resolution, size)
+        base = (cached_sr_base(dataset, compression, config.super_resolution_base_resolution, size)
                 if model.super_resolution_enable else None)
         native = render_material_mip0(decoded, size, config.device, superres_base=base,
                                       inference_tile=config.eval_inference_tile)
@@ -135,14 +136,14 @@ def write_metrics(directory, records, *, evaluation, iteration=None, metadata=No
     directory.mkdir(parents=True, exist_ok=True)
     records = [dict(row, iteration=iteration) for row in records]
     report = dict(schema_version=2, evaluation=evaluation, iteration=iteration,
-                  storage_scope=dict(unit='bytes', mip=0, sr_base_included=False, container_overhead_included=False),
+                  storage_scope=dict(unit='bytes', mip=0, sr_base_included=True, container_overhead_included=False),
                   metric_definitions={
                       'psnr': 'dB; image MSE or weighted group mean; exact image matches report 120 dB',
                       'normal': 'PSNR/SSIM on encoded channels; LPIPS averages scalar channels replicated to RGB',
                       'average': 'weighted mean of group scores, using the sum of effective channel weights',
                       'romsd_lpips': 'mean of per-scalar LPIPS, each scalar replicated to RGB',
                       'lpips_status': 'not_computed is null in JSON and empty in CSV; never a perfect score',
-                      'storage': 'bytes; Mip0 deployment payload; SR base and file containers excluded',
+                      'storage': 'bytes; Mip0 deployment payload including enabled SR base; file containers and runtime output cache excluded',
                   }, metadata=metadata or {}, records=records)
     text = json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2) + '\n'
     (directory/'metrics.json').write_text(text, encoding='utf-8')
@@ -380,21 +381,25 @@ def log_comparison_storage(model, dataset, compression, config, *, verbose=True,
     latent = latent_payload_bytes(model)
     decoder, cnn = model.decoder_storage_bytes(deployment_config)
     tile = compression.payload_bytes(dataset, size)
+    base = 0
+    if model.super_resolution_enable:
+        level = dataset.mip_cache[sr_base_source_mip(dataset,config.super_resolution_base_resolution)]
+        base = compression.payload_bytes(dataset,level.shape[:2])
     channels = sum(b-a for name in dataset.available_textures
                    for a,b in [dataset.canonical_channel_slices[name]])
-    storage = {UNCOMPRESSED: latent+decoder+cnn,
+    storage = {UNCOMPRESSED: latent+decoder+cnn+base,
                baseline_method(compression,dataset): tile,
                'GT': dataset.texture_height*dataset.texture_width*channels}
     if config.material_recompression_enable:
-        storage[recompressed_method(compression,dataset)] = latent+decoder+cnn
+        storage[recompressed_method(compression,dataset)] = latent+decoder+cnn+base
     if verbose:
         for name, count in storage.items():
-            detail = (f'latent={latent:,} B + decoder={decoder:,} B + material CNN={cnn:,} B'
+            detail = (f'latent={latent:,} B + decoder={decoder:,} B + material CNN={cnn:,} B + SR base={base:,} B'
                       + (f'; output tile cache={tile:,} B separately' if name.startswith('FNTC_Recompressed') else '')
                       if name.startswith('FNTC_') else
                       'material tiles' if name != 'GT' else 'UNORM8 effective channels')
             print(f'[Storage] {name} total={count:,} B ({count/1024:.2f} KiB) | {detail}; '
-                  f'tile={compression.tile_size}; Mip0 payload only; SR base and containers excluded')
+                  f'tile={compression.tile_size}; Mip0 payload only; containers excluded')
     return storage
 
 
@@ -452,7 +457,7 @@ def save_material_images(evaluation, dataset, compression, metric_objects, direc
 def run_material_comparison_pipeline(trainer, *, evaluation=None, curr_iter=None, output_root=None,
                                      verbose=True, save_outputs=True, report_context=None):
     evaluation = evaluation or evaluate_materials(trainer.model, trainer.dataset, trainer.configs,
-                                                  trainer.material_compression, trainer.astc_codec)
+                                                  trainer.material_compression)
     compression, dataset = trainer.material_compression, trainer.dataset
     gt = evaluation.images['GT']
     metrics = {name: trainer._compute_material_metrics(image,gt)
@@ -467,9 +472,12 @@ def run_material_comparison_pipeline(trainer, *, evaluation=None, curr_iter=None
                for r in metric_records(groups,name,storage_bytes=storage[name],
                                         lpips_available=min(gt.shape[-2:])>=128)]
     primary = primary_method(compression,dataset,trainer.configs.material_recompression_enable)
+    sr_base = (export_sr_base(dataset,compression,trainer.configs.super_resolution_base_resolution,root/'SR_Base')
+               if trainer.model.super_resolution_enable else None)
     write_metrics(root,records,evaluation='material',iteration=curr_iter,
                   metadata=dict(report_context or {},primary_method=primary,
                                 compression_formats=compression.recipe(dataset),
+                                sr_base=sr_base,
                                 fntc_tile_size=trainer.configs.fntc_tile_size,
                                 tile_layout=compression.tile_layout(dataset,evaluation.size),
                                 dds_mipmaps='assembled full-material chains down to 1x1; storage_bytes counts Mip0 only',
@@ -479,7 +487,7 @@ def run_material_comparison_pipeline(trainer, *, evaluation=None, curr_iter=None
                                 latent_formats=[r.as_config() for r in trainer.model.grid_compressions],
                                 gt_size=list(gt.shape[-2:]),inference_size=list(evaluation.size),
                                 screenshot_size=list(gt.shape[-2:]),storage_bytes=storage,
-                                storage_meaning={'FNTC':'compressed latent + decoder + CNN; output tile cache reported separately',
+                                storage_meaning={'FNTC':'compressed latent + decoder + CNN + enabled SR base; output tile cache reported separately',
                                                  'Baseline':'compressed material textures'},
                                 output_tile_cache_bytes=(compression.payload_bytes(dataset,evaluation.size)
                                                         if trainer.configs.material_recompression_enable else 0),

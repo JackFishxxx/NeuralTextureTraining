@@ -290,6 +290,8 @@ def run_pbr_comparison_pipeline(trainer, evaluation, output_root, *, curr_iter=N
                                     shadows='depth maps; 3x3 PCF; directional and point lights',
                                     shadow_resolution=scene.shadow_size,
                                     compression_formats=compression.recipe(dataset),storage_bytes=storage,
+                                    sr_base_codec=trainer.model.sr_base_codec if trainer.super_resolution_enable else None,
+                                    sr_base_resolution=config.super_resolution_base_resolution if trainer.super_resolution_enable else None,
                                     fntc_tile_size=config.fntc_tile_size,
                                     gt_size=[dataset.texture_height,dataset.texture_width],
                                     inference_size=list(evaluation.size),

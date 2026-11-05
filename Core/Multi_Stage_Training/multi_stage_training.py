@@ -28,8 +28,8 @@ def fit_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5,
     model = trainer.model
     if not trainer.mip0_only or not model.quantize or model.direct_diffuse_enabled:
         raise ValueError('Decoder fitting requires quantized Mip0 without direct diffuse')
-    if trainer.super_resolution_enable and trainer.astc_superres_base_mip0 is None:
-        raise ValueError('A deployment ASTC base is required for decoder fitting')
+    if trainer.super_resolution_enable and trainer.sr_base_native is None:
+        raise ValueError('A deployment SR base is required for decoder fitting')
     source = [grid.params.detach().clone() for grid in model.feature_grids]
     was_training = model.training
     started = time.perf_counter()

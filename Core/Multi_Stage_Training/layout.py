@@ -62,7 +62,7 @@ def _select(trainer, proposal, grid_index=0):
                               (xy[..., 0] + .5) / trainer.texture_height), -1).reshape(-1, 2)
             target = trainer.dataset.expand_to_canonical(trainer.dataset.sample_continuous(xy.reshape(-1, 2), 0)).to(
                 torch.float32 if (scale_y, scale_x) != (1, 1) else torch.float16)
-            base = trainer._astc_base_at_uv(uv)
+            base = trainer._sr_base_at_uv(uv)
             inputs = torch.cat((uv, torch.zeros(len(uv), 1, device=model.device)), 1)
             if base is not None:
                 inputs = torch.cat((inputs, base), 1)
@@ -113,7 +113,7 @@ def refit_layout(trainer, steps):
     if (not trainer.mip0_only or not model.quantize or model.direct_diffuse_enabled
             or model._decoder_adaptation_features is not None):
         return {'applied': False, 'reason': 'requires quantized Mip0 outside direct diffuse/adaptation'}
-    if trainer.super_resolution_enable and trainer.astc_superres_base_mip0 is None:
+    if trainer.super_resolution_enable and trainer.sr_base_native is None:
         raise ValueError('Layout refitting requires the deployment SR base')
     original_proxies = torch.nn.ModuleList(list(model.grid_proxies))
     saved_codecs = [{k: v.detach().clone() for k, v in proxy.state_dict().items()}
@@ -158,7 +158,7 @@ def refit_layout(trainer, steps):
             uv = torch.stack(((ids % width + .5)/width, (ids // width + .5)/height), 1)
             target = trainer.dataset.expand_to_canonical(trainer.dataset.mip_cache[0][ids // width, ids % width]).to(
                 torch.float32 if material_size(model, height, width) != (height, width) else torch.float16)
-            base = trainer._astc_base_at_uv(uv)
+            base = trainer._sr_base_at_uv(uv)
             inputs = torch.cat((uv, torch.zeros(len(uv), 1, device=model.device)), 1)
             if base is not None:
                 inputs = torch.cat((inputs, base), 1)
@@ -221,7 +221,7 @@ def refit_layout(trainer, steps):
                 optimizer.zero_grad(set_to_none=True)
                 loss = reconstruction(ids)
                 if trainer.subpixel_sampling_enable and trainer.subpixel_sampling_ratio > 0:
-                    inputs, target, base = trainer._sample_astc_subpixel_batch(proxy=True)
+                    inputs, target, base = trainer._sample_subpixel_batch()
                     loss += trainer.subpixel_sampling_ratio * trainer._compute_material_reconstruction_loss(
                         target, trainer._predict_material(inputs), base, weights)
                 loss.backward()

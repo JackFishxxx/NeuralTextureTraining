@@ -61,7 +61,7 @@ class ASTCTrainingOperations:
             resolution = spec.max_resolution
             target = prefiltered_material(self.dataset, (resolution, resolution))[0]
             target = target.permute(1, 2, 0).reshape(-1, model.num_channels)
-            base = self.astc_superres_base_mip0.permute(2, 0, 1)[None].float()
+            base = self.sr_base_native
             if base.shape[-2:] != (resolution, resolution):
                 base = resize_bilinear_repeat(base, (resolution, resolution))
             base = base[0].permute(1, 2, 0).reshape(-1, model.num_channels)

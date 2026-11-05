@@ -93,6 +93,8 @@ def training_recipe(config):
     result['grid_training'] = [asdict(p) for p in config.grid_training]
     result['normal_loss'] = 'encoded_mse'
     result['material_metric_space'] = 'encoded_channels'
+    if config.super_resolution_enable:
+        result['sr_base'] = 'baseline_material_codec_all_stages_v1'
     return result
 
 

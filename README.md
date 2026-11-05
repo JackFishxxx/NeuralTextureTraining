@@ -324,7 +324,7 @@ Scene and Detail share the device, geometry, pipelines and shadows. Each materia
 
 The room contains two boxes topped by smooth spheres. The elevated camera and default Detail viewport (`center: [0.76, 0.59]`, `zoom: 3.5`) show a close-up of part of the right sphere and its supporting box, together with the wall, floor and cast shadows. Dataset loading already linearizes albedo, so the renderer consumes linear material values and compressed mip texels directly. OpenGL source normals use the appropriate green-channel convention. Directional and point lights use cached 1024-pixel shadow maps with PCF. Interior point lights are enabled by default; optional directional sunlight is also occluded by the room ceiling. Shading uses Cook-Torrance GGX, a small ambient fill, Reinhard tone mapping and sRGB output; it does not simulate global illumination. These rendering changes invalidate comparisons with earlier PBR metric reports.
 
-FNTC storage counts compressed latents, decoder and CNN; material tile cache bytes are reported separately. Baseline storage counts compressed material payload. Containers and the shared SR base are excluded.
+FNTC storage counts compressed latents, decoder, CNN and the enabled low-resolution SR base; material tile cache bytes are reported separately. Baseline storage counts compressed material payload. Containers are excluded. Exported `SR_Base/metadata.json` records payload and file sizes separately.
 
 ### ASTC-Aware Latent Training
 
@@ -339,7 +339,7 @@ astc_codec_in_loop_interval: 100
 astc_decoder_projection_interval: 500
 ```
 
-`astc_codec_in_loop_interval` controls CPU encoding frequency; CUDA updates run every step. Set `astc_decoder_projection_interval: 0` to disable material projection. `astcenc_path` and `astcenc_quality` configure ASTC encoding; `astc_block` controls the shared SR base footprint independently of each grid's `format` and the material baseline formats.
+`astc_codec_in_loop_interval` controls CPU encoding frequency; CUDA updates run every step. Set `astc_decoder_projection_interval: 0` to disable material projection. `astcenc_path` and `astcenc_quality` configure ASTC encoding where used. SR base formats follow `material_compression_formats`; latent footprints follow each grid's `format`.
 
 The native proxy supports 6x6 ASTC with four channels per grid and direct diffuse disabled on that grid. Other footprints and eight-channel ASTC grids use conventional ASTC encoding with a round-trip STE; eight channels occupy two surfaces. Native builds download pinned encoder source to `tools/astc_encoder_source/Source` if absent.
 
@@ -417,11 +417,13 @@ for the output layer. In residual SR mode, the decoder output is signed and skip
 
 ### Neural Texture Super-Resolution
 
-Set `super_resolution_enable: true` and `super_resolution_base_resolution` to provide an ASTC-compressed source mip alongside the latent features. The decoder predicts a signed residual, combined as `clamp(bilinear_base + predicted_residual, 0, 1)` at native material texel centers. This mode disables direct-diffuse inference.
+Set `super_resolution_enable: true` and `super_resolution_base_resolution` to provide a source mip compressed with the Baseline's exact codecs, formats, packing and tile rules alongside the latent features. The PC preset uses BC7 diffuse / BC5 normal / BC1 ROMSD. Representation learning, codec optimization, decoder fitting, CNN, evaluation and inference share this compressed base. The decoder predicts a signed residual, combined as `clamp(bilinear_base + predicted_residual, 0, 1)` at native material texel centers. This mode disables direct-diffuse inference.
+
+`super_resolution_base_resolution` must match the actual maximum edge of a source GT mip. Material reports and inference export this low-resolution base as single-level textures with metadata under `Compare_Material/SR_Base/`. Metadata records the source GT mip; the model inference contract records the formats and normal encoding.
 
 The material raster follows the largest latent resolution, capped by GT and preserving aspect ratio. `material_compare_resolution` overrides FNTC inference and baseline dimensions independently of latent resolution. Material CNN filtering runs on the inference raster before material recompression.
 
-For a 1K latent and 512 SR base against 2K GT, training reconstructs a 1K material and differentiates through its bilinear-repeat interpolation to GT. The base is sampled directly from its source mip onto the native raster. Baseline preparation and ASTC projection use material-aware prefiltering, including normal-vector handling. PBR samples native rasters as described in the comparison section.
+For a 1K latent and 512 SR base against 2K GT, the output material mip0 is 1K, and the base corresponds to its mip1 and the GT's mip2. Training reconstructs the 1K material and differentiates through its bilinear-repeat interpolation to GT. The base is sampled directly from its source mip onto the native raster. Baseline preparation and ASTC projection use material-aware prefiltering, including normal-vector handling. PBR samples native rasters as described in the comparison section.
 
 ### BC1 latent textures
 

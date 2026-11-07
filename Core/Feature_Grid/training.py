@@ -89,6 +89,25 @@ class FeatureGridTraining(ASTCTrainingOperations):
             return self.model(inputs)
         base_sampler = self._sr_base_sampler if self.super_resolution_enable else None
         uv = inputs[:, :2]
+        if (self.model.training and torch.is_grad_enabled() and uv.is_cuda and uv.dtype == torch.float32
+                and not uv.requires_grad and len(uv) and len(uv)*4 <= size[0]*size[1]//2
+                and not torch.is_autocast_enabled()
+                and not self.model.direct_diffuse_enabled
+                and all(spec.n_levels == 1 and size == (spec.max_resolution, spec.max_resolution)
+                        for spec in self.model.feature_grid_specs)):
+            from .material_graph import MaterialQueryGraphs
+
+            graphs = getattr(self, '_material_query_graphs', None)
+            if (graphs is None or graphs.model is not self.model or graphs.size != size
+                    or graphs.base_sampler is not base_sampler
+                    or (base_sampler is not None and graphs.base_version != base_sampler.image._version)):
+                graphs = self._material_query_graphs = MaterialQueryGraphs(self.model, size, base_sampler)
+            params = tuple(self.model._get_qat_grid_params(i, grid)
+                           if self.model.quantize or self.model._decoder_adaptation_features is not None
+                           else grid.params for i, grid in enumerate(self.model.feature_grids))
+            prediction = graphs(uv, params)
+            return (prediction - inputs[:, 2 + (not self.mip0_only):].float()
+                    if self.super_resolution_enable else prediction)
         query_plan = None
         if uv.is_cuda and not uv.requires_grad and len(uv) and len(uv)*4 <= size[0]*size[1]//2:
             key = (len(uv), uv.dtype, uv.device, size)

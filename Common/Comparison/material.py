@@ -444,13 +444,16 @@ def save_material_images(evaluation, dataset, compression, metric_objects, direc
             scores = {group: (values[0],values[1],values[2] if min(height,width)>=128 else None)}
             label = f'{filename}_{format_name}' if filename == 'FNTC_Recompressed' else filename
             tile = _make_annotated_tile(visual, label, scores, group)
-            tile.save(directory/f'{prefix}_{filename}.png')
+            # Lossless PNG at a low compression level keeps report generation
+            # from blocking training on CPU compression of 2K/8K panels.
+            tile.save(directory/f'{prefix}_{filename}.png', compress_level=1)
             panels[filename] = tile
         order = [UNCOMPRESSED]
         if 'FNTC_Recompressed' in panels:
             order.append('FNTC_Recompressed')
         order += [format_name,f'GT[{width}x{height}]']
-        _concat_pil_h([panels[name] for name in order]).save(directory/f'comparison_strip_{prefix}.png')
+        _concat_pil_h([panels[name] for name in order]).save(
+            directory/f'comparison_strip_{prefix}.png', compress_level=1)
 
 
 @torch.no_grad()

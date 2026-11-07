@@ -14,6 +14,17 @@ from Common.Material.reconstruction import cached_sr_base, make_deployment_model
 from dataset import material_size
 from .material_cnn import MaterialCNN
 from checkpoint import atomic_torch_save
+from Common.cuda_graph import make_graphed_callables
+
+
+class _PatchObjective(torch.nn.Module):
+    """Expose CNN parameters to the graphed loss's autograd function."""
+    def __init__(self, post, loss_at):
+        super().__init__()
+        self.post, self.loss_at = post, loss_at
+
+    def forward(self, origins):
+        return self.loss_at(origins)
 
 
 def validate_training_size(gt_size, inference_size):
@@ -204,12 +215,18 @@ def fit_material_cnn(trainer, steps=50000, validation_interval=1000, resume_stat
 
     checkpoint()
     post.train()
+    training_loss = loss_at
+    if cuda_device is not None and completed < steps:
+        # Patch shapes, source maps and loss weights stay fixed for this stage.
+        # Capture forward/backward together; Adam/LR/validation stay outside.
+        # Reuse validation positions so capture does not advance the RNG.
+        training_loss = make_graphed_callables(_PatchObjective(post, loss_at), (validation[:4].clone(),))
     for step in range(completed+1, steps+1):
         ratio = step/steps
         lr = .001 if ratio <= .5 else (.0003 if ratio <= .8 else .0001)
         optimizer.param_groups[0]['lr'] = lr
         optimizer.zero_grad(set_to_none=True)
-        loss = loss_at(positions(4))
+        loss = training_loss(positions(4))
         loss_value = float(loss.detach())
         if not math.isfinite(loss_value):
             raise RuntimeError('Nonfinite material CNN training loss')

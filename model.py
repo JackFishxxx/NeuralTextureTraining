@@ -8,7 +8,7 @@ from torchtyping import TensorType
 
 from configs import Config
 from Core.Positional_Encoding.positional_encoding import TiledPositionalEncoding
-from Core.Feature_Grid.feature_gradients import sample_feature_inputs, sample_feature_centers
+from Core.Feature_Grid.feature_gradients import sample_feature_inputs, sample_feature_centers, gradient_directions
 from Core.Tile_CNN.material_cnn import MaterialCNN
 from Core.Feature_Grid.sampling import resize_bilinear_repeat
 from Common.Material.normal_encoding import NORMAL_XY_MIN_Z
@@ -140,11 +140,14 @@ class TCNNModel(torch.nn.Module):
         self.feature_grids = torch.nn.ModuleList()
         self.feature_grid_specs = []
 
-        for grid_cfg in config.feature_grid_configs:
+        for idx, grid_cfg in enumerate(config.feature_grid_configs):
             spec = FeatureGridSpec.from_config(grid_cfg, config.quantize_bits, config.learning_rate)
             if self.mip0_only:
                 spec = FeatureGridSpec(**{**spec.__dict__, 'n_levels': 1, 'base_resolution': spec.max_resolution})
             self.feature_grid_specs.append(spec)
+            self.register_buffer(f'_center_shifts_{idx}', torch.tensor(
+                ((0, 0), *gradient_directions(spec.feature_gradient_count)),
+                device=self.device, dtype=torch.long), persistent=False)
             max_res = spec.max_resolution
             n_levels = spec.n_levels
             qbits = spec.quantize_bits
@@ -402,7 +405,7 @@ class TCNNModel(torch.nn.Module):
             return features
         return features.reshape(len(features), -1, 4)[..., :3].flatten(1)
 
-    def forward(self, x: torch.Tensor, *, native_size=None) -> TensorType["batch_size", "num_channels"]:
+    def _prepare_decoder_inputs(self, x, *, native_size=None, grid_params=None):
 
         coordinate_dims = 2 + (not self.mip0_only)
         expected_dims = coordinate_dims + (self.num_channels if self.super_resolution_enable else 0)
@@ -427,14 +430,17 @@ class TCNNModel(torch.nn.Module):
         for idx, feature_grid in enumerate(self.feature_grids):
             spec = self.feature_grid_specs[idx]
             active_params = None
-            if self._decoder_adaptation_features is not None:
+            if grid_params is not None:
+                active_params = grid_params[idx]
+            elif self._decoder_adaptation_features is not None:
                 active_params = self._decoder_adaptation_features[idx]
             elif self.quantize and self.training:
                 active_params = self._get_qat_grid_params(idx, feature_grid)
             params = active_params if active_params is not None else feature_grid.params
             if (native_size == (spec.max_resolution, spec.max_resolution) and spec.n_levels == 1
                     and uvs.dtype == torch.float32 and not uvs.requires_grad):
-                sampled_features = sample_feature_centers(params, spec, uvs)
+                sampled_features = sample_feature_centers(
+                    params, spec, uvs, shifts=getattr(self, f'_center_shifts_{idx}'))
             else:
                 grid_levels = spec.n_levels
                 clipped_mips = torch.clamp(mips, max=grid_levels - num_sampled_mips)
@@ -457,6 +463,10 @@ class TCNNModel(torch.nn.Module):
         input_parts.append(torch.ones((len(x), 1), device=x.device, dtype=features.dtype))
         inputs = torch.cat(input_parts, dim=1)
 
+        return inputs, direct_diffuse
+
+    def forward(self, x: torch.Tensor, *, native_size=None) -> TensorType["batch_size", "num_channels"]:
+        inputs, direct_diffuse = self._prepare_decoder_inputs(x, native_size=native_size)
         outputs = self.network(inputs) + self.decoder_output_bias.to(dtype=self.network.params.dtype)
         if not self.super_resolution_enable:
             outputs = self._apply_output_activation(outputs)

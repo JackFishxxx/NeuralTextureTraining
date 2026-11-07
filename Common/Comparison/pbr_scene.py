@@ -184,10 +184,10 @@ def _save_render_panels(images, metrics, directory, path, prefix):
     canvas = Image.new('RGB', (sum(p.width for p in panels), panels[0].height))
     x = 0
     for (name,image),panel in zip(images.items(),panels):
-        panel.save(os.path.join(directory, prefix+name+'.png'))
+        panel.save(os.path.join(directory, prefix+name+'.png'), compress_level=1)
         canvas.paste(panel,(x,0))
         x += panel.width
-    canvas.save(path)
+    canvas.save(path, compress_level=1)
 
 
 @torch.no_grad()

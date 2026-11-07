@@ -96,7 +96,7 @@ class FeatureGridTraining(ASTCTrainingOperations):
                 self._native_query_plans[key] = NativeQueryPlan(uv, size)
             query_plan = self._native_query_plans[key]
         prediction = sample_material(self.model, uv, size, base_sampler=base_sampler, query_plan=query_plan)
-        return prediction - inputs[:, 3:].float() if self.super_resolution_enable else prediction
+        return prediction - inputs[:, 2 + (not self.mip0_only):].float() if self.super_resolution_enable else prediction
 
     def _begin_codec_step(self, curr_iter):
         self.model.current_iter = curr_iter
@@ -177,7 +177,7 @@ class FeatureGridTraining(ASTCTrainingOperations):
         uv = torch.stack(
             ((xy[:, 1] + 0.5) / self.texture_width, (xy[:, 0] + 0.5) / self.texture_height), 1
         )
-        inputs = torch.cat((uv, torch.zeros((count, 1), device=self.device)), 1)
+        inputs = uv if self.mip0_only else torch.cat((uv, uv.new_zeros((count, 1))), 1)
         base = None
         if self.super_resolution_enable:
             base = self._sr_base_at_uv(uv)
@@ -186,7 +186,7 @@ class FeatureGridTraining(ASTCTrainingOperations):
 
     def _codec_batch_loss(self, inputs, target, weights, curr_iter):
         self._ensure_grid_proxies()
-        base = inputs[:, 3:] if self.super_resolution_enable else None
+        base = inputs[:, 2 + (not self.mip0_only):] if self.super_resolution_enable else None
         self._codec_batches = [(inputs, target, base, 1.0, True)]
         self._codec_loss_weights = weights
         self.model.codec_branch_enabled = True

@@ -23,11 +23,14 @@ from Common.Material.normal_encoding import (
 ROMSD_TYPES = ('roughness', 'occlusion', 'metallic', 'specular', 'displacement')
 
 
-def build_texture_packing(available_textures, romsd_format: str) -> Dict[str, List[str]]:
-    """Pack actual maps in R/O/M/S/D priority, excluding BC1's binary alpha."""
+def build_texture_packing(available_textures, romsd_format: str, diffuse_format: str = 'BC7') -> Dict[str, List[str]]:
+    """Keep at most four scalars; move AO to BC7 alpha when ROMSD uses BC1."""
     available = set(available_textures)
     groups = {name: [name] for name in ('diffuse', 'normal') if name in available}
-    scalars = [name for name in ROMSD_TYPES if name in available]
+    scalars = [name for name in ROMSD_TYPES if name in available][:4]
+    if romsd_format == 'BC1' and diffuse_format == 'BC7' and 'diffuse' in groups and 'occlusion' in scalars:
+        groups['diffuse'].append('occlusion')
+        scalars.remove('occlusion')
     if scalars:
         capacity = 3 if romsd_format == 'BC1' else 4
         groups['romsd'] = scalars[:capacity]
@@ -139,7 +142,7 @@ def sample_material(model, uv, size, base_image=None, *, base_sampler=None, quer
     rather than latent features, interpolate. Dense batches share predictions.
     """
     centers, inverse, weights = query_plan(uv) if query_plan is not None else native_query_uv(uv, size)
-    inputs = torch.cat((centers, centers.new_zeros((len(centers), 1))), 1)
+    inputs = centers if model.mip0_only else torch.cat((centers, centers.new_zeros((len(centers), 1))), 1)
     base = (base_sampler(centers) if base_sampler is not None
             else sample_image(base_image, centers) if base_image is not None else None)
     if base is not None:
@@ -192,18 +195,21 @@ def get_texture_config(normal_encoding: str = "xyz") -> List[Dict]:
     return keyword_order, texture_keywords, texture_configs
 
 
-def get_canonical_num_channels(normal_encoding: str = "xyz") -> int:
+def get_canonical_num_channels(normal_encoding: str = "xyz", texture_types=None) -> int:
     """Total canonical channels aligned with the selected normal encoding."""
     keyword_order, _, texture_configs = get_texture_config(normal_encoding)
-    return sum(texture_configs[t]["expected_channels"] for t in keyword_order)
+    return sum(texture_configs[t]["expected_channels"] for t in keyword_order
+               if texture_types is None or t in texture_types)
 
 
-def get_canonical_channel_slices_static(normal_encoding: str = "xyz") -> Dict[str, tuple]:
+def get_canonical_channel_slices_static(normal_encoding: str = "xyz", texture_types=None) -> Dict[str, tuple]:
     """Return (start, end) slice in the canonical layout for each texture type."""
     keyword_order, _, texture_configs = get_texture_config(normal_encoding)
     out = {}
     idx = 0
     for t in keyword_order:
+        if texture_types is not None and t not in texture_types:
+            continue
         n = texture_configs[t]["expected_channels"]
         out[t] = (idx, idx + n)
         idx += n
@@ -219,18 +225,19 @@ class TextureDataset(torch.nn.Module):
         self.device = config.device
         
         self.data_dir = config.data_dir
-        self.normal_encoding = str(getattr(config, "normal_encoding", "xyz")).lower()
+        from Common.Material.compression import compressed_normal_encoding
+        self.normal_encoding = compressed_normal_encoding(
+            str(getattr(config, "normal_encoding", "xyz")).lower(), config.material_compression_formats['normal'])
 
         self.keyword_order, self.texture_keywords, self.texture_configs = get_texture_config(self.normal_encoding)
         # mapping from texture type to channel slice [start, end) in current loaded data
         self.channel_slices = {}
-        # (start, end) in the canonical 11-channel layout for each texture type, aligned with model
-        self.canonical_channel_slices = get_canonical_channel_slices_static(self.normal_encoding)
-        self.canonical_num_channels = get_canonical_num_channels(self.normal_encoding)
         # ordered available texture types that were found and concatenated
         self.available_textures = []
 
         self.textures = self.load_data()
+        self.canonical_channel_slices = self.channel_slices.copy()
+        self.canonical_num_channels = self.textures.shape[-1]
         self.texture_height, self.texture_width, self.num_channels = self.textures.shape
         self.material_reconstruction_size = material_size(config, self.texture_height, self.texture_width)
         
@@ -376,7 +383,8 @@ class TextureDataset(torch.nn.Module):
             textures[texture_type] = tensor
 
         romsd_format = self.config.material_compression_formats['romsd']
-        self.texture_packing = build_texture_packing(textures, romsd_format)
+        self.texture_packing = build_texture_packing(textures, romsd_format,
+                                                  self.config.material_compression_formats['diffuse'])
         active = {name for names in self.texture_packing.values() for name in names}
         for name in list(textures):
             if name not in active:
@@ -493,22 +501,17 @@ class TextureDataset(torch.nn.Module):
         return mip_cache
 
     def expand_to_canonical(self, x: torch.Tensor) -> torch.Tensor:
-        """Expand the last dimension to canonical channels, filling absent textures with 0."""
-        out = x.new_zeros((*x.shape[:-1], self.canonical_num_channels))
-        for tex_type in self.available_textures:
-            ds_start, ds_end = self.channel_slices[tex_type]
-            canon_start, canon_end = self.canonical_channel_slices[tex_type]
-            out[..., canon_start:canon_end] = x[..., ds_start:ds_end]
-        return out
+        """Loaded data already uses the compact network channel layout."""
+        return x
 
 
     def get_canonical_loss_weights(self, config_weights: Optional[Dict[str, float]] = None) -> List[float]:
-        """Return per-channel loss weights of canonical length; channels for missing textures are 0."""
+        """Return per-channel loss weights for the retained textures."""
         weights = [0.0] * self.canonical_num_channels
         for tex_type in self.keyword_order:
-            canon_start, canon_end = self.canonical_channel_slices[tex_type]
             if tex_type not in self.available_textures:
                 continue
+            canon_start, canon_end = self.canonical_channel_slices[tex_type]
             cfg = self.texture_configs[tex_type]
             w = config_weights.get(tex_type, cfg.get("loss_weight", 1.0)) if config_weights else cfg.get("loss_weight", 1.0)
             for i in range(canon_start, canon_end):
@@ -517,7 +520,7 @@ class TextureDataset(torch.nn.Module):
 
     def get_vis_configs(self) -> List[Dict]:
         """Return a list of visualization configs for all available textures.
-        Each entry: texture_type, display_name, vis_mode, channel_slice (dataset order), canonical_channel_slice (0..11).
+        Each entry includes the texture's compact dataset and network channel slices.
         """
         vis = []
         for tex_type in self.available_textures:

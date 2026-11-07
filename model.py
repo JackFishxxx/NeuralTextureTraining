@@ -22,7 +22,14 @@ from Core.Feature_Grid.feature_grid import (
     feature_to_unorm, qat_noise_multiplier, quantize_feature_ste, quantize_feature_tensor,
     unorm_to_feature,
 )
-from dataset import get_canonical_num_channels
+from dataset import get_canonical_channel_slices_static
+
+
+def _feature_input_channels(config):
+    return [grid['n_features_per_level'] * 3 // 4
+            if recipe.format == 'bc1' and not getattr(config, 'bcn_alpha_input_enable', False)
+            else grid['n_features_per_level']
+            for grid, recipe in zip(config.feature_grid_configs, config.grid_compressions)]
 
 
 class TCNNModel(torch.nn.Module):
@@ -57,6 +64,7 @@ class TCNNModel(torch.nn.Module):
         self.n_hidden_layers = config.n_hidden_layers
         self.output_activation = getattr(config, "output_activation", "hard_swish")
         self.grid_compressions = config.grid_compressions
+        self.feature_input_channels = _feature_input_channels(config)
         self.astcenc_path = config.astcenc_path
         self.astcenc_quality = config.astcenc_quality
         self.fntc_tile_size = config.fntc_tile_size
@@ -66,7 +74,8 @@ class TCNNModel(torch.nn.Module):
         self.grid_proxies = torch.nn.ModuleList()
         # Network output matches the selected canonical texture layout.
         self.normal_encoding = str(getattr(config, "normal_encoding", "xyz")).lower()
-        self.num_channels = get_canonical_num_channels(self.normal_encoding)
+        self.channel_slices = get_canonical_channel_slices_static(self.normal_encoding, getattr(config, 'texture_types', None))
+        self.num_channels = max(end for _, end in self.channel_slices.values())
         self.super_resolution_enable = bool(getattr(config, "super_resolution_enable", False))
         self.super_resolution_base_resolution = config.super_resolution_base_resolution
         self.material_reconstruction_size = tuple(getattr(config, 'material_reconstruction_size', ()))
@@ -189,9 +198,9 @@ class TCNNModel(torch.nn.Module):
         self.scheduler = make_scheduler(self.optimizer, config.lr_scheduler, self.max_iter)
 
     def _create_decoder(self, config, positional_dims):
-        features = sum(grid['n_features_per_level'] * (1 + grid['feature_gradient_count'])
-                       for grid in config.feature_grid_configs)
-        inputs = positional_dims + features * self.num_sampled_mips + 2
+        features = sum(channels * (1 + grid['feature_gradient_count'])
+                       for channels, grid in zip(_feature_input_channels(config), config.feature_grid_configs))
+        inputs = positional_dims + features * self.num_sampled_mips + 1 + (not config.mip0_only)
         if config.super_resolution_enable:
             inputs += self.num_channels
         return tcnn.Network(inputs, self.num_channels, {
@@ -388,9 +397,15 @@ class TCNNModel(torch.nn.Module):
         """Use direct feature gathers when the caller supplies native centers."""
         return self(x, native_size=size)
 
+    def _decoder_features(self, features, index):
+        if self.feature_input_channels[index] == self.feature_grid_specs[index].n_features_per_level:
+            return features
+        return features.reshape(len(features), -1, 4)[..., :3].flatten(1)
+
     def forward(self, x: torch.Tensor, *, native_size=None) -> TensorType["batch_size", "num_channels"]:
 
-        expected_dims = 3 + (self.num_channels if self.super_resolution_enable else 0)
+        coordinate_dims = 2 + (not self.mip0_only)
+        expected_dims = coordinate_dims + (self.num_channels if self.super_resolution_enable else 0)
         if x.shape[1] != expected_dims:
             raise ValueError(f"Expected model input with {expected_dims} columns, got {x.shape[1]}")
         if not self.training and self._decoder_adaptation_features is None:
@@ -398,7 +413,7 @@ class TCNNModel(torch.nn.Module):
 
         # Explicit wrap to [0,1), so train/eval behavior matches repeat sampling at inference.
         uvs = torch.remainder(x[:, 0:2], 1.0)
-        mip_encodings = x[:, [2]]
+        mip_encodings = x.new_zeros((len(x), 1)) if self.mip0_only else x[:, [2]]
 
         # Select the feature-grid level corresponding to the normalized Mip.
         num_sampled_mips = self.num_sampled_mips
@@ -431,12 +446,14 @@ class TCNNModel(torch.nn.Module):
                 # Center channels come first, before the feature differences.
                 direct_diffuse = self._decode_direct_diffuse_features(sampled_features)
 
-            features.append(sampled_features)
+            features.append(self._decoder_features(sampled_features, idx))
         features = torch.cat(features, dim=1)
 
-        input_parts = [positional_encodings, features, mip_encodings]
+        input_parts = [positional_encodings, features]
+        if not self.mip0_only:
+            input_parts.append(mip_encodings)
         if self.super_resolution_enable:
-            input_parts.append(x[:, 3:])
+            input_parts.append(x[:, coordinate_dims:])
         input_parts.append(torch.ones((len(x), 1), device=x.device, dtype=features.dtype))
         inputs = torch.cat(input_parts, dim=1)
 

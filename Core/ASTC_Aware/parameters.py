@@ -36,9 +36,9 @@ class ASTCTrainingOperations:
         model = self.model
         weights = torch.tensor(self.output_loss_weights, device=self.device)
         starts = [0]
-        for spec in model.feature_grid_specs:
-            starts.append(starts[-1] + spec.n_features_per_level)
-        dim = starts[-1] + model.num_channels + 2
+        for channels in model.feature_input_channels:
+            starts.append(starts[-1] + channels)
+        dim = model.network.n_input_dims
         names = ("endpoints", "weights", "metadata", "partitions", "indices", "coefficients")
         results = []
         for index, grid in enumerate(model.grid_proxies):
@@ -75,12 +75,11 @@ class ASTCTrainingOperations:
                 uv = torch.stack(((ids % resolution + .5)/resolution,
                                   (ids // resolution + .5)/resolution), 1)
                 features = torch.cat([
-                    sample_feature_inputs(p, other, uv,
-                                          uv.new_full((len(uv), 1), other.n_levels-1))
-                    for p, other in zip(params, model.feature_grid_specs)], 1)
+                    model._decoder_features(sample_feature_inputs(p, other, uv,
+                        uv.new_full((len(uv), 1), other.n_levels-1)), i)
+                    for i, (p, other) in enumerate(zip(params, model.feature_grid_specs))], 1)
                 features[:, begin_channel:begin_channel+4] = 0
-                inputs = torch.cat((features, uv.new_zeros((len(uv), 1)), batch,
-                                    uv.new_ones((len(uv), 1))), 1)
+                inputs = torch.cat((features, batch, uv.new_ones((len(uv), 1))), 1)
                 residual = (target[start:start+len(batch)] - batch
                             - model.network(inputs).float() - model.decoder_output_bias.float())
                 projected.append((residual @ transform).clamp(

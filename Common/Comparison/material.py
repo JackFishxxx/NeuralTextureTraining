@@ -420,7 +420,7 @@ def save_material_images(evaluation, dataset, compression, metric_objects, direc
     for vc in dataset.get_vis_configs():
         a,b = vc['canonical_channel_slice']
         group = next(group for group,names in dataset.texture_packing.items() if vc['texture_type'] in names)
-        prefix = 'Diffuse' if group == 'diffuse' else vc['texture_type'].capitalize()
+        prefix = vc['texture_type'].capitalize()
         format_name = compression.formats[group].name
         items = [(f'GT[{width}x{height}]', gt)]
         if (ih,iw) != (height,width):
@@ -440,7 +440,7 @@ def save_material_images(evaluation, dataset, compression, metric_objects, direc
                 values = metrics[method][group]
             else:
                 values = _compute_metrics_from_refs(image[:,a:b],gt[:,a:b],*metric_objects,
-                                                    scalar_channels=(group!='diffuse'))
+                                                    scalar_channels=(vc['texture_type']!='diffuse'))
             scores = {group: (values[0],values[1],values[2] if min(height,width)>=128 else None)}
             label = f'{filename}_{format_name}' if filename == 'FNTC_Recompressed' else filename
             tile = _make_annotated_tile(visual, label, scores, group)

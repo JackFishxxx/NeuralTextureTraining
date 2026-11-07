@@ -10,16 +10,16 @@ from .layout import surface_filename
 def inference_spec(model):
     """The numeric interpretation and input/output layout of a deployed model."""
     cnn = model.material_cnn
-    from dataset import get_canonical_channel_slices_static
     return dict(
         version=1,
         grids=[dict(**recipe.as_config(), resolution=spec.max_resolution, levels=spec.n_levels,
                     channels=spec.n_features_per_level, quantize_bits=spec.quantize_bits,
-                    feature_gradient_count=spec.feature_gradient_count)
-               for recipe, spec in zip(model.grid_compressions, model.feature_grid_specs)],
+                    feature_gradient_count=spec.feature_gradient_count, input_channels=channels)
+               for recipe, spec, channels in zip(model.grid_compressions, model.feature_grid_specs,
+                                                  model.feature_input_channels)],
         num_mips=model.num_mips, mip0_only=model.mip0_only,
         normal_encoding=model.normal_encoding, output_channels=model.num_channels,
-        output_layout={name: list(bounds) for name, bounds in get_canonical_channel_slices_static(model.normal_encoding).items()},
+        output_layout={name: list(bounds) for name, bounds in model.channel_slices.items()},
         output_activation=model.output_activation,
         positional_encoding=dict(type=model.pos_encoding_type, frequencies=model.n_frequencies,
                                  tile_uv=model.pos_encoding_tile_uv),
@@ -31,7 +31,8 @@ def inference_spec(model):
         direct_diffuse=model.direct_diffuse_infer_mode,
         material_size=list(model.material_reconstruction_size),
         inference_size=list(model.inference_size),
-        input_order=['positional_encoding', 'grid_centers_and_differences', 'normalized_mip']
+        input_order=['positional_encoding', 'grid_centers_and_differences']
+                    + ([] if model.mip0_only else ['normalized_mip'])
                     + (['canonical_sr_base'] if model.super_resolution_enable else []) + ['constant_one'],
         feature_sampling='bilinear_repeat_texel_center',
         cnn=None if cnn is None else dict(version=cnn.version, mode=cnn.mode, channels=cnn.channels,

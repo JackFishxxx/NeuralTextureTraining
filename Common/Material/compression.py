@@ -11,7 +11,7 @@ from torch.nn import functional as F
 from Common.Block_Compression.astc import ASTCCodec
 from Common.Block_Compression.bc import BCCodec, dds_header
 from Common.Block_Compression.formats import TextureFormat
-from .normal_encoding import decode_normal, encode_normal, filter_normal
+from .normal_encoding import filter_normal
 from Core.Feature_Grid.sampling import tile_regions
 
 GROUP_NAMES = {'diffuse': 'Diffuse', 'normal': 'Normal', 'romsd': 'Romsd'}
@@ -19,7 +19,7 @@ DEFAULT_FORMATS = {'diffuse': 'BC7', 'normal': 'BC5', 'romsd': 'BC1'}
 
 
 def compressed_normal_encoding(normal_encoding, format_name):
-    return 'xy' if format_name == 'BC5' and normal_encoding == 'xyz' else normal_encoding
+    return 'xy' if format_name == 'BC5' else normal_encoding
 
 
 @lru_cache(maxsize=1)
@@ -104,7 +104,7 @@ class MaterialCompression:
         for group,names in dataset.texture_packing.items():
             channels = sum(b-a for name in names for a,b in [dataset.canonical_channel_slices[name]])
             fmt = self.formats[group]
-            if channels > fmt.channels and not (group == 'normal' and fmt.name == 'BC5' and channels == 3):
+            if channels > fmt.channels:
                 raise ValueError(f'{GROUP_NAMES[group]} has {channels} channels but {fmt.name} stores {fmt.channels} continuous channels')
 
     def _encode_tiled(self, rgba, group):
@@ -150,9 +150,6 @@ class MaterialCompression:
             indices = [i for name in names for i in range(*dataset.canonical_channel_slices[name])]
             source = image[0, indices]
             fmt = self.formats[group]
-            normal_rgb = group == 'normal' and fmt.name == 'BC5' and len(indices) == 3
-            if normal_rgb:
-                source = decode_normal(source, dataset.normal_encoding)[:2]
             h, w = source.shape[-2:]
             rgba = np.full((h, w, 4), 255, np.uint8)
             rgba[..., :len(source)] = (source.clamp(0, 1)*255).round().byte().permute(1, 2, 0).cpu().numpy()
@@ -161,10 +158,6 @@ class MaterialCompression:
             textures[GROUP_NAMES[group]+extension] = data
             decoded = self.codecs[group].decode_bytes(data)
             restored = torch.from_numpy(decoded[..., :len(source)].copy()).permute(2, 0, 1).to(image).div_(255)
-            if normal_rgb:
-                xy = restored*2-1
-                z = (1-xy.square().sum(0, keepdim=True)).clamp_min(0).sqrt()
-                restored = encode_normal(torch.cat((restored, (z+1)/2), 0), dataset.normal_encoding)
             result[0, indices] = restored
         return result.clamp(0, 1), textures
 
@@ -195,8 +188,7 @@ class MaterialCompression:
             data = textures[filename]
             encoding = None
             if group == 'normal':
-                encoding = ('xy' if self.formats['normal'].name == 'BC5' and dataset.normal_encoding == 'xyz'
-                            else dataset.normal_encoding)
+                encoding = self.normal_encoding(dataset)
             is_bc = isinstance(codec,BCCodec)
             levels = codec.decode_mipmaps(data) if is_bc else [codec.decode_bytes(data)]
             if tuple(levels[0].shape[:2]) != tuple(size):

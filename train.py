@@ -121,6 +121,8 @@ class Trainer(FeatureGridTraining):
                 material_compression.validate_dataset(dataset)
                 print(f"[NormalEncoding] mode={dataset.normal_encoding}")
                 configs.num_mips = dataset.num_mips
+                configs.normal_encoding = dataset.normal_encoding
+                configs.texture_types = dataset.available_textures
                 # Tile size is measured in decoder/material texels, independent of GT resolution.
                 if not configs.pos_encoding_reference_edge:
                     configs.pos_encoding_reference_edge = max(dataset.material_reconstruction_size)
@@ -419,13 +421,13 @@ class Trainer(FeatureGridTraining):
             # generate random sample indices
             ys = torch.randint(0, self.texture_height, [self.batch_size, 1]).to(self.device)
             xs = torch.randint(0, self.texture_width, [self.batch_size, 1]).to(self.device)
-            # Get data; expand to canonical 11 channels, missing texture positions filled with 0
+            # Use the dataset's compact material layout.
             gt_texture = self.dataset.mip_cache[0][ys[:, 0], xs[:, 0]]
             gt_texture = self.dataset.expand_to_canonical(gt_texture).to(
                 torch.float32 if self.native_reconstruction else torch.float16)
             us = (xs.float() + 0.5) / self.texture_width
             vs = (ys.float() + 0.5) / self.texture_height
-            batch_input = torch.cat([us, vs, torch.zeros_like(us)], dim=1)
+            batch_input = torch.cat([us, vs] + ([] if self.mip0_only else [torch.zeros_like(us)]), dim=1)
             superres_base = self._sr_base_at_uv(batch_input[:, :2]) if self.super_resolution_enable else None
             if superres_base is not None:
                 batch_input = torch.cat([batch_input, superres_base], dim=1)

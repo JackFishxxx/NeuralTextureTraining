@@ -47,6 +47,7 @@ pos_encoding_tile_size: 6
 
 # ---------- BCn aware configs ----------
 bcn_aware_enable: true
+bcn_alpha_input_enable: false  # include 1-bit latent alpha in decoder inputs
 bcn_learning_rate: 0.01
 
 # ---------- astc aware configs ----------

@@ -86,7 +86,7 @@ def config_values(config):
 
 def training_recipe(config):
     ignored = {'load_dir', 'load_iter', 'save_dir', 'data_dir', 'mode', 'device', 'warm_start',
-               'num_channels', 'num_mips', 'pos_encoding_reference_edge', 'material_reconstruction_size',
+               'num_channels', 'num_mips', 'texture_types', 'pos_encoding_reference_edge', 'material_reconstruction_size',
                'material_cnn_inference_size', 'output_loss_weights', 'save_interval',
                'enable_material_compare', 'material_compare_interval', 'eval_inference_tile'}
     result = {k: v for k, v in config_values(config).items() if k not in ignored and not k.startswith('groups_')}

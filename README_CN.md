@@ -114,7 +114,7 @@ data
 | specular（高光） | 1 | `specular` |
 | displacement（位移） | 1 | `displacement`、`disp`、`height` |
 
-> **提示**：规范布局总通道数取决于法线编码：`normal_encoding: xyz` 时为 11 通道，`xy` 或 `hemi_oct` 时为 10 通道。缺失材质槽位在目标中填零，不参与 loss 和指标。分辨率不一致时，按 canonical 顺序（diffuse、normal、R/O/M/S/D）中首个有效类型的分辨率对齐。
+> **提示**：网络只包含实际保留的纹理通道：diffuse 最多 3 通道、BC5 normal 最多 2 通道、标量材质最多 4 通道。分辨率不一致时，按 canonical 顺序（diffuse、normal、R/O/M/S/D）中首个有效类型的分辨率对齐。
 
 具体命名、识别和通道数量可参考 `dataset.py` 中的 `get_texture_config()` 函数。
 
@@ -227,13 +227,12 @@ tensorboard --logdir ./outputs
 diffuse(3) | normal(3 或 2) | roughness(1) | occlusion(1) | metallic(1) | specular(1) | displacement(1)
 ```
 
-默认 `normal_encoding: xy`，因此法线占 2 个网络通道，总规范布局为 10 个固定通道槽位；
-缺失或被排除的纹理类型对应槽位填零。
+网络和 SR base 只按上述顺序保留实际使用的通道，不保留空材质槽位。mip0 only 模型及解码器输入不包含 miplevel。
 
-法线输入统一使用 OpenGL 约定；DirectX 法线需在输入前翻转绿色通道。`xy` / `hemi_oct` 强制正 Z 半球，GT 和重建法线使用相同编码；`xyz` 保留 Z 的正负号。
+法线输入统一使用 OpenGL 约定；DirectX 法线需在输入前翻转绿色通道。`xy` / `hemi_oct` 强制正 Z 半球，GT 和重建法线使用相同编码；`xyz` 保留 Z 的正负号，但 BC5 存储会强制使用 XY 编码。
 
-数据集统一生成 `texture_packing`，描述 diffuse、normal 和一张标量纹理，按 R/O/M/S/D 优先级紧凑打包，空余分量填 1。BC1 最多保留三个实际加载的标量通道，超出时先移除 displacement，再移除 specular；其他格式最多保留四个标量。被移除的贴图不参与训练、指标和截图输出。材质基线和压缩 SR base 按同一映射执行，映射及 canonical 通道范围导出到 `texture_packing.json`；网络槽位保持固定。输入 `ROMS` 的 alpha 表示 specular，`ROMD` 的 alpha 表示 displacement。
-如果只提供部分纹理类型，对应的缺失通道将自动填零，不影响训练和推理。
+数据集按 R/O/M/S/D 优先级最多保留 4 个标量通道。ROMSD 使用 BC1 且 diffuse 使用 BC7 时，AO 存入 diffuse alpha，BC1 中最多存其余 3 个标量；没有 BC7 diffuse 贴图时，BC1 只保留 3 个标量。BC5 法线统一转换为正 Z 半球 XY 编码，GT、baseline 和 SR base 遵循相同规则。被排除的贴图不参与训练、指标和截图输出。baseline 和 SR base 共用导出到 `texture_packing.json` 的映射。输入 `ROMS` 的 alpha 表示 specular，`ROMD` 的 alpha 表示 displacement。
+如果只提供部分纹理类型，网络只保留对应的实际通道。
 
 ### 基于 PSNR 的自动早停
 
@@ -420,4 +419,4 @@ bias，并增加 `decoder_output_bias` 作为输出层 bias。残差超分模式
 
 每个 `format: BC1` grid 默认为四个特征，一张 surface 保存 RGB 和二值 alpha。PC 预设使用两个 grid，合计八个特征，其中两个为二值分量。显式设置 `n_features_per_level: 8` 可在一个逻辑 grid 中存放两张 surface。BC1 感知训练联合学习 RGB565 端点、共享选择器及块模式；透明 texel 的 RGB 为零，alpha 在双线性过滤前为二值。
 
-`BCn aware configs` 配置 `bcn_aware_enable` 和 `bcn_learning_rate`，二值使用率的弱先验由 `bcn_usage_weight` 控制。BC1 grid 支持 decoder 拟合和材质 CNN，也可与 ASTC grid 混合使用。
+`BCn aware configs` 配置 `bcn_aware_enable` 和 `bcn_learning_rate`。`bcn_alpha_input_enable: false`（默认）从解码器输入及 feature differences 中移除每张 BC1 latent 的 1-bit alpha；设为 `true` 可恢复 alpha 输入，存储仍为 RGBA。二值使用率的弱先验由 `bcn_usage_weight` 控制。BC1 grid 支持 decoder 拟合和材质 CNN，也可与 ASTC grid 混合使用。

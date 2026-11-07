@@ -117,7 +117,7 @@ Place your textures in the corresponding folder. The code **automatically identi
 | specular | 1 | `specular` |
 | displacement | 1 | `displacement`, `disp`, `height` |
 
-> **Note**: The model has 10 canonical output channels with `xy`/`hemi_oct` normals, or 11 with `xyz`. Missing material slots are zero-filled in targets and excluded from losses/metrics. Mismatched texture resolutions follow the first available type in canonical order (diffuse, normal, R/O/M/S/D).
+> **Note**: Network channels include only retained textures, with up to three diffuse, two BC5 normal and four scalar channels. Mismatched texture resolutions follow the first available type in canonical order (diffuse, normal, R/O/M/S/D).
 
 For detailed naming conventions, keyword matching, and channel counts, refer to `get_texture_config()` in `dataset.py`.
 
@@ -233,10 +233,9 @@ The model constructs a canonical layout according to the selected normal encodin
 diffuse(3) | normal(3 or 2) | roughness(1) | occlusion(1) | metallic(1) | specular(1) | displacement(1)
 ```
 
-With the default `normal_encoding: xy`, the canonical layout has 10 fixed channel slots.
-Missing or excluded texture types are zero-filled automatically.
+The network and SR base use only retained channels in this order, without empty material slots. Mip0-only model and decoder inputs omit the mip level.
 
-The dataset defines `texture_packing` once for diffuse, normal and one scalar texture, with R/O/M/S/D priority and unused components set to one. BC1 retains at most three actual scalar maps; when capacity is exceeded, displacement is excluded first, then specular. Other formats retain up to four scalars. Excluded maps do not participate in training, metrics or screenshots. Material baselines and the compressed SR base use this mapping, exported with canonical channel slices in `texture_packing.json`. Network slots stay fixed. Packed `ROMS` inputs use alpha for specular; `ROMD` inputs use alpha for displacement.
+The dataset retains up to four scalar maps in R/O/M/S/D priority. When ROMSD uses BC1 and diffuse uses BC7, AO moves to diffuse alpha, leaving at most three scalars in BC1. Without a BC7 diffuse texture, BC1 retains only three scalars. BC5 normals always use positive-Z XY encoding for GT, baseline and SR base. Excluded maps do not participate in training, metrics or screenshots. Baseline and SR base share the mapping exported in `texture_packing.json`. Packed `ROMS` inputs use alpha for specular; `ROMD` inputs use alpha for displacement.
 
 ### PSNR-Based Early Stopping
 
@@ -398,7 +397,7 @@ The model supports **heterogeneous feature grids** through the `feature_grid_con
 
 Independent loss weights can be assigned to each texture type via the `texture_loss_weights` field in `configs.py`, balancing the contribution of different channels during training (e.g., diffuse typically weighted higher than displacement).
 
-Normal inputs use the OpenGL convention. Convert DirectX normals by flipping green before input. XY and hemi-oct force positive Z for both GT and reconstructed normals; `normal_encoding: xyz` preserves both Z signs.
+Normal inputs use the OpenGL convention. Convert DirectX normals by flipping green before input. XY and hemi-oct force positive Z for both GT and reconstructed normals; `normal_encoding: xyz` preserves both Z signs unless the material normal format is BC5, which requires XY.
 
 ### Configurable Network Architecture
 
@@ -429,4 +428,4 @@ For a 1K latent and 512 SR base against 2K GT, the output material mip0 is 1K, a
 
 Each `format: BC1` grid defaults independently to four features on one surface: RGB plus binary alpha. The PC preset uses two such grids for eight features, including two binary components. Set `n_features_per_level: 8` explicitly to pack two surfaces into one logical grid. BC1-aware training jointly learns RGB565 endpoints, shared categorical selectors and block modes. Transparent texels have RGB=0; alpha is binary before bilinear filtering.
 
-The `BCn aware configs` section exposes `bcn_aware_enable` and `bcn_learning_rate`. Training uses a weak binary-usage prior controlled by `bcn_usage_weight`. BC1 grids support decoder adaptation and material CNN fitting alongside ASTC grids in mixed models.
+The `BCn aware configs` section exposes `bcn_aware_enable` and `bcn_learning_rate`. `bcn_alpha_input_enable: false` (default) omits each BC1 latent texture's one-bit alpha from decoder inputs and feature differences; set it to `true` to include alpha. Storage stays RGBA. Training uses a weak binary-usage prior controlled by `bcn_usage_weight`. BC1 grids support decoder adaptation and material CNN fitting alongside ASTC grids in mixed models.

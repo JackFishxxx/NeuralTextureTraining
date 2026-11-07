@@ -12,8 +12,8 @@ class MaterialCNN(nn.Module):
 
     def __init__(self, channels=10, hidden=16, rounds=2, inference_size=None, tile_size=128):
         super().__init__()
-        if channels not in (10, 11) or hidden < 1 or rounds not in (1, 2):
-            raise ValueError('MaterialCNN requires 10/11 canonical channels, positive hidden width and 1/2 rounds')
+        if channels < 1 or hidden < 1 or rounds not in (1, 2):
+            raise ValueError('MaterialCNN requires positive channel counts and 1/2 rounds')
         self.channels, self.hidden, self.rounds = channels, hidden, rounds
         self.halo = rounds
         if not isinstance(tile_size, int) or isinstance(tile_size, bool) or tile_size < 1:

@@ -27,8 +27,9 @@ def render_material_mip0(model, size, device, *, superres_base=None, inference_t
     for h0, w0, h, w in tile_regions(H, W, step):
         rr, cc = torch.meshgrid(torch.arange(h0, h0+h, device=device),
                                 torch.arange(w0, w0+w, device=device), indexing='ij')
-        inp = torch.stack(((cc + 0.5) / W, (rr + 0.5) / H,
-                           torch.zeros_like(rr)), dim=-1).reshape(-1, 3)
+        inp = torch.stack(((cc + 0.5) / W, (rr + 0.5) / H), dim=-1).reshape(-1, 2)
+        if not model.mip0_only:
+            inp = torch.cat((inp, inp.new_zeros((len(inp), 1))), 1)
         if sr:
             base = superres_base[:, h0:h0+h, w0:w0+w].permute(1, 2, 0).reshape(-1, superres_base.shape[0]).float()
             y = (base + model(torch.cat([inp, base], dim=1)).float()).clamp(0.0, 1.0)

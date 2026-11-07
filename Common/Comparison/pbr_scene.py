@@ -93,10 +93,8 @@ def _compressed_material_maps(compression, textures, dataset, size):
         offset = 0
         for name in dataset.texture_packing[group]:
             start,end = dataset.canonical_channel_slices[name]
-            encoding = dataset.normal_encoding if name == 'normal' else None
-            if name == 'normal' and compression.formats['normal'].name == 'BC5' and encoding == 'xyz':
-                encoding = 'xy'
-            channels = 2 if encoding == 'xy' else end-start
+            encoding = compression.normal_encoding(dataset) if name == 'normal' else None
+            channels = end-start
             maps[name] = CompressedTexture(tuple(
                 level[...,offset:offset+channels].transpose(2,0,1).astype(np.float32)/255
                 for level in levels),encoding)

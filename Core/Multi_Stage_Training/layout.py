@@ -63,7 +63,7 @@ def _select(trainer, proposal, grid_index=0):
             target = trainer.dataset.expand_to_canonical(trainer.dataset.sample_continuous(xy.reshape(-1, 2), 0)).to(
                 torch.float32 if (scale_y, scale_x) != (1, 1) else torch.float16)
             base = trainer._sr_base_at_uv(uv)
-            inputs = torch.cat((uv, torch.zeros(len(uv), 1, device=model.device)), 1)
+            inputs = uv
             if base is not None:
                 inputs = torch.cat((inputs, base), 1)
 
@@ -159,7 +159,7 @@ def refit_layout(trainer, steps):
             target = trainer.dataset.expand_to_canonical(trainer.dataset.mip_cache[0][ids // width, ids % width]).to(
                 torch.float32 if material_size(model, height, width) != (height, width) else torch.float16)
             base = trainer._sr_base_at_uv(uv)
-            inputs = torch.cat((uv, torch.zeros(len(uv), 1, device=model.device)), 1)
+            inputs = uv
             if base is not None:
                 inputs = torch.cat((inputs, base), 1)
             prediction = trainer._predict_material(inputs)

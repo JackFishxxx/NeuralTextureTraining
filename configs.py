@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 import torch
 import yaml
 from Core.Feature_Grid.feature_grid import FeatureGridSpec
-from Common.Material.compression import DEFAULT_FORMATS, parse_material_formats
+from Common.Material.compression import DEFAULT_FORMATS, parse_material_formats, compressed_normal_encoding
 
 
 def _load_yaml_defaults(config_path=None):
@@ -162,6 +162,9 @@ class Config():
         if not math.isfinite(self.bcn_usage_weight) or self.bcn_usage_weight < 0:
             raise ValueError("bcn_usage_weight must be finite and nonnegative")
         self.bcn_aware_enable = params.bcn_aware_enable
+        self.bcn_alpha_input_enable = params.bcn_alpha_input_enable
+        if not isinstance(self.bcn_alpha_input_enable, bool):
+            raise ValueError('bcn_alpha_input_enable must be a boolean')
         self.bcn_learning_rate = params.bcn_learning_rate
         if not math.isfinite(self.bcn_learning_rate) or self.bcn_learning_rate <= 0:
             raise ValueError("bcn_learning_rate must be finite and positive")
@@ -338,6 +341,7 @@ class Config():
         if self.material_compare_interval < 1:
             raise ValueError('material_compare_interval must be positive')
         self.material_compression_formats = {group: fmt.name for group,fmt in parse_material_formats(params.material_compression_formats).items()}
+        self.normal_encoding = compressed_normal_encoding(self.normal_encoding, self.material_compression_formats['normal'])
         self.astcenc_path = params.astcenc_path
         self.astcenc_quality = params.astcenc_quality
         self.material_compare_resolution = getattr(params, "material_compare_resolution", None)
@@ -545,6 +549,8 @@ def get_args():
     parser.add_argument('--bcn_usage_weight', dest='bcn_usage_weight', type=float, default=0.01,
                         help='Weak binary usage/confidence prior; 0 disables it')
     parser.add_argument('--bcn_aware_enable', dest='bcn_aware_enable', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--bcn_alpha_input_enable', action=argparse.BooleanOptionalAction, default=False,
+                        help='Include BC1 latent alpha in decoder inputs and feature differences')
     parser.add_argument('--bcn_learning_rate', dest='bcn_learning_rate', type=float, default=0.01,
                         help='Adam learning rate in RGB565/selector code units')
     parser.add_argument(

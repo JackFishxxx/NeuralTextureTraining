@@ -236,7 +236,7 @@ def _create_decoder(trainer, target):
     from Core.Feature_Grid.compression import freeze_proxies
 
     config = copy.deepcopy(target)
-    for key in ('num_mips', 'num_channels', 'pos_encoding_reference_edge',
+    for key in ('num_mips', 'num_channels', 'texture_types', 'pos_encoding_reference_edge',
                 'material_cnn_inference_size', 'material_reconstruction_size'):
         setattr(config, key, getattr(trainer.configs, key))
     config.load_dir, config.load_iter, config.material_cnn_enable = None, 0, False

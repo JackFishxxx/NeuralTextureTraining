@@ -40,6 +40,10 @@ class _Texture(ct.Structure):
     _fields_ = [('levels', ct.POINTER(_Mip)), ('count', ct.c_uint), ('channels', ct.c_uint)]
 
 
+class _Geometry(ct.Structure):
+    _fields_ = [('data', ct.c_void_p), ('count', ct.c_uint)]
+
+
 @functools.lru_cache(maxsize=1)
 def _library():
     if os.name != 'nt':
@@ -67,7 +71,8 @@ def _library():
     lib.pbr_create.restype = ct.c_void_p
     lib.pbr_destroy.argtypes = [ct.c_void_p]
     lib.pbr_render.argtypes = [ct.c_void_p, ct.POINTER(_Texture), ct.POINTER(_View),
-                               ct.POINTER(_Light), ct.c_uint, ct.c_void_p, ct.c_char_p, ct.c_size_t]
+                               ct.POINTER(_Light), ct.c_uint, ct.POINTER(_Geometry),
+                               ct.c_void_p, ct.c_char_p, ct.c_size_t]
     lib.pbr_render.restype = ct.c_int
     lib.pbr_adapter.argtypes = [ct.c_void_p]
     lib.pbr_adapter.restype = ct.c_char_p
@@ -76,7 +81,7 @@ def _library():
     return lib, shader
 
 
-def _vertices(meshes, spheres):
+def _vertices(meshes, spheres, *, subdivide=False):
     """Position, smooth normal, UV tangent/handedness, UV; 48-byte vertices."""
     from .pbr_scene import _triangle_tangent_frame
     result = []
@@ -85,7 +90,18 @@ def _vertices(meshes, spheres):
             xyz, uv = vertices[list(ids)], uvs[list(ids)]
             n, t, b = _triangle_tangent_frame(xyz, uv)
             frame = np.r_[n, t, np.sign(np.dot(np.cross(n, t), b))]
-            result.append(np.c_[xyz, np.broadcast_to(frame, (3, 7)), uv])
+            triangle = np.c_[xyz, np.broadcast_to(frame, (3, 7)), uv]
+            if subdivide:
+                # Refine coarse room/box faces; spheres already have a dense mesh.
+                steps = 32  # Matching edge divisions allow adjacent faces to stay welded.
+                y, x = np.indices((steps, steps))
+                first = np.stack((x, y), -1)[x+y < steps]
+                second = np.stack((x, y), -1)[x+y < steps-1]
+                corners = np.concatenate((first[:, None] + [[0, 0], [1, 0], [0, 1]],
+                                          second[:, None] + [[1, 0], [1, 1], [0, 1]])).reshape(-1, 2) / steps
+                weights = np.c_[1-corners.sum(1), corners]
+                triangle = weights @ triangle
+            result.append(triangle)
     longitude, latitude = 128, 64
     u, v = np.meshgrid(np.linspace(0, 1, longitude + 1), np.linspace(0, 1, latitude + 1))
     theta, phi = (u - .5) * (2 * np.pi), v * np.pi
@@ -102,6 +118,47 @@ def _vertices(meshes, spheres):
     return np.ascontiguousarray(np.concatenate(result) if result else np.empty((0, 12)), dtype=np.float32)
 
 
+def _displaced_vertices(vertices, height, scale):
+    """Bilinear-repeat height displacement and its geometric surface gradient."""
+    from .pbr_scene import _normalize
+    result = vertices.copy()
+    uv, normal = vertices[:, 10:12], vertices[:, 3:6]
+    h, w = height.shape
+    def sample(coords):
+        xy = coords * [w, h] - .5
+        base = np.floor(xy).astype(np.int64)
+        t = xy - base
+        x, y = base[:, 0] % w, base[:, 1] % h
+        return ((height[y, x]*(1-t[:, 0]) + height[y, (x+1) % w]*t[:, 0])*(1-t[:, 1])
+                + (height[(y+1) % h, x]*(1-t[:, 0]) + height[(y+1) % h, (x+1) % w]*t[:, 0])*t[:, 1])
+    result[:, :3] += normal * ((sample(uv)-.5)*scale)[:, None]
+    # UV seams/hard normals duplicate vertices. Average their displaced
+    # positions so box corners, room edges and sphere seams remain closed.
+    _, inverse, counts = np.unique(np.round(vertices[:, :3], 6), axis=0, return_inverse=True, return_counts=True)
+    positions = np.zeros((len(counts), 3), np.float64)
+    np.add.at(positions, inverse, result[:, :3])
+    result[:, :3] = positions[inverse] / counts[inverse, None]
+    triangle = vertices.reshape(-1, 3, 12)
+    edges = triangle[:, 1:, :3] - triangle[:, :1, :3]
+    duv = triangle[:, 1:, 10:12] - triangle[:, :1, 10:12]
+    determinant = duv[:, 0, 0]*duv[:, 1, 1] - duv[:, 0, 1]*duv[:, 1, 0]
+    dpdu = (edges[:, 0]*duv[:, 1, 1:2] - edges[:, 1]*duv[:, 0, 1:2]) / determinant[:, None]
+    dpdv = (edges[:, 1]*duv[:, 0, :1] - edges[:, 0]*duv[:, 1, :1]) / determinant[:, None]
+    dpdu, dpdv = np.repeat(dpdu, 3, axis=0), np.repeat(dpdv, 3, axis=0)
+    dual_u, dual_v = np.cross(dpdv, normal), np.cross(normal, dpdu)
+    denom = (dpdu*dual_u).sum(1, keepdims=True)
+    valid = np.abs(denom) > 1e-10
+    dual_u = np.divide(dual_u, denom, out=np.zeros_like(dual_u), where=valid)
+    dual_v = np.divide(dual_v, denom, out=np.zeros_like(dual_v), where=valid)
+    dhdu = (sample(uv + [1/w, 0]) - sample(uv - [1/w, 0])) * (w/2)
+    dhdv = (sample(uv + [0, 1/h]) - sample(uv - [0, 1/h])) * (h/2)
+    normal = _normalize(normal - scale*(dhdu[:, None]*dual_u + dhdv[:, None]*dual_v))
+    result[:, 3:6] = normal
+    tangent = vertices[:, 6:9]
+    result[:, 6:9] = _normalize(tangent - normal*(normal*tangent).sum(1, keepdims=True))
+    return result
+
+
 def _mips(source, encoding=None):
     levels = [source]
     while max(levels[-1].shape[-2:]) > 1:
@@ -113,8 +170,8 @@ def _mips(source, encoding=None):
 
 
 def _material(texture, slices, encoding, available_textures, texture_maps):
-    names = ('diffuse', 'normal', 'roughness', 'occlusion', 'metallic', 'specular')
-    defaults = ((.65, .65, .65), (.5, .5, 1.), (.5,), (1.,), (0.,), (.5,))
+    names = ('diffuse', 'normal', 'roughness', 'occlusion', 'metallic', 'specular', 'displacement')
+    defaults = ((.65, .65, .65), (.5, .5, 1.), (.5,), (1.,), (0.,), (.5,), (.5,))
     active = set(slices) if available_textures is None else set(available_textures)
     source = None if texture_maps is not None else torch.nan_to_num(texture[0].detach().float(), nan=0., posinf=1., neginf=0.).clamp(0, 1)
     arrays, mip_arrays, descriptions, chains = [], [], [], []
@@ -128,14 +185,14 @@ def _material(texture, slices, encoding, available_textures, texture_maps):
         elif source is not None and name in active and name in slices:
             start, end = slices[name]
             mode = encoding if name == 'normal' else None
-            levels = _mips(source[start:end], mode)
+            levels = [source[start:end]] if name == 'displacement' else _mips(source[start:end], mode)
         else:
             mode = 'xyz' if name == 'normal' else None
             levels = [np.asarray(default, np.float32)[:, None, None]]
         if name == 'normal':
             normal_mode = mode or encoding
         chain = []
-        for level in levels:
+        for level in (levels[:1] if name == 'displacement' else levels):
             # Dataset loading already linearizes albedo, including the values
             # compressed into exported mip chains. Never decode gamma again.
             if isinstance(level, torch.Tensor):
@@ -172,7 +229,11 @@ def _material(texture, slices, encoding, available_textures, texture_maps):
         mips = (_Mip * len(mip_descriptions))(*mip_descriptions)
         mip_arrays.append(mips)
         descriptions.append(_Texture(mips, len(mips), arrays[chain[0]].shape[-1]))
-    return (_Texture * 6)(*descriptions), arrays, mip_arrays, ('xyz', 'xy', 'hemi_oct').index(normal_mode)
+    has_height = ('displacement' in texture_maps if texture_maps is not None
+                  else 'displacement' in active and 'displacement' in slices)
+    displacement = arrays[chains[-1][0]][..., 0] if has_height else None
+    return ((_Texture * 6)(*descriptions[:6]), arrays, mip_arrays,
+            ('xyz', 'xy', 'hemi_oct').index(normal_mode), displacement)
 
 
 class DX12Scene:
@@ -181,6 +242,7 @@ class DX12Scene:
         self.meshes, self.spheres = meshes, spheres
         self.handle = None
         self.lock = threading.Lock()
+        self._refined_vertices = None
         self._open()
 
     def _open(self):
@@ -192,6 +254,7 @@ class DX12Scene:
             raise RuntimeError(error.value.decode('utf-8', errors='replace'))
         self.adapter = self.lib.pbr_adapter(self.handle).decode('utf-8')
         self.shadow_size = self.lib.pbr_shadow_size()
+        self._height_key = None
 
     def _close(self):
         if self.handle:
@@ -219,8 +282,13 @@ class DX12Scene:
             if (len(center) != 2 or any(not math.isfinite(n) or not 0 <= n <= 1 for n in center)
                     or not math.isfinite(zoom) or zoom < 1 or not math.isfinite(mip_lod_bias)):
                 raise ValueError('PBR viewport center, zoom and mip bias must be finite and valid')
-        textures, arrays, mip_arrays, encoding = _material(texture, slices, normal_encoding, available_textures, texture_maps)
+        textures, arrays, mip_arrays, encoding, height = _material(texture, slices, normal_encoding, available_textures, texture_maps)
         lighting = lighting or {}
+        displacement_scale = float(lighting.get('displacement_scale', .03))
+        if not math.isfinite(displacement_scale) or displacement_scale < 0:
+            raise ValueError('PBR displacement scale must be finite and nonnegative')
+        height_key = (height.shape, hashlib.sha256(height.tobytes()).digest(), displacement_scale) if (
+            height is not None and displacement_scale > 0 and np.any(height != .5)) else None
         point_lights = lighting.get('point_lights', [
             dict(position=[0., .82, .7], intensity=6.5, color=[1., 1., 1.]),
             dict(position=[-.8, .45, -.15], intensity=1.2, color=[1., 1., 1.])])
@@ -236,16 +304,28 @@ class DX12Scene:
         with self.lock:
             if not self.handle:
                 self._open()
+            geometry = None
+            if height_key != self._height_key:
+                if height_key is None:
+                    geometry = _Geometry(None, 0)  # Restore the original mesh.
+                else:
+                    if self._refined_vertices is None:
+                        self._refined_vertices = _vertices(self.meshes, self.spheres, subdivide=True)
+                    displaced = _displaced_vertices(self._refined_vertices, height, displacement_scale)
+                    geometry = _Geometry(displaced.ctypes.data, len(displaced))
             for index, (width, height, center, zoom) in enumerate(views):
                 width, height = int(width), int(height)
                 settings = _View(width, height, tuple(center), zoom, mip_lod_bias, encoding,
                                  CAMERA_EYE, CAMERA_TARGET, CAMERA_FOV, sun)
                 output = np.empty((height, width, 4), np.float32)
                 ok = self.lib.pbr_render(self.handle, textures if index == 0 else None,
-                                         ct.byref(settings), lights, len(lights), output.ctypes.data, error, len(error))
+                                         ct.byref(settings), lights, len(lights),
+                                         ct.byref(geometry) if index == 0 and geometry is not None else None,
+                                         output.ctypes.data, error, len(error))
                 if ok != 1:
                     if ok < 0:  # Native recording/submission failed; discard its state.
                         self._close()
                     raise RuntimeError(error.value.decode('utf-8', errors='replace'))
+                self._height_key = height_key
                 outputs.append(output[:, :, :3].copy())
         return outputs

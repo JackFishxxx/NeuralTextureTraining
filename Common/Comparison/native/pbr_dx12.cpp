@@ -22,6 +22,7 @@ namespace {
 constexpr UINT shadowSize = 1024;
 struct Mip { const float* data; UINT width, height; };
 struct Texture { const Mip* levels; UINT count, channels; };
+struct Geometry { const float* data; UINT count; };
 struct PointLight { XMFLOAT3 position; float power; XMFLOAT3 color; float padding; };
 struct View {
     UINT width, height; XMFLOAT2 center; float zoom, mipBias; UINT normalMode;
@@ -110,7 +111,7 @@ class Renderer {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> shadingPipeline, shadowPipeline;
     ComPtr<ID3D12DescriptorHeap> resources, targets, depths;
-    ComPtr<ID3D12Resource> vertices, constants, lights, shadows;
+    ComPtr<ID3D12Resource> vertices, displacedVertices, constants, lights, shadows;
     struct Target {
         ComPtr<ID3D12Resource> output, depth, readback;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
@@ -127,7 +128,7 @@ class Renderer {
     std::array<Material*, 6> selectedMaterials{};
     std::array<ComPtr<ID3D12Resource>, 6> materialUploads;
     D3D12_VERTEX_BUFFER_VIEW vertexView{};
-    UINT vertexCount = 0, shadowCount = 0;
+    UINT vertexCount = 0, baseVertexCount = 0, shadowCount = 0;
     UINT srvStride = 0, dsvStride = 0;
     std::vector<unsigned char> lightingKey;
     std::vector<Light> lightRecords;
@@ -415,15 +416,30 @@ public:
         vertices = buffer(SIZE_T(count) * 48, D3D12_HEAP_TYPE_UPLOAD);
         void* mapped; D3D12_RANGE noRead{0,0}; check(vertices->Map(0, &noRead, &mapped), "Map vertices");
         if (count) memcpy(mapped, data, SIZE_T(count) * 48); vertices->Unmap(0, nullptr);
-        vertexCount = count; vertexView = {vertices->GetGPUVirtualAddress(), count * 48, 48};
+        vertexCount = baseVertexCount = count; vertexView = {vertices->GetGPUVirtualAddress(), count * 48, 48};
         event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
         if (!event) throw std::runtime_error("Create GPU fence event failed");
     }
     ~Renderer() { if (event) CloseHandle(event); }
 
-    void render(const Texture* textures, const View& settings, const PointLight* points, UINT count, float* result) {
+    void render(const Texture* textures, const View& settings, const PointLight* points, UINT count,
+                const Geometry* geometry, float* result) {
         if (settings.width < 2 || settings.height < 2 || settings.width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION || settings.height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) throw std::runtime_error("Invalid D3D12 render resolution");
         bool updateShadows = prepareLights(settings, points, count);
+        if (geometry) {
+            vertexCount = geometry->count ? geometry->count : baseVertexCount;
+            if (geometry->count) {
+                SIZE_T bytes = SIZE_T(vertexCount) * 48;
+                if (!displacedVertices || displacedVertices->GetDesc().Width < bytes)
+                    displacedVertices = buffer(bytes, D3D12_HEAP_TYPE_UPLOAD);
+                void* mapped; D3D12_RANGE noRead{0, 0};
+                check(displacedVertices->Map(0, &noRead, &mapped), "Map displaced vertices");
+                memcpy(mapped, geometry->data, bytes); displacedVertices->Unmap(0, nullptr);
+            }
+            auto* resource = geometry->count ? displacedVertices.Get() : vertices.Get();
+            vertexView = {resource->GetGPUVirtualAddress(), vertexCount * 48, 48};
+            updateShadows = true;
+        }
         auto& viewportTarget = target(settings.width, settings.height, 1 + count * 6);
         Camera camera{};
         XMVECTOR eye = XMLoadFloat3(&settings.eye), target = XMLoadFloat3(&settings.target);
@@ -482,12 +498,17 @@ __declspec(dllexport) void pbr_destroy(void* renderer) { delete static_cast<Rend
 __declspec(dllexport) const char* pbr_adapter(void* renderer) { return static_cast<Renderer*>(renderer)->adapterName.c_str(); }
 __declspec(dllexport) UINT pbr_shadow_size() { return shadowSize; }
 __declspec(dllexport) int pbr_render(void* renderer, const Texture* textures, const View* settings,
-                                  const PointLight* points, UINT count, float* output, char* error, size_t capacity) {
+                                  const PointLight* points, UINT count, const Geometry* geometry,
+                                  float* output, char* error, size_t capacity) {
     // Reject bad input before mapping resources, invalidating caches or opening
     // a command list. A recording/submission failure requires a fresh renderer.
-    try { validateTextures(textures); }
+    try {
+        validateTextures(textures);
+        if (geometry && ((geometry->count && !geometry->data) || geometry->count % 3 || geometry->count > UINT_MAX / 48))
+            throw std::runtime_error("Invalid displaced geometry");
+    }
     catch (const std::exception& e) { report(error, capacity, e); return 0; }
-    try { static_cast<Renderer*>(renderer)->render(textures, *settings, points, count, output); return 1; }
+    try { static_cast<Renderer*>(renderer)->render(textures, *settings, points, count, geometry, output); return 1; }
     catch (const std::exception& e) { report(error, capacity, e); return -1; }
 }
 }

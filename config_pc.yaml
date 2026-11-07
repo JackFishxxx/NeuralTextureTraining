@@ -89,6 +89,7 @@ pbr_detail_resolution: 2048  # independent detail viewport, width and height
 pbr_detail_center: [0.5, 0.59]  # close-up of part of the right sphere/box, wall and floor
 pbr_detail_zoom: 4.0  # separately render the focused viewport
 pbr_mip_lod_bias: 0.0  # use one sharper mip level
+pbr_displacement_scale: 0.0  # world-space height range; 0 disables displacement
 pbr_loss_enable: true
 pbr_loss_weight: 0.2
 pbr_directional_light_enable: false  # interior point lights; enable for sunlight through the open front

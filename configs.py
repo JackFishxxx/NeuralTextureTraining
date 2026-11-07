@@ -362,6 +362,9 @@ class Config():
                 or not math.isfinite(self.pbr_detail_zoom) or self.pbr_detail_zoom <= 1):
             raise ValueError('PBR detail center must be two coordinates in [0,1] and zoom must be finite and > 1')
         self.pbr_mip_lod_bias = float(getattr(params, "pbr_mip_lod_bias", -1.0))
+        self.pbr_displacement_scale = float(params.pbr_displacement_scale)
+        if not math.isfinite(self.pbr_displacement_scale) or self.pbr_displacement_scale < 0:
+            raise ValueError('pbr_displacement_scale must be finite and nonnegative')
         self.pbr_loss_enable = bool(getattr(params, "pbr_loss_enable", False))
         self.pbr_loss_weight = float(getattr(params, "pbr_loss_weight", 0.1))
         self.pbr_directional_light_enable = bool(getattr(params, "pbr_directional_light_enable", False))
@@ -685,6 +688,8 @@ def get_args():
                         help='PBR detail viewport magnification, rendered separately; must be > 1')
     parser.add_argument('--pbr_mip_lod_bias', type=float, default=-1.0,
                         help='PBR texture mip LOD bias; negative values select sharper mips')
+    parser.add_argument('--pbr_displacement_scale', type=float, default=.03,
+                        help='World-space height range for PBR geometry displacement; 0 disables it')
     parser.add_argument('--pbr_loss_enable', action=argparse.BooleanOptionalAction, default=False,
                         help='add differentiable material-to-PBR shaded RGB loss during training')
     parser.add_argument('--pbr_loss_weight', type=float, default=0.1,

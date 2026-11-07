@@ -225,6 +225,7 @@ class Trainer(FeatureGridTraining):
         self.pbr_loss_enable = bool(getattr(configs, "pbr_loss_enable", False))
         self.pbr_loss_weight = float(getattr(configs, "pbr_loss_weight", 0.1))
         self.pbr_lighting = {
+            "displacement_scale": configs.pbr_displacement_scale,
             "directional_enable": configs.pbr_directional_light_enable,
             "directional_direction": configs.pbr_directional_light_direction,
             "directional_intensity": configs.pbr_directional_light_intensity,

@@ -18,6 +18,10 @@ GROUP_NAMES = {'diffuse': 'Diffuse', 'normal': 'Normal', 'romsd': 'Romsd'}
 DEFAULT_FORMATS = {'diffuse': 'BC7', 'normal': 'BC5', 'romsd': 'BC1'}
 
 
+def compressed_normal_encoding(normal_encoding, format_name):
+    return 'xy' if format_name == 'BC5' and normal_encoding == 'xyz' else normal_encoding
+
+
 @lru_cache(maxsize=1)
 def _physical_core_count():
     """Query physical cores without assuming that every CPU uses two-way SMT."""
@@ -80,6 +84,9 @@ class MaterialCompression:
 
     def recipe(self, dataset):
         return {group: self.formats[group].name for group in GROUP_NAMES if group in dataset.texture_packing}
+
+    def normal_encoding(self, dataset):
+        return compressed_normal_encoding(dataset.normal_encoding, self.formats['normal'].name)
 
     def payload_bytes(self, dataset, size):
         return sum(self.formats[group].payload_bytes(*size) for group in dataset.texture_packing)

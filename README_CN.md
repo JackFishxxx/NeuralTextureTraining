@@ -230,7 +230,7 @@ diffuse(3) | normal(3 或 2) | roughness(1) | occlusion(1) | metallic(1) | specu
 默认 `normal_encoding: xy`，因此法线占 2 个网络通道，总规范布局为 10 个固定通道槽位；
 缺失或被排除的纹理类型对应槽位填零。
 
-法线输入统一使用 OpenGL 约定；DirectX 法线需在输入前翻转绿色通道。`xy` 和 `hemi_oct` 只能表示正 Z 半球，发现负 Z 输入时自动警告；需要保留负 Z 时使用 `normal_encoding: xyz`。
+法线输入统一使用 OpenGL 约定；DirectX 法线需在输入前翻转绿色通道。`xy` / `hemi_oct` 强制正 Z 半球，GT 和重建法线使用相同编码；`xyz` 保留 Z 的正负号。
 
 数据集统一生成 `texture_packing`，描述 diffuse、normal 和一张标量纹理，按 R/O/M/S/D 优先级紧凑打包，空余分量填 1。BC1 最多保留三个实际加载的标量通道，超出时先移除 displacement，再移除 specular；其他格式最多保留四个标量。被移除的贴图不参与训练、指标和截图输出。材质基线和压缩 SR base 按同一映射执行，映射及 canonical 通道范围导出到 `texture_packing.json`；网络槽位保持固定。输入 `ROMS` 的 alpha 表示 specular，`ROMD` 的 alpha 表示 displacement。
 如果只提供部分纹理类型，对应的缺失通道将自动填零，不影响训练和推理。

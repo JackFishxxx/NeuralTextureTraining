@@ -1,4 +1,3 @@
-import warnings
 import torch
 from torch.nn import functional as F
 
@@ -51,7 +50,7 @@ def encode_normal(normal_rgb: torch.Tensor, normal_encoding: str = 'xyz') -> tor
         return torch.clamp(_take(n, 0, 2) * 0.5 + 0.5, 0.0, 1.0)
     x = _take(n, 0, 1)
     y = _take(n, 1, 1)
-    z = torch.clamp(_take(n, 2, 1), min=0.0)
+    z = _take(n, 2, 1).abs()
     denom = torch.clamp(x.abs() + y.abs() + z, min=1e-8)
     px, py = x / denom, y / denom
     return torch.clamp(torch.cat([px + py, px - py], dim=cd) * 0.5 + 0.5, 0.0, 1.0)
@@ -86,17 +85,10 @@ def normal_vectors(encoded: torch.Tensor, normal_encoding: str = 'xyz') -> torch
 
 
 def prepare_normal_input(rgb, normal_encoding='xyz'):
-    """Encode OpenGL source normals, reporting information lost by hemisphere encodings."""
+    """Encode GT in the selected domain: positive Z for XY/hemi-oct, signed Z for XYZ."""
     rgb = rgb.float()
     if not torch.isfinite(rgb).all():
         raise ValueError('Normal input contains nonfinite values')
-    # Normalization cannot change Z's sign; avoid normalizing the full image twice.
-    negative = _take(rgb, 2, 1) < .5
-    if _enc(normal_encoding) in ('xy', 'hemi_oct') and bool(negative.any()):
-        count = int(negative.sum())
-        message = (f'{count} normal texels have negative Z, which {normal_encoding} cannot represent; '
-                   'use normal_encoding: xyz to preserve the source hemisphere')
-        warnings.warn(message, UserWarning, stacklevel=2)
     return encode_normal(rgb, normal_encoding)
 
 

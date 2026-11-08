@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 from Core.Feature_Grid.sampling import resize_bilinear_repeat, tile_regions
 from .normal_encoding import decode_normal, normal_to_rgb
+from .color_space import linear_to_srgb
 from Core.Feature_Grid.compression import apply_latent_compression
 
 
@@ -38,7 +39,8 @@ def render_material_mip0(model, size, device, *, superres_base=None, inference_t
         if hwc is None:
             hwc = torch.empty(H, W, y.shape[-1], device=device, dtype=torch.float32)
         hwc[h0:h0+h, w0:w0+w] = y.reshape(h, w, -1)
-    if getattr(model, "direct_diffuse_enabled", False) and hasattr(model, "render_direct_diffuse_mip"):
+    if (getattr(model, "direct_diffuse_enabled", False) and hasattr(model, "render_direct_diffuse_mip")
+            and getattr(model, 'inference_mode', 'on_load') != 'on_sample'):
         direct = model.render_direct_diffuse_mip(0, H, W)
         hwc[:, :, :3] = direct.squeeze(0).permute(1, 2, 0).to(hwc.dtype)
     hwc = torch.nan_to_num(hwc, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
@@ -130,7 +132,7 @@ def postprocess_material(image: torch.Tensor, vis_mode: str, normal_encoding='xy
     """
     image = torch.clamp(image, 0.0, 1.0)
     if vis_mode == 'srgb':
-        image = torch.pow(image, 1.0 / 2.2)
+        image = linear_to_srgb(image)
     elif vis_mode == 'normal':
         image = normal_to_rgb(image * 2.0 - 1.0)
     elif vis_mode == 'normal_encoded':

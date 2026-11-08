@@ -13,6 +13,7 @@ import torch
 
 from Common.native_build import prepare_msvc
 from Common.Material.normal_encoding import filter_normal
+from .on_sample import MAX_GRIDS, neural_header, protocol_defines
 
 CAMERA_EYE = (0., .55, -4.25)
 CAMERA_TARGET = (0., -.05, 1.15)
@@ -51,7 +52,10 @@ def _library():
     from filelock import FileLock
     native = Path(__file__).with_name('native')
     source = (native / 'pbr_dx12.cpp').read_bytes()
-    shader = (native / 'pbr.hlsl').read_bytes()
+    # Compile both native languages against the same protocol used by Python.
+    definitions = {f'NEURAL_{name}': value for name, value in protocol_defines().items()}
+    prefix = ''.join(f'#define {name} {value}\n' for name, value in definitions.items()).encode()
+    shader = prefix + (native / 'pbr.hlsl').read_bytes()
     digest = hashlib.sha256(source + shader).hexdigest()[:16]
     cache = Path(os.environ.get('LOCALAPPDATA', str(Path.home() / '.cache'))) / 'NeuralTextureTraining' / 'dx12' / digest
     cache.mkdir(parents=True, exist_ok=True)
@@ -60,6 +64,7 @@ def _library():
         if not dll.exists():
             prepare_msvc()
             result = subprocess.run(['cl', '/nologo', '/LD', '/O2', '/EHsc', '/std:c++17', '/DNOMINMAX',
+                                     *(f'/D{name}={value}' for name, value in definitions.items()),
                                      str(native / 'pbr_dx12.cpp'), '/Fe:' + str(dll),
                                      '/Fo:' + str(cache / 'pbr_dx12.obj'), '/link',
                                      'd3d12.lib', 'dxgi.lib', 'd3dcompiler.lib'],
@@ -72,6 +77,7 @@ def _library():
     lib.pbr_destroy.argtypes = [ct.c_void_p]
     lib.pbr_render.argtypes = [ct.c_void_p, ct.POINTER(_Texture), ct.POINTER(_View),
                                ct.POINTER(_Light), ct.c_uint, ct.POINTER(_Geometry),
+                               ct.c_void_p, ct.c_uint,
                                ct.c_void_p, ct.c_char_p, ct.c_size_t]
     lib.pbr_render.restype = ct.c_int
     lib.pbr_adapter.argtypes = [ct.c_void_p]
@@ -167,6 +173,27 @@ def _mips(source, encoding=None):
         levels.append(filter_normal(levels[-1], size, encoding) if encoding else
                       torch.nn.functional.adaptive_avg_pool2d(levels[-1], size))
     return levels
+
+
+def _latent_material(material):
+    """Bind decoded latent values with their independent mip levels intact."""
+    arrays, mip_arrays, descriptions = [], [], []
+    for slot in range(MAX_GRIDS):
+        levels = material.levels[slot] if slot < len(material.levels) else (torch.zeros(1, 1, 1),)
+        packed = torch.cat([level.detach().float().reshape(-1) for level in levels]).cpu().numpy()
+        offset, mips = 0, []
+        for level in levels:
+            count = level.numel()
+            value = packed[offset:offset + count].reshape(tuple(level.shape))
+            array = np.ascontiguousarray(value.transpose(1, 2, 0))
+            arrays.append(array)
+            mips.append(_Mip(array.ctypes.data, array.shape[1], array.shape[0]))
+            offset += count
+        chain = (_Mip * len(mips))(*mips)
+        mip_arrays.append(chain)
+        descriptions.append(_Texture(chain, len(mips), levels[0].shape[0]))
+    mode = {'xyz': 0, 'xy': 1, 'hemi_oct': 2}[material.normal_encoding]
+    return (_Texture * MAX_GRIDS)(*descriptions), arrays, mip_arrays, mode, None
 
 
 def _material(texture, slices, encoding, available_textures, texture_maps):
@@ -274,7 +301,7 @@ class DX12Scene:
 
     @torch.no_grad()
     def render_views(self, texture, slices, normal_encoding, available_textures,
-                     mip_lod_bias, lighting, texture_maps, views):
+                     mip_lod_bias, lighting, texture_maps, views, *, on_sample=None):
         """Prepare/upload one material, then reuse it for all requested cameras."""
         for width, height, center, zoom in views:
             if any(not math.isfinite(n) or int(n) != n or not 2 <= n <= 16384 for n in (width, height)):
@@ -282,9 +309,13 @@ class DX12Scene:
             if (len(center) != 2 or any(not math.isfinite(n) or not 0 <= n <= 1 for n in center)
                     or not math.isfinite(zoom) or zoom < 1 or not math.isfinite(mip_lod_bias)):
                 raise ValueError('PBR viewport center, zoom and mip bias must be finite and valid')
-        textures, arrays, mip_arrays, encoding, height = _material(texture, slices, normal_encoding, available_textures, texture_maps)
+        textures, arrays, mip_arrays, encoding, height = (_latent_material(on_sample) if on_sample is not None else
+            _material(texture, slices, normal_encoding, available_textures, texture_maps))
+        neural = on_sample.parameters if on_sample is not None else neural_header()
         lighting = lighting or {}
         displacement_scale = float(lighting.get('displacement_scale', .03))
+        if on_sample is not None and displacement_scale != 0:
+            raise ValueError('on_sample PBR currently requires pbr_displacement_scale: 0')
         if not math.isfinite(displacement_scale) or displacement_scale < 0:
             raise ValueError('PBR displacement scale must be finite and nonnegative')
         height_key = (height.shape, hashlib.sha256(height.tobytes()).digest(), displacement_scale) if (
@@ -321,6 +352,7 @@ class DX12Scene:
                 ok = self.lib.pbr_render(self.handle, textures if index == 0 else None,
                                          ct.byref(settings), lights, len(lights),
                                          ct.byref(geometry) if index == 0 and geometry is not None else None,
+                                         neural.ctypes.data if index == 0 else None, len(neural) if index == 0 else 0,
                                          output.ctypes.data, error, len(error))
                 if ok != 1:
                     if ok < 0:  # Native recording/submission failed; discard its state.

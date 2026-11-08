@@ -9,6 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from torch.nn import functional as F
 from Common.Block_Compression.astc import ASTCCodec
+from Common.Block_Compression.ktx2 import header_bytes as ktx2_header_bytes, pack_mipmaps, unpack_mipmaps
 from Common.Block_Compression.bc import BCCodec, dds_header
 from Common.Block_Compression.formats import TextureFormat
 from .normal_encoding import filter_normal
@@ -88,8 +89,24 @@ class MaterialCompression:
     def normal_encoding(self, dataset):
         return compressed_normal_encoding(dataset.normal_encoding, self.formats['normal'].name)
 
-    def payload_bytes(self, dataset, size):
-        return sum(self.formats[group].payload_bytes(*size) for group in dataset.texture_packing)
+    @staticmethod
+    def mip_sizes(size, full_chain=False):
+        """Match the floor-halved material levels written by prepare_textures."""
+        yield tuple(size)
+        while full_chain and max(size) > 1:
+            size = tuple(max(1, edge // 2) for edge in size)
+            yield size
+
+    def payload_bytes(self, dataset, size, *, full_chain=False):
+        return sum(self.formats[group].payload_bytes(*level)
+                   for level in self.mip_sizes(size, full_chain) for group in dataset.texture_packing)
+
+    def file_bytes(self, dataset, size, *, full_chain=False):
+        levels = list(self.mip_sizes(size, full_chain))
+        return self.payload_bytes(dataset, size, full_chain=full_chain) + sum(
+            ktx2_header_bytes(len(levels)) if self.formats[group].name.startswith('ASTC') else
+            len(dds_header(size[1], size[0], self.formats[group].name, len(levels)))
+            for group in dataset.texture_packing)
 
     def tile_layout(self, dataset, size):
         regions = list(tile_regions(*size,self.tile_size or max(size)))
@@ -154,7 +171,9 @@ class MaterialCompression:
             rgba = np.full((h, w, 4), 255, np.uint8)
             rgba[..., :len(source)] = (source.clamp(0, 1)*255).round().byte().permute(1, 2, 0).cpu().numpy()
             data = self._encode_tiled(rgba,group)
-            extension = '.dds' if isinstance(self.codecs[group],BCCodec) else '.astc'
+            extension = '.dds' if isinstance(self.codecs[group],BCCodec) else '.ktx2'
+            if extension == '.ktx2':
+                data = pack_mipmaps([data])
             textures[GROUP_NAMES[group]+extension] = data
             decoded = self.codecs[group].decode_bytes(data)
             restored = torch.from_numpy(decoded[..., :len(source)].copy()).permute(2, 0, 1).to(image).div_(255)
@@ -171,10 +190,8 @@ class MaterialCompression:
         self.prepare_textures(textures,dataset,size)
         for filename,data in textures.items():
             source = Path(filename)
-            group,separator,mip = source.stem.partition('_mip')
+            group = source.stem
             name = f'{group}_{method}_{self.formats[group.lower()].name}'
-            if separator:
-                name += f'_mip{mip}'
             if source.suffix == '.dds':
                 name = 'DDS_'+name
             (directory/(name+source.suffix)).write_bytes(data)
@@ -184,28 +201,23 @@ class MaterialCompression:
         result = []
         for group in dataset.texture_packing:
             codec = self.codecs[group]
-            filename = GROUP_NAMES[group]+('.dds' if isinstance(codec,BCCodec) else '.astc')
+            filename = GROUP_NAMES[group]+('.dds' if isinstance(codec,BCCodec) else '.ktx2')
             data = textures[filename]
             encoding = None
             if group == 'normal':
                 encoding = self.normal_encoding(dataset)
             is_bc = isinstance(codec,BCCodec)
-            levels = codec.decode_mipmaps(data) if is_bc else [codec.decode_bytes(data)]
+            levels = codec.decode_mipmaps(data)
             if tuple(levels[0].shape[:2]) != tuple(size):
                 raise ValueError('Compressed material dimensions do not match inference size')
-            if is_bc:
-                if len(levels) == 1 and max(size) > 1:
-                    data = codec.with_mipmaps(data,self._material_mipmaps(levels[0],encoding))
-                    textures[filename] = data
-                    levels = codec.decode_mipmaps(data)
-            else:
-                mip_files = [GROUP_NAMES[group]+f'_mip{mip}.astc'
-                             for mip in range(1,max(size).bit_length())]
-                if any(name not in textures for name in mip_files):
-                    for name,rgba in zip(mip_files,self._material_mipmaps(levels[0],encoding)):
-                        if name not in textures:
-                            textures[name] = self._encode_tiled(rgba,group)
-                levels.extend(codec.decode_bytes(textures[name]) for name in mip_files)
+            if len(levels) == 1 and max(size) > 1:
+                mipmaps = self._material_mipmaps(levels[0],encoding)
+                if is_bc:
+                    data = codec.with_mipmaps(data,mipmaps)
+                else:
+                    data = pack_mipmaps(unpack_mipmaps(data) + [self._encode_tiled(rgba,group) for rgba in mipmaps])
+                textures[filename] = data
+                levels = codec.decode_mipmaps(data)
             if tuple(levels[-1].shape[:2]) != (1,1):
                 raise ValueError('Compressed material requires a complete mip chain')
             result.append((group,levels))

@@ -12,9 +12,9 @@ qat_noise_warmup_frac: 0.1
 
 # ---------- model configs ----------
 output_activation: "hard_swish"
+inference_mode: on_load
 direct_diffuse_infer_mode: "disable"  # disable | rgb | ycocg
 normal_encoding: "xy"  # xyz | xy | hemi_oct
-mip0_only: true  # true: train, sample, evaluate, and compare Mip0 only
 subpixel_sampling_enable: true
 subpixel_sampling_ratio: 0.5
 subpixel_jitter: 0.5
@@ -22,10 +22,12 @@ subpixel_jitter: 0.5
 # ---------- feature grid configs ----------
 feature_grid_configs:
   - max_resolution: 1024
+    n_levels: 1
     format: BC1  # astc6x6 | astc4x4 | BC1
     feature_gradient_count: 4  # 0 off | 2 right/down | 4 axial | 8 3x3 | 24 5x5
     learning_rate: 0.0005
   - max_resolution: 1024
+    n_levels: 1
     format: BC1  # astc6x6 | astc4x4 | BC1
     feature_gradient_count: 0
     learning_rate: 0.0005

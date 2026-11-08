@@ -57,6 +57,63 @@ void validateTextures(const Texture* textures) {
     }
 }
 
+// NEURAL_* constants are injected by pbr_dx12.py from on_sample.protocol_defines.
+void validateNeural(const float* neural, UINT count, const Texture* textures) {
+    if (!neural) {
+        if (count || textures) throw std::runtime_error("Missing neural parameter header");
+        return;  // Later viewports reuse the uploaded decoder.
+    }
+    if (count < NEURAL_HEADER_WORDS) throw std::runtime_error("Invalid neural parameter buffer");
+    for (UINT index = 0; index < count; ++index)
+        if (!std::isfinite(neural[index])) throw std::runtime_error("Nonfinite neural parameter");
+    auto integer = [&](UINT index, UINT lower, UINT upper) {
+        float value = neural[index];
+        if (value < lower || value > upper || value != std::floor(value))
+            throw std::runtime_error("Invalid on-sample header field");
+        return static_cast<UINT>(value);
+    };
+    integer(NEURAL_VERSION, NEURAL_PROTOCOL_VERSION, NEURAL_PROTOCOL_VERSION);
+    if (!integer(NEURAL_ENABLED, 0, 1)) {
+        if (count != NEURAL_HEADER_WORDS) throw std::runtime_error("Unexpected disabled decoder weights");
+        return;
+    }
+    UINT grids = integer(NEURAL_GRID_COUNT, 1, NEURAL_MAX_GRIDS);
+    UINT features = integer(NEURAL_FEATURE_COUNT, 1, NEURAL_MAX_GRIDS * NEURAL_MAX_GRID_CHANNELS);
+    UINT outputs = integer(NEURAL_OUTPUT_COUNT, 1, NEURAL_MAX_OUTPUTS);
+    if (count != NEURAL_HEADER_WORDS + outputs * (features + 2))
+        throw std::runtime_error("Invalid on-sample decoder dimensions");
+    integer(NEURAL_MIP_COUNT, 1, 32);
+    integer(NEURAL_ACTIVATION, 0, 2);
+    UINT directDiffuse = integer(NEURAL_DIRECT_DIFFUSE, 0, 2);
+    integer(NEURAL_MIP0_ONLY, 0, 1);
+    if (neural[NEURAL_REFERENCE_WIDTH] < 1 || neural[NEURAL_REFERENCE_HEIGHT] < 1)
+        throw std::runtime_error("Invalid on-sample LOD reference size");
+    UINT channels = 0;
+    for (UINT grid = 0; grid < grids; ++grid) {
+        UINT size = integer(NEURAL_GRID_CHANNELS + grid, 1, NEURAL_MAX_GRID_CHANNELS);
+        if (textures && size > textures[grid].channels)
+            throw std::runtime_error("Latent texture has too few decoder channels");
+        if (textures) {
+            float expected = std::log2(textures[grid].levels[0].width /
+                std::max(neural[NEURAL_REFERENCE_WIDTH], neural[NEURAL_REFERENCE_HEIGHT]));
+            if (std::abs(neural[NEURAL_GRID_LOD_OFFSETS + grid] - expected) > 1e-5f)
+                throw std::runtime_error("Invalid on-sample grid LOD offset in header");
+        }
+        channels += size;
+    }
+    if (channels != features || (directDiffuse && neural[NEURAL_GRID_CHANNELS] < 3))
+        throw std::runtime_error("Latent channels do not match decoder inputs");
+    for (UINT slot = 0; slot < NEURAL_MAX_GRIDS; ++slot) {
+        UINT offset = NEURAL_OUTPUT_LAYOUT + slot * 2;
+        UINT size = integer(offset + 1, 0, outputs);
+        if (neural[offset] == -1 && size == 0) continue;
+        UINT start = integer(offset, 0, outputs - 1);
+        if (!size || start + size > outputs ||
+            (slot == 0 ? size != 1 && size != 3 : slot == 1 ? size != 2 && size != 3 : size != 1))
+            throw std::runtime_error("Invalid on-sample output channel layout");
+    }
+}
+
 void check(HRESULT hr, const char* operation) {
     if (FAILED(hr)) {
         char message[256];
@@ -111,7 +168,7 @@ class Renderer {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> shadingPipeline, shadowPipeline;
     ComPtr<ID3D12DescriptorHeap> resources, targets, depths;
-    ComPtr<ID3D12Resource> vertices, displacedVertices, constants, lights, shadows;
+    ComPtr<ID3D12Resource> vertices, displacedVertices, constants, lights, shadows, neuralParameters;
     struct Target {
         ComPtr<ID3D12Resource> output, depth, readback;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
@@ -203,7 +260,7 @@ class Renderer {
     }
     void pipelines(const char* shader, size_t size) {
         D3D12_DESCRIPTOR_RANGE range{};
-        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors = 8;
+        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors = 9;
         D3D12_ROOT_PARAMETER parameters[3]{};
         parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
         parameters[0].Descriptor.ShaderRegister = 0;
@@ -406,7 +463,7 @@ public:
         check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&commands)), "Create command list");
         check(commands->Close(), "Close initial command list");
         check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "Create fence");
-        resources = descriptors(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8, true);
+        resources = descriptors(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 9, true);
         targets = descriptors(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1);
         srvStride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         dsvStride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
@@ -423,9 +480,21 @@ public:
     ~Renderer() { if (event) CloseHandle(event); }
 
     void render(const Texture* textures, const View& settings, const PointLight* points, UINT count,
-                const Geometry* geometry, float* result) {
+                const Geometry* geometry, const float* neural, UINT neuralCount, float* result) {
         if (settings.width < 2 || settings.height < 2 || settings.width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION || settings.height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) throw std::runtime_error("Invalid D3D12 render resolution");
         bool updateShadows = prepareLights(settings, points, count);
+        if (neural) {
+            const UINT64 bytes = UINT64(neuralCount) * sizeof(float);
+            if (!neuralParameters || neuralParameters->GetDesc().Width < bytes)
+                neuralParameters = buffer(bytes, D3D12_HEAP_TYPE_UPLOAD);
+            void* mapped; D3D12_RANGE noRead{0, 0};
+            check(neuralParameters->Map(0, &noRead, &mapped), "Map neural parameters");
+            memcpy(mapped, neural, static_cast<size_t>(bytes)); neuralParameters->Unmap(0, nullptr);
+            D3D12_SHADER_RESOURCE_VIEW_DESC view{}; view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            view.Buffer.NumElements = neuralCount; view.Buffer.StructureByteStride = sizeof(float);
+            device->CreateShaderResourceView(neuralParameters.Get(), &view, srv(8));
+        }
         if (geometry) {
             vertexCount = geometry->count ? geometry->count : baseVertexCount;
             if (geometry->count) {
@@ -499,16 +568,17 @@ __declspec(dllexport) const char* pbr_adapter(void* renderer) { return static_ca
 __declspec(dllexport) UINT pbr_shadow_size() { return shadowSize; }
 __declspec(dllexport) int pbr_render(void* renderer, const Texture* textures, const View* settings,
                                   const PointLight* points, UINT count, const Geometry* geometry,
-                                  float* output, char* error, size_t capacity) {
+                                  const float* neural, UINT neuralCount, float* output, char* error, size_t capacity) {
     // Reject bad input before mapping resources, invalidating caches or opening
     // a command list. A recording/submission failure requires a fresh renderer.
     try {
         validateTextures(textures);
+        validateNeural(neural, neuralCount, textures);
         if (geometry && ((geometry->count && !geometry->data) || geometry->count % 3 || geometry->count > UINT_MAX / 48))
             throw std::runtime_error("Invalid displaced geometry");
     }
     catch (const std::exception& e) { report(error, capacity, e); return 0; }
-    try { static_cast<Renderer*>(renderer)->render(textures, *settings, points, count, geometry, output); return 1; }
+    try { static_cast<Renderer*>(renderer)->render(textures, *settings, points, count, geometry, neural, neuralCount, output); return 1; }
     catch (const std::exception& e) { report(error, capacity, e); return -1; }
 }
 }

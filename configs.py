@@ -195,8 +195,6 @@ class Config():
         ### ---------- tile cnn configs ---------- ###
         self.material_cnn_enable = params.material_cnn_enable
         if self.material_cnn_enable:
-            if not params.mip0_only:
-                raise ValueError("Material CNN requires Mip0")
             if params.mode == "train" and not params.multi_stage_training_enable:
                 raise ValueError("Material CNN training requires multi_stage_training_enable: true")
         self.material_cnn_steps = params.material_cnn_steps
@@ -232,7 +230,14 @@ class Config():
         self.eval_interval = params.eval_interval
         self.save_interval = params.save_interval
         self.eval_inference_tile = params.eval_inference_tile
-        self.mip0_only = bool(getattr(params, "mip0_only", False))
+        self.inference_mode = params.inference_mode
+        self.material_lod_reference_size = []  # native Mobile material size; independent of GT supervision size
+        self.mip_fractional_sampling_ratio = params.mip_fractional_sampling_ratio
+        self.mip_validation_samples = params.mip_validation_samples
+        if not math.isfinite(self.mip_fractional_sampling_ratio) or not 0 <= self.mip_fractional_sampling_ratio <= 1:
+            raise ValueError('mip_fractional_sampling_ratio must be in [0, 1]')
+        if self.mip_validation_samples < 16:
+            raise ValueError('mip_validation_samples must be >=16')
 
         ### ---------- early stopping configs ---------- ###
         self.early_stop = params.early_stop
@@ -423,15 +428,12 @@ class Config():
             GridCompression.from_config(g)
             for g in raw_grids
         )
-        if not self.mip0_only:
-            raise ValueError('Block-compressed deployment currently requires mip0_only: true; '
-                             'multi-Mip training/export is not implemented')
         processed = []
         for cfg, recipe in zip(raw_grids, recipes):
             cfg = dict(cfg)
             if recipe.format == "bc1":
-                if not self.mip0_only or self.direct_diffuse_infer_mode != "disable":
-                    raise ValueError("BC1 grids require mip0_only and direct diffuse disabled")
+                if self.direct_diffuse_infer_mode != "disable":
+                    raise ValueError("BC1 grids require direct diffuse disabled")
                 cfg.setdefault("n_features_per_level", 4)
             if recipe.format == 'astc':
                 cfg.setdefault('n_features_per_level', 4)
@@ -446,7 +448,7 @@ class Config():
             processed.append(
                 dict(
                     max_resolution=spec.max_resolution,
-                    n_levels=1 if self.mip0_only else spec.n_levels,
+                    n_levels=spec.n_levels,
                     n_features_per_level=spec.n_features_per_level,
                     quantize_bits=spec.quantize_bits,
                     learning_rate=spec.learning_rate,
@@ -456,6 +458,11 @@ class Config():
                 )
             )
         self.feature_grid_configs = processed
+        self.mip0_only = all(g['n_levels'] == 1 for g in processed)
+        if self.inference_mode == 'on_load' and not self.mip0_only:
+            raise ValueError('on_load requires n_levels: 1 for every grid; use on_sample for learned mip chains')
+        if self.material_cnn_enable and not self.mip0_only:
+            raise ValueError('Material CNN requires feature_grid_configs.n_levels: 1 for every grid')
         self.grid_compressions = recipes
         families = {r.format for r in recipes}
         self.codec_training_enable = self.mode == "train" and (
@@ -475,9 +482,21 @@ class Config():
             int(params.astc_decoder_projection_interval) if self.native_astc_grids else 0
         )
         if ("bc1" in families or len(set(recipes)) > 1) and (
-            not self.mip0_only or self.direct_diffuse_infer_mode != "disable"
+            self.direct_diffuse_infer_mode != "disable"
         ):
-            raise ValueError("BC1/mixed grids require mip0_only and direct diffuse disabled")
+            raise ValueError("BC1/mixed grids require direct diffuse disabled")
+        if self.inference_mode == 'on_sample':
+            if any(g['quantize_bits'] != 8 for g in processed):
+                raise ValueError('on_sample requires quantize_bits: 8 to match native compressed texture filtering')
+            if (self.super_resolution_enable or self.material_cnn_enable or self.n_hidden_layers
+                    or self.n_frequencies or any(g['feature_gradient_count'] for g in processed)):
+                raise ValueError('on_sample DX12 evaluation requires an affine decoder without SR, CNN, PE or feature differences')
+            if len(processed) > 6 or any(g['n_features_per_level'] > 4 for g in processed):
+                raise ValueError('on_sample DX12 evaluation supports up to six latent grids with at most four channels each')
+            if self.material_recompression_enable:
+                raise ValueError('on_sample inference cannot recompress a material raster')
+            if self.enable_pbr_compare and self.pbr_displacement_scale != 0:
+                raise ValueError('on_sample PBR currently requires pbr_displacement_scale: 0')
 
     @property
     def native_astc_grids(self):
@@ -638,10 +657,14 @@ def get_args():
                         help='iteration interval for saving model')
     parser.add_argument('--eval_inference_tile', type=int, default=512,
                         help='eval/infer: tile edge in pixels (0 = one batch over full plane, may OOM)')
-    parser.add_argument('--mip0_only', action=argparse.BooleanOptionalAction, default=False,
-                        help='restrict training samples, loss, inference metrics, and comparisons to Mip0')
+    parser.add_argument('--inference_mode', choices=['on_load', 'on_sample'], default='on_load',
+                        help='material raster reconstruction or filtered latent decoding per texture query')
+    parser.add_argument('--mip_fractional_sampling_ratio', type=float, default=0.25,
+                        help='advanced on_sample training option: fraction of blendable batches using fractional LOD')
+    parser.add_argument('--mip_validation_samples', type=int, default=16384,
+                        help='on_sample fixed scrambled Sobol UV count per validation LOD (>=16)')
     parser.add_argument('--feature_grid_configs', type=yaml.safe_load, default=None,
-                        help='YAML list of feature grids; each accepts feature_gradient_count: 0, 2, 4, 8 or 24')
+                        help='YAML list of grids; n_levels: 1 (default), full, or an explicit mip count')
     parser.add_argument('--texture_loss_weights', type=yaml.safe_load, default=None,
                         help='YAML mapping of per-texture loss/eval weights')
 

@@ -79,16 +79,24 @@ class ASTCCodec:
             )
             return target.read_bytes()
 
-    def decode_bytes(self, data: bytes) -> np.ndarray:
+    def decode_bytes(self, data: bytes, mip: int = 0) -> np.ndarray:
+        from .ktx2 import IDENTIFIER, unpack_mipmaps
+        levels = unpack_mipmaps(data) if data.startswith(IDENTIFIER) else [data]
+        if not isinstance(mip, int) or isinstance(mip, bool) or not 0 <= mip < len(levels):
+            raise ValueError('ASTC mip index out of range')
         with tempfile.TemporaryDirectory(prefix="fntc_astc_") as directory:
             source, target = Path(directory) / "texture.astc", Path(directory) / "decoded.png"
-            source.write_bytes(data)
+            source.write_bytes(levels[mip])
             subprocess.run(
                 [self.ensure_executable(), "-dl", str(source), str(target)],
                 check=True,
                 capture_output=True,
             )
             return np.array(Image.open(target).convert("RGBA"), dtype=np.uint8, copy=True)
+
+    def decode_mipmaps(self, data: bytes):
+        from .ktx2 import unpack_mipmaps
+        return [self.decode_bytes(level) for level in unpack_mipmaps(data)]
 
     def roundtrip_rgba(self, rgba: np.ndarray) -> np.ndarray:
         if rgba.ndim != 3 or rgba.shape[-1] != 4:

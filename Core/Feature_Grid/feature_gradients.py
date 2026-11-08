@@ -23,11 +23,21 @@ def sample_feature_inputs(params, spec, uv, selected_level):
     Twenty-four directions use the complete 5x5 neighborhood in row-major order.
     """
     directions = gradient_directions(spec.feature_gradient_count)
-    levels = selected_level.round().long().reshape(-1).clamp(0, spec.n_levels - 1)
+    selected = selected_level.reshape(-1).clamp(0, spec.n_levels - 1)
+    lower = selected.floor().long()
+    shifts = uv.new_tensor(((0, 0), *directions))
+    samples = _sample_level_inputs(params, spec, uv, lower, shifts)
+    if spec.n_levels > 1:
+        upper = (lower + 1).clamp(max=spec.n_levels - 1)
+        blend = (selected - lower).reshape(-1, 1)
+        samples = torch.lerp(samples, _sample_level_inputs(params, spec, uv, upper, shifts), blend)
+    return samples
+
+
+def _sample_level_inputs(params, spec, uv, levels, shifts):
     resolution = (spec.base_resolution * 2 ** levels).reshape(-1, 1)
     # Dense levels grow by 4; avoid a GPU table transfer per sampling call.
     offsets = (spec.base_resolution ** 2 * (4 ** levels - 1) // 3) * spec.n_features_per_level
-    shifts = uv.new_tensor(((0, 0), *directions))
     queries = uv[:, None, :] + shifts[None, :, :] / resolution[:, None, :]
     query_res = resolution[:, None, :].expand(-1, len(shifts), -1).reshape(-1, 1)
     corners, weights = bilinear_texel_corners(queries.reshape(-1, 2), query_res)

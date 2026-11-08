@@ -38,6 +38,8 @@ class FeatureGridSpec:
         if unknown:
             raise ValueError(f'Unknown feature_grid_configs keys: {sorted(unknown)}')
         for name in ('max_resolution', 'n_levels', 'n_features_per_level', 'quantize_bits'):
+            if name == 'n_levels' and cfg.get(name) == 'full':
+                continue
             if name in cfg and (not isinstance(cfg[name], int) or isinstance(cfg[name], bool)):
                 raise ValueError(f'feature_grid_configs.{name} must be an integer')
         lr = cfg.get('learning_rate', default_lr)
@@ -46,8 +48,8 @@ class FeatureGridSpec:
         max_res = int(cfg.get("max_resolution", 1024))
         if max_res <= 0 or (max_res & (max_res - 1)) != 0:
             raise ValueError("max_resolution must be a positive power of two")
-        default_levels = max(1, max_res.bit_length() - 2)
-        n_levels = int(cfg.get("n_levels", default_levels))
+        levels = cfg.get('n_levels', 1)
+        n_levels = max_res.bit_length() if levels == 'full' else int(levels)
         qbits = int(cfg.get("quantize_bits", default_quantize_bits))
         if n_levels <= 0 or n_levels > max_res.bit_length():
             raise ValueError(
@@ -98,6 +100,20 @@ class FeatureGridSpec:
     @property
     def quant_step_count(self) -> int:
         return 2 ** int(self.quantize_bits)
+
+
+class LearnedMipPyramid(torch.nn.Module):
+    """Independent dense levels, packed smallest first without TCNN alignment gaps."""
+
+    def __init__(self, spec, device):
+        super().__init__()
+        self.params = torch.nn.Parameter(torch.empty(
+            sum(spec.level_feature_count(i) for i in range(spec.n_levels)), device=device))
+        torch.nn.init.uniform_(self.params, -1e-4, 1e-4)
+
+    @property
+    def dtype(self):
+        return self.params.dtype
 
 
 def quantize_feature_tensor(params: torch.Tensor, spec: FeatureGridSpec) -> torch.Tensor:

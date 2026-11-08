@@ -17,6 +17,10 @@ Texture2D<float4> Metallic : register(t4);
 Texture2D<float4> Specular : register(t5);
 Texture2DArray<float> Shadows : register(t6);
 StructuredBuffer<Light> Lights : register(t7);
+// NEURAL_* constants come from on_sample.protocol_defines via pbr_dx12.py.
+// Header + output-major affine weights + output bias. Slots t0..t5 hold
+// deployment-decoded latent mip chains when Neural[NEURAL_ENABLED] is enabled.
+StructuredBuffer<float> Neural : register(t8);
 SamplerState MaterialSampler : register(s0);
 SamplerComparisonState ShadowSampler : register(s1);
 
@@ -94,16 +98,87 @@ float3 linearToSRGB(float3 x) {
                   x.g <= .0031308 ? 12.92*x.g : 1.055*pow(x.g,1/2.4)-.055,
                   x.b <= .0031308 ? 12.92*x.b : 1.055*pow(x.b,1/2.4)-.055);
 }
+
+float4 latentSample(uint grid, float2 uv, float lod) {
+    if (grid == 0) return Diffuse.SampleLevel(MaterialSampler, uv, lod);
+    if (grid == 1) return Normal.SampleLevel(MaterialSampler, uv, lod);
+    if (grid == 2) return Roughness.SampleLevel(MaterialSampler, uv, lod);
+    if (grid == 3) return Occlusion.SampleLevel(MaterialSampler, uv, lod);
+    if (grid == 4) return Metallic.SampleLevel(MaterialSampler, uv, lod);
+    return Specular.SampleLevel(MaterialSampler, uv, lod);
+}
+float activateMaterial(float x) {
+    uint activation = (uint)Neural[NEURAL_ACTIVATION];
+    if (activation == 0) return x * clamp(x + 3, 0, 6) / 6;
+    if (activation == 1) return x * saturate((x + 1.5) / 3);
+    return x >= 0 ? x : .01 * x;
+}
+int2 outputLayout(uint slot) {
+    uint offset = NEURAL_OUTPUT_LAYOUT + slot * 2;
+    return int2(Neural[offset], Neural[offset + 1]);
+}
+void neuralMaterial(float2 uv, out float3 albedo, out float3 normal,
+                    out float rough, out float ao, out float metal, out float spec) {
+    float2 referenceSize = float2(Neural[NEURAL_REFERENCE_WIDTH], Neural[NEURAL_REFERENCE_HEIGHT]);
+    float2 dx = ddx(uv) * referenceSize, dy = ddy(uv) * referenceSize;
+    float lod = clamp(.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-16)) + mipBias,
+                      0, Neural[NEURAL_MIP_COUNT] - 1);
+    if (Neural[NEURAL_MIP0_ONLY] != 0) lod = 0;
+    float features[NEURAL_MAX_GRIDS * NEURAL_MAX_GRID_CHANNELS + 1];
+    uint featureCount = 0;
+    [loop] for (uint grid = 0; grid < (uint)Neural[NEURAL_GRID_COUNT]; ++grid) {
+        float4 sampled = latentSample(grid, uv, max(0, lod + Neural[NEURAL_GRID_LOD_OFFSETS + grid]));
+        [loop] for (uint channel = 0; channel < (uint)Neural[NEURAL_GRID_CHANNELS + grid]; ++channel)
+            features[featureCount++] = sampled[channel];
+    }
+    features[featureCount] = 1;
+    uint inputs = featureCount + 1, outputs = (uint)Neural[NEURAL_OUTPUT_COUNT];
+    float values[NEURAL_MAX_OUTPUTS];
+    [loop] for (uint output = 0; output < outputs; ++output) {
+        float value = 0;
+        [loop] for (uint input = 0; input < inputs; ++input)
+            value += Neural[NEURAL_HEADER_WORDS + output * inputs + input] * features[input];
+        value += Neural[NEURAL_HEADER_WORDS + outputs * inputs + output];
+        values[output] = saturate(activateMaterial(value));
+    }
+    if (Neural[NEURAL_DIRECT_DIFFUSE] != 0) {
+        float3 rgb = saturate((float3(features[0], features[1], features[2]) - Neural[NEURAL_QUANT_MIN]) * Neural[NEURAL_QUANT_SCALE]);
+        if (Neural[NEURAL_DIRECT_DIFFUSE] == 2) {
+            float y = rgb.x, co = rgb.y - .5, cg = rgb.z - .5;
+            rgb = saturate(float3(y + co - cg, y + cg, y - co - cg));
+        }
+        values[0] = rgb.r; values[1] = rgb.g; values[2] = rgb.b;
+    }
+    albedo = float3(.65, .65, .65); normal = float3(.5, .5, 1);
+    rough = .5; ao = 1; metal = 0; spec = .5;
+    int2 layout = outputLayout(0);
+    int start = layout.x;
+    if (start >= 0) albedo = layout.y == 1 ? values[start].xxx : float3(values[start], values[start+1], values[start+2]);
+    layout = outputLayout(1); start = layout.x;
+    if (start >= 0) normal = float3(values[start], values[start+1], layout.y == 3 ? values[start+2] : 1);
+    start = outputLayout(2).x; if (start >= 0) rough = values[start];
+    start = outputLayout(3).x; if (start >= 0) ao = values[start];
+    start = outputLayout(4).x; if (start >= 0) metal = values[start];
+    start = outputLayout(5).x; if (start >= 0) spec = values[start];
+    rough = clamp(rough, .045, 1);
+}
 float4 PS(Interpolants i) : SV_Target {
-    float3 albedo = saturate(Diffuse.SampleBias(MaterialSampler, i.uv, mipBias).rgb);
-    float rough = clamp(Roughness.SampleBias(MaterialSampler, i.uv, mipBias).r, .045, 1);
-    float ao = saturate(Occlusion.SampleBias(MaterialSampler, i.uv, mipBias).r);
-    float metal = saturate(Metallic.SampleBias(MaterialSampler, i.uv, mipBias).r);
-    float spec = saturate(Specular.SampleBias(MaterialSampler, i.uv, mipBias).r);
+    float3 albedo, normalEncoded;
+    float rough, ao, metal, spec;
+    if (Neural[NEURAL_ENABLED] != 0)
+        neuralMaterial(i.uv, albedo, normalEncoded, rough, ao, metal, spec);
+    else {
+        albedo = saturate(Diffuse.SampleBias(MaterialSampler, i.uv, mipBias).rgb);
+        rough = clamp(Roughness.SampleBias(MaterialSampler, i.uv, mipBias).r, .045, 1);
+        ao = saturate(Occlusion.SampleBias(MaterialSampler, i.uv, mipBias).r);
+        metal = saturate(Metallic.SampleBias(MaterialSampler, i.uv, mipBias).r);
+        spec = saturate(Specular.SampleBias(MaterialSampler, i.uv, mipBias).r);
+        normalEncoded = Normal.SampleBias(MaterialSampler, i.uv, mipBias).rgb;
+    }
     float3 gn = unit(i.normal);
     float3 t = unit(i.tangent.xyz - gn * dot(gn, i.tangent.xyz));
     float3 b = cross(gn, t) * i.tangent.w;
-    float3 nts = decodeNormal(Normal.SampleBias(MaterialSampler, i.uv, mipBias).rgb);
+    float3 nts = decodeNormal(normalEncoded);
     // Source normals are OpenGL (+Y up); texture image V increases downward.
     float3 n = unit(t * nts.x - b * nts.y + gn * nts.z);
     float3 view = unit(eye.xyz - i.position);

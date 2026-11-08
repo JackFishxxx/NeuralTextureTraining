@@ -9,7 +9,7 @@ from dataset import prefiltered_material
 class ASTCTrainingOperations:
     def _supports_astc_projection(self):
         model = self.model
-        return (model.n_hidden_layers == 0 and model.n_frequencies == 0
+        return (model.mip0_only and model.n_hidden_layers == 0 and model.n_frequencies == 0
                 and not any(spec.feature_gradient_count for spec in model.feature_grid_specs)
                 and self.super_resolution_enable
                 and getattr(model, '_decoder_adaptation_features', None) is None)

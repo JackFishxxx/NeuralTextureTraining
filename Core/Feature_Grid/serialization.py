@@ -3,15 +3,15 @@
 import json
 import math
 import torch
-from .compression import SourceGrid, astc_codec_for, plans_for
+from .compression import SourceGrid, MipProxyGrid, astc_codec_for, plans_for
 from .layout import surface_filename
 
 
 def inference_spec(model):
     """The numeric interpretation and input/output layout of a deployed model."""
     cnn = model.material_cnn
-    return dict(
-        version=1,
+    spec = dict(
+        version=3 if getattr(model, 'inference_mode', 'on_load') == 'on_sample' else 1 if model.mip0_only else 2,
         grids=[dict(**recipe.as_config(), resolution=spec.max_resolution, levels=spec.n_levels,
                     channels=spec.n_features_per_level, quantize_bits=spec.quantize_bits,
                     feature_gradient_count=spec.feature_gradient_count, input_channels=channels)
@@ -32,7 +32,6 @@ def inference_spec(model):
         material_size=list(model.material_reconstruction_size),
         inference_size=list(model.inference_size),
         input_order=['positional_encoding', 'grid_centers_and_differences']
-                    + ([] if model.mip0_only else ['normalized_mip'])
                     + (['canonical_sr_base'] if model.super_resolution_enable else []) + ['constant_one'],
         feature_sampling='bilinear_repeat_texel_center',
         cnn=None if cnn is None else dict(version=cnn.version, mode=cnn.mode, channels=cnn.channels,
@@ -40,6 +39,21 @@ def inference_spec(model):
                                           tile_size=int(cnn.tile_size),
                                           inference_size=cnn.inference_size.tolist()),
     )
+    if not model.mip0_only:
+        spec['latent_mips'] = dict(storage='independent_learned_levels_smallest_first',
+                                  material_lod='normalized_query_mip_times_num_mips_minus_one',
+                                  grid_level='clamp(level_count_minus_one_minus_material_lod)',
+                                  filtering='bilinear_repeat_with_linear_lod_blend',
+                                  decoder_mip_input=False)
+    if getattr(model, 'inference_mode', 'on_load') == 'on_sample':
+        if 'latent_mips' in spec:
+            spec['latent_mips']['grid_level'] = 'level_count_minus_one_minus_clamp(material_lod_plus_grid_lod_offset)'
+        spec['on_sample'] = dict(lod_reference_size=list(model.material_lod_reference_size),
+                                sampling='bilinear_trilinear_latents_then_decoder',
+                                lod_zero='native_material_mip0',
+                                lod_offset_rule='log2(grid_resolution/native_material_max_edge)',
+                                grid_lod_offsets=list(model.feature_grid_lod_offsets))
+    return spec
 
 
 def _json_tensor(model, value):
@@ -74,12 +88,16 @@ def validate_contract(model, state):
         raise ValueError('Checkpoint requires the current inference contract')
     saved = _read_metadata(state, '_inference_contract', dict)
     expected = inference_spec(model)
+    if 'on_sample' in expected and saved.get('version') != expected['version']:
+        raise ValueError('On-sample LOD semantics changed: retrain using the native material resolution')
     if saved != expected:
         differences = [key for key in saved.keys() | expected.keys() if saved.get(key) != expected.get(key)]
         raise ValueError('Checkpoint inference configuration does not match: '+', '.join(sorted(differences)))
 
 
 def proxy_state_kind(proxy):
+    if isinstance(proxy, MipProxyGrid):
+        return dict(kind='mip_pyramid', levels=[proxy_state_kind(level) for level in proxy.levels])
     return 'astc_packed' if hasattr(proxy, 'surfaces') else proxy.proxy_kind
 
 
@@ -87,13 +105,28 @@ def proxy_layout_tensor(model):
     return _json_tensor(model, [proxy_state_kind(proxy) for proxy in model.grid_proxies])
 
 
-def _validate_proxy(model, index, kind, state):
+def _validate_proxy(model, index, kind, state, *, prefix=None, resolution=None):
     """Validate the saved representation against its grid before allocating it."""
+    spec, recipe = model.feature_grid_specs[index], model.grid_compressions[index]
+    prefix = f'grid_proxies.{index}.' if prefix is None else prefix
+    if isinstance(kind, dict):
+        if (set(kind) != {'kind', 'levels'} or kind['kind'] != 'mip_pyramid'
+                or not isinstance(kind['levels'], list) or len(kind['levels']) != spec.n_levels):
+            raise ValueError('Checkpoint mip pyramid does not match grid')
+        for level, child in enumerate(kind['levels']):
+            if not isinstance(child, str) or child == 'source':
+                raise ValueError('Checkpoint requires an encoded proxy for every mip')
+            _validate_proxy(model, index, child, state, prefix=f'{prefix}levels.{level}.',
+                            resolution=spec.level_resolution(level))
+        return
+    if resolution is None and spec.n_levels > 1 and kind != 'source':
+        raise ValueError('Checkpoint requires a proxy pyramid for a multi-level grid')
+    allowed = ('source', 'bc1_rgba') if recipe.format == 'bc1' else ('source', 'astc_native', 'astc_roundtrip', 'astc_packed')
+    if kind not in allowed:
+        raise ValueError(f'Unsupported grid proxy kind: {kind}')
     if kind == 'source':
         return
-    spec, recipe = model.feature_grid_specs[index], model.grid_compressions[index]
-    resolution, channels = spec.max_resolution, spec.n_features_per_level
-    prefix = f'grid_proxies.{index}.'
+    resolution, channels = resolution or spec.max_resolution, spec.n_features_per_level
     plans = plans_for(model, index)
     shapes = {}
     if kind == 'bc1_rgba':
@@ -136,24 +169,21 @@ def restore_proxies(model, state):
         raise ValueError('Checkpoint requires explicit grid proxy kinds')
     kinds = _read_metadata(state, '_grid_proxy_kinds', list)
     state.pop('_grid_proxy_kinds')
-    if not all(isinstance(kind, str) for kind in kinds):
-        raise ValueError('Checkpoint grid proxy kinds must be a list of names')
+    if not all(isinstance(kind, (str, dict)) for kind in kinds):
+        raise ValueError('Checkpoint grid proxy kinds must contain names or mip layouts')
     count = len(kinds)
     if count not in (0, len(model.grid_compressions)):
         raise ValueError('Checkpoint grid proxy count does not match configuration')
     for index, kind in enumerate(kinds):
-        recipe = model.grid_compressions[index]
-        allowed = ('source', 'bc1_rgba') if recipe.format == 'bc1' else ('source', 'astc_native', 'astc_roundtrip', 'astc_packed')
-        if kind not in allowed:
-            raise ValueError(f'Unsupported grid proxy kind: {kind}')
         _validate_proxy(model, index, kind, state)
     if len(model.grid_proxies) == count and all(
         proxy_state_kind(proxy) == kind for proxy, kind in zip(model.grid_proxies, kinds)
     ):
         return
-    result = torch.nn.ModuleList()
-    for i, kind in enumerate(kinds):
-        prefix = f"grid_proxies.{i}."
+    def restore(i, kind, prefix):
+        if isinstance(kind, dict):
+            return MipProxyGrid(restore(i, child, f'{prefix}levels.{level}.')
+                                for level, child in enumerate(kind['levels']))
         if kind == "source":
             proxy = SourceGrid()
         elif kind == "astc_packed":
@@ -174,43 +204,35 @@ def restore_proxies(model, state):
             else:
                 from Core.BCn_Aware.alpha_proxy import BC1AlphaProxyGrid as Proxy
             proxy = Proxy.from_state(state, prefix, model.device)
-        result.append(proxy)
-    model.grid_proxies = result
+        return proxy
+    model.grid_proxies = torch.nn.ModuleList(
+        restore(i, kind, f'grid_proxies.{i}.') for i, kind in enumerate(kinds))
 
 
 def deployment_arrays(model):
     manifest = []
+    schema_version = 4 if not model.mip0_only or any(r.format == 'astc' for r in model.grid_compressions) else 2
     for i, (recipe, spec) in enumerate(zip(model.grid_compressions, model.feature_grid_specs)):
         plans = plans_for(model, i)
-        manifest.append(
-            dict(
-                **recipe.as_config(),
-                channels=spec.n_features_per_level,
-                binary_channels=(
-                    [j for j in range(spec.n_features_per_level) if j % 4 == 3]
-                    if recipe.format == "bc1"
-                    else []
-                ),
-                surfaces=[
-                    dict(
-                        file=surface_filename(i, j, recipe, len(plans)),
-                        channels=list(p.channels),
-                        block=list(p.block),
-                        block_bytes=p.block_bytes,
-                    )
-                    for j, p in enumerate(plans)
-                ],
-            )
-        )
+        entry = dict(**recipe.as_config(), channels=spec.n_features_per_level,
+                     binary_channels=([j for j in range(spec.n_features_per_level) if j % 4 == 3]
+                                      if recipe.format == 'bc1' else []),
+                     surfaces=[dict(file=surface_filename(i, j, recipe, len(plans)),
+                                    channels=list(p.channels), block=list(p.block), block_bytes=p.block_bytes)
+                               for j, p in enumerate(plans)])
+        if schema_version == 4:
+            entry['mips'] = [dict(mip=mip, resolution=spec.level_resolution(spec.n_levels - 1 - mip))
+                             for mip in range(spec.n_levels)]
+        manifest.append(entry)
     import numpy as np
 
     return dict(
         fntc_tile_size=np.array(model.fntc_tile_size, dtype=np.int32),
         feature_grid_gradient_counts=np.array([spec.feature_gradient_count for spec in model.feature_grid_specs],
                                               dtype=np.int32),
-        compression_schema_version=np.array(2, dtype=np.int32),
+        compression_schema_version=np.array(schema_version, dtype=np.int32),
         feature_grid_compression=np.array(json.dumps(manifest)),
         latent_color_space=np.array("linear_unorm"),
-        inference_schema_version=np.array(1, dtype=np.int32),
+        inference_schema_version=np.array(inference_spec(model)['version'], dtype=np.int32),
         inference_spec=np.array(json.dumps(inference_spec(model))),
     )

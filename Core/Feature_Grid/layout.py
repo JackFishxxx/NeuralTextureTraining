@@ -34,4 +34,4 @@ def surface_filename(index, surface, recipe, count):
     if recipe.format == "bc1":
         return f"feature_grid_{index}_bc1_{surface}.dds"
     suffix = "" if count == 1 else f"_{surface}"
-    return f"feature_grid_{index}{suffix}.astc"
+    return f"feature_grid_{index}{suffix}.ktx2"

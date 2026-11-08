@@ -4,13 +4,18 @@ import torch
 from Core.Feature_Grid.compression import (
     initialize_grid_proxy,
     SourceGrid,
+    proxy_levels,
 )
 
 
-def make_scheduler(optimizer, kind, steps):
+def make_scheduler(optimizer, kind, steps, *, on_sample=False):
     if kind == 'none':
         return None
     if kind == 'plateau':
+        if on_sample:
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='max', factor=.85, patience=4,
+                threshold=.01, threshold_mode='abs')
         return torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=.85, patience=2000)
     if kind == 'steplr':
         return torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=.9)
@@ -51,29 +56,45 @@ class GridCompressionOptimizer:
                 continue
             proxy = model.grid_proxies[i]
             if self.optimizers[i] is None:
+                # A codec may activate after warmup validation already reduced
+                # the decoder LR. Start it at the same relative schedule age.
+                lr_scale = (model.optimizer.param_groups[0]['lr'] /
+                            trainer.configs.network_learning_rate
+                            if getattr(model, 'inference_mode', 'on_load') == 'on_sample' else 1.)
                 if proxy.proxy_kind == 'source':
                     proxy = initialize_grid_proxy(model, i)
                     model.grid_proxies[i] = proxy
-                if proxy.proxy_kind == 'astc_roundtrip':
+                if hasattr(proxy, 'thaw'):
                     proxy.thaw()
                 else:
                     proxy.requires_grad_(True)
-                if proxy.proxy_kind == 'astc_native':
+                levels = proxy_levels(proxy)
+                if all(level.proxy_kind == 'astc_native' for level in levels):
                     from Core.ASTC_Aware.differentiable_proxy import ASTCBlockAdam
-                    opt = ASTCBlockAdam(torch.nn.ModuleList([proxy]), trainer.configs.astc_learning_rate,
-                                        trainer.configs.astc_learning_rate, fused=True,
+                    opt = ASTCBlockAdam(torch.nn.ModuleList(levels), trainer.configs.astc_learning_rate * lr_scale,
+                                        trainer.configs.astc_learning_rate * lr_scale, fused=True,
                                         quantization_aware=True, packed_pair_search=True)
                 else:
                     lr = trainer.configs.bcn_learning_rate if recipe.format == 'bc1' else trainer.configs.astc_learning_rate
-                    opt = torch.optim.Adam(proxy.parameters(), lr=lr)
+                    opt = torch.optim.Adam(proxy.parameters(), lr=lr * lr_scale)
                 self.optimizers[i] = opt
-            if proxy.proxy_kind == 'bc1_rgba':
-                proxy.temperature.fill_(.25**progress)
+            for level in proxy_levels(proxy):
+                if level.proxy_kind == 'bc1_rgba':
+                    level.temperature.fill_(.25**progress)
 
     def zero_grad(self):
         for opt in self.optimizers:
             if opt is not None:
                 opt.zero_grad()
+
+    def scale_learning_rates(self, factor):
+        """Keep codec/decoder adaptation in sync after validation-driven decay."""
+        for opt in self.optimizers:
+            if isinstance(opt, torch.optim.Optimizer):
+                for group in opt.param_groups:
+                    group['lr'] *= factor
+            elif opt is not None:
+                opt.lrs = tuple(lr * factor for lr in opt.lrs)
 
     def step(self):
         due = getattr(self.trainer, '_codec_due_grids', range(len(self.optimizers)))
@@ -83,11 +104,10 @@ class GridCompressionOptimizer:
             if isinstance(opt, torch.optim.Optimizer):
                 opt.step()
             elif self.updates[index] % 100 == 0 and hasattr(self.trainer, "_codec_batches"):
-                proxy = self.trainer.model.grid_proxies[index]
-                touched = torch.where(
-                    (proxy.endpoints.grad.abs().sum(1) + proxy.weights.grad.abs().sum(1)) > 0
-                )[0]
-                opt.step({0: touched}, objective=self.trainer._codec_objective)
+                touched = {level: torch.where(
+                    (proxy.endpoints.grad.abs().sum(1) + proxy.weights.grad.abs().sum(1)) > 0)[0]
+                    for level, proxy in enumerate(opt.grids)}
+                opt.step(touched, objective=self.trainer._codec_objective)
             else:
                 opt.step_full_grid()
             self.updates[index] += 1

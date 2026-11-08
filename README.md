@@ -219,7 +219,72 @@ The following metrics are logged automatically during training:
 - **Loss/train**: Training loss
 - **PSNR / SSIM / LPIPS**: Mip0 quality metrics per material group; ROMSD LPIPS averages the independently evaluated scalar channels.
 
-Training, latent block-compressed export and material image metrics use Mip0 (`mip0_only: true`).
+Configure learned mip levels inside each `feature_grid_configs` entry:
+`n_levels: 1` (default) stores only Mip0, `n_levels: full` learns the complete
+chain down to 1x1, and an integer selects a shorter chain. PC uses single-level
+grids and `inference_mode: on_load`; Mobile uses full chains and `on_sample`.
+There is no global `mip0_only` setting: the runtime flag is derived from the grids.
+On-load reconstruction requires `n_levels: 1` for every grid; learned mip chains
+require `inference_mode: on_sample`.
+Each learned level has independent parameters and codec state. Shorter or
+single-level companion grids clamp to their smallest available level.
+
+Mip level selects the latent level and blends adjacent levels for fractional LOD;
+it is not an input channel of the decoder. The two four-channel mobile grids
+therefore use eight feature inputs plus a constant bias input. Export writes one
+file per latent surface, with all configured mips inside: ASTC uses KTX2
+(`feature_grid_0.ktx2`), BC1 uses DDS (`feature_grid_0_bc1_0.dds`).
+`network_data.npz` records their filenames and mip dimensions. Mobile PBR
+filters latent mip levels and then decodes in the pixel shader. Inference LOD uses
+the native material size, just like Baseline: two 1K latents and a 1K Baseline each
+have 11 levels, from 1K mip0 to 1x1 mip10. GT resolution adds no inference LOD bias.
+Training and validation directly sample the original GT at the same mip index:
+1K latent mip0 fits 2K GT mip0; 512 latent mip1 fits 1K GT mip1, and so on.
+There is no 1K-prefiltered training target. Integer training queries cover the
+original GT texel centers; subpixel and fractional queries also use its mip chain.
+If the native output chain is longer than GT's, supervision clamps to GT's last
+available mip while the decoder query retains the native output LOD.
+Baseline still compresses a native-size material image independently of FNTC supervision.
+Each grid samples
+`clamp(material_lod + log2(grid_resolution / native_material_max_edge), 0, grid_mip_count - 1)`;
+1K/512 grids with 1K output use offsets 0/-1. `inference_spec.on_sample` exports
+the native LOD reference dimensions, per-grid offsets and their rule.
+Training uses a fixed mixture of 80% geometric fine-mip priority (decay 0.5)
+and 20% uniform full-chain coverage. Fractional LODs occur in 25% of blendable
+batches by default; `mip_fractional_sampling_ratio` is an advanced training override.
+Multi-LOD validation uses `mip_validation_samples` fixed scrambled Sobol UVs per
+LOD (default 16,384), covering subtexel/block phases without consuming the training RNG.
+Validation keeps the fixed mip mixture and 25% half-integer LOD weighting regardless
+of the training override. Every validation can save a new best checkpoint;
+early stopping retains its configured window, and restoring weights invalidates
+the cached score. Validation drives scheduling and early stopping. On-sample plateau
+patience is fixed at 4: the fifth consecutive non-improving validation reduces the LR.
+Material image metrics still measure Mip0.
+On-sample requires `quantize_bits: 8` for every grid (the default), so decoded
+ASTC/BC feature mapping agrees with native texture filtering. Per-texel 2/4-bit
+re-quantization remains available for PC on-load.
+Codec training reads proxy representations directly; updates mark source mirrors
+stale and synchronize only for source forwards or checkpoints, avoiding a second
+full-chain ASTC decode at each step. BC1 usage diagnostics include each mip.
+Native ASTC6x6 accumulates Adam updates per block with gradients; BC1/ASTC
+roundtrip retain ordinary Adam's global parameter-step semantics, so zero-gradient
+levels may still move under historical momentum. Their optimization trajectories
+are not assumed to be identical.
+Mobile inference uses schema version 3 and DX12 protocol 2. The previous original-GT
+LOD contract is rejected rather than silently reinterpreting old mip weights.
+The training recipe records original-GT same-mip supervision and rejects exact
+resumption of the previous prefiltered-target recipe. ASTC and multi-mip BC1 exports use
+compression schema 4: `surfaces[]` lists container files and `mips[]` lists their
+level dimensions. All-single-level BC1 exports retain compression schema 2.
+Checkpoint weights and inference contracts are unchanged by container packaging.
+
+Storage comparisons count actual deployment file sizes: every exported latent
+level, decoder/CNN `network_data.npz` (including metadata), and texture/container
+headers. Baseline and raw GT always count their full material mip chains down to
+1x1, matching material export and PBR sampling, independently of latent level counts.
+Enabled single-level SR base files are counted separately within the FNTC total;
+training checkpoints and runtime material output caches are excluded. Small mip
+costs use exact codec block rounding rather than a blanket 4/3 multiplier.
 
 ---
 
@@ -233,7 +298,14 @@ The model constructs a canonical layout according to the selected normal encodin
 diffuse(3) | normal(3 or 2) | roughness(1) | occlusion(1) | metallic(1) | specular(1) | displacement(1)
 ```
 
-The network and SR base use only retained channels in this order, without empty material slots. Mip0-only model and decoder inputs omit the mip level.
+The network and SR base use only retained channels in this order, without empty material slots. Multi-mip model queries include normalized Mip for latent selection; decoder inputs omit it.
+
+Diffuse source images are decoded with the standard IEC 61966-2-1 sRGB transfer
+function before resizing, mip generation and training. Material values, decoder
+outputs and PBR inputs remain linear; screenshots use the inverse standard sRGB
+function, matching the PBR shader. Normal/scalar maps and latent features receive
+no sRGB conversion. Training checkpoints record the source transfer function;
+older Gamma 2.2 runs require a new run or `--warm_start` because the targets changed.
 
 The dataset retains up to four scalar maps in R/O/M/S/D priority. When ROMSD uses BC1 and diffuse uses BC7, AO moves to diffuse alpha, leaving at most three scalars in BC1. Without a BC7 diffuse texture, BC1 retains only three scalars. BC5 normals always use positive-Z XY encoding for GT, baseline and SR base. Excluded maps do not participate in training, metrics or screenshots. Baseline and SR base share the mapping exported in `texture_packing.json`. Packed `ROMS` inputs use alpha for specular; `ROMD` inputs use alpha for displacement.
 
@@ -299,7 +371,7 @@ Tile size is measured in inference material texels. CNN training/inference, FNTC
 
 Reports record `fntc_tile_size` and `tile_layout`. Full material textures are written directly under `Compare_Material/iter_<iteration>/`, for example `DDS_Diffuse_Baseline_BC7.dds` and `DDS_Diffuse_FNTC_Recompressed_BC7.dds`, with corresponding Normal and Romsd files in their configured formats. CNN checkpoints and NPZ exports preserve tile size and validate it during restoration.
 
-DDS material images include a full mip chain down to 1×1. Mips are filtered successively from the assembled, decoded Mip0, with vector filtering for normals. ASTC material mips use separate files such as `Diffuse_Baseline_ASTC6x6.astc` and `Diffuse_Baseline_ASTC6x6_mip1.astc`. Quality metrics and storage comparisons count Mip0; exported files additionally contain lower mips and container headers. Model latent surfaces retain their Mip0 export.
+Material textures contain a full mip chain down to 1×1 in one file per group: BC uses DDS, ASTC uses KTX2, e.g. `Diffuse_Baseline_ASTC6x6.ktx2`. Mips are filtered successively from the assembled, decoded Mip0, with vector filtering for normals. KTX2 stores the existing linear ASTC UNORM blocks without transcoding or supercompression. Material image metrics measure Mip0; storage includes the complete chain and container headers. Latent export packs every configured independently learned level into the same surface file; it never generates substitute mips by resizing latent Mip0. SR base exports remain single-level DDS/KTX2 textures.
 
 ### FNTC tile recompression
 
@@ -311,7 +383,7 @@ Recompression uses `material_compression_formats` from the baseline section. Sta
 
 `FNTC_Uncompressed` is inference from compressed latent textures, before material recompression. `FNTC_Recompressed_DiffuseBC7_NormalBC5_RomsdBC1` applies the same per-group formats as `Baseline_DiffuseBC7_NormalBC5_RomsdBC1`. Recompression is enabled by default, making FNTC_Recompressed the primary deployment method; disabling it selects FNTC_Uncompressed. The reconstruction objective trains the decoder; conventional recompression is evaluated without differentiating through the codec.
 
-`[Material Test]` runs every `material_compare_interval` iterations independently of saving, early-stop windows or stage starts, with an additional terminal report. `Compare_Material/iter_<iteration>/` contains `metrics.json`, `metrics.csv`, annotated standalone images, strips and baseline/recompressed DDS or ASTC files. PBR compares all enabled methods under `Compare_PBRScene/iter_<iteration>/`: Scene uses `pbr_render_resolution`, and the separately rendered Scene Detail uses `pbr_detail_resolution`.
+`[Material Test]` runs every `material_compare_interval` iterations independently of saving, early-stop windows or stage starts, with an additional terminal report. `Compare_Material/iter_<iteration>/` contains `metrics.json`, `metrics.csv`, annotated standalone images, strips and baseline/recompressed DDS or KTX2 files. PBR compares all enabled methods under `Compare_PBRScene/iter_<iteration>/`: Scene uses `pbr_render_resolution`, and the separately rendered Scene Detail uses `pbr_detail_resolution`.
 
 For 2048 GT and a 1024 inference/baseline raster, every screenshot is 2048×2048: `Diffuse_GT[1024x1024].png`, `Diffuse_GT[2048x2048].png`, `Diffuse_BC7.png`, `Diffuse_FNTC_Uncompressed.png`, `Diffuse_FNTC_Recompressed.png`. Compression occurs at 1024 before bilinear upsampling and evaluation against full-resolution GT. The low-resolution GT image shows the prefiltered source before conventional compression. Every standalone image has metrics in its upper-left corner.
 
@@ -325,7 +397,7 @@ Scene and Detail share the device, geometry, pipelines and shadows. Each materia
 
 The room contains two boxes topped by smooth spheres. The elevated camera and default Detail viewport (`center: [0.76, 0.59]`, `zoom: 3.5`) show a close-up of part of the right sphere and its supporting box, together with the wall, floor and cast shadows. Dataset loading already linearizes albedo, so the renderer consumes linear material values and compressed mip texels directly. OpenGL source normals use the appropriate green-channel convention. Directional and point lights use cached 1024-pixel shadow maps with PCF. Interior point lights are enabled by default; optional directional sunlight is also occluded by the room ceiling. Shading uses Cook-Torrance GGX, a small ambient fill, Reinhard tone mapping and sRGB output; it does not simulate global illumination. These rendering changes invalidate comparisons with earlier PBR metric reports.
 
-FNTC storage counts compressed latents, decoder, CNN and the enabled low-resolution SR base; material tile cache bytes are reported separately. Baseline storage counts compressed material payload. Containers are excluded. Exported `SR_Base/metadata.json` records payload and file sizes separately.
+FNTC storage counts all compressed latent files, decoder/CNN NPZ metadata and the enabled single-level SR base; material tile cache bytes are reported separately. Baseline storage includes full material mip-chain files and their container headers. Exported `SR_Base/metadata.json` records payload and file sizes separately.
 
 ### ASTC-Aware Latent Training
 
@@ -380,7 +452,7 @@ The feature grid supports a **wrap boundary constraint**: during training, selec
 
 ### Model Export
 
-Each `models/train_result_<iteration>/` contains `model.pth`, `training_state.pth`, `network_data.npz` and the compressed latent surfaces declared in its manifest (BC1 DDS or ASTC). The run directory contains `resolved_config.json`, `texture_packing.json` and, for multi-stage runs, `representation_config.json` and `multi_stage_training.json`.
+Each `models/train_result_<iteration>/` contains `model.pth`, `training_state.pth`, `network_data.npz` and the compressed latent surfaces declared in its manifest (BC1 DDS or ASTC KTX2). The run directory contains `resolved_config.json`, `texture_packing.json` and, for multi-stage runs, `representation_config.json` and `multi_stage_training.json`.
 
 ### Heterogeneous Multi-Feature Grid
 

@@ -33,6 +33,54 @@ FNTC 使用压缩 latent 纹理和小型 decoder 表示一组材质。可选的�
 
 ## Core 算法模块
 
+### Mobile 的 on-sample 训练与评估
+
+`config_mobile.yaml` 使用 `inference_mode: on_sample`，PC 使用 `on_load`。
+Mobile 的推理 LOD 以实际输出材质尺寸为参考，与 Baseline 使用相同的 mip 层号。
+2K GT、两张 1K latent、1K Baseline 时，FNTC 和 Baseline 都是 1K 到 1×1 的 11 层纹理链：
+LOD0 使用各自的 1K 顶层，LOD1 使用各自的 512 层，不因 GT 是 2K 而额外降低一层。
+训练和验证直接采样原始 GT 的同编号 mip：latent mip0（1K）拟合 GT mip0（2K），
+latent mip1（512）拟合 GT mip1（1K），依此类推；不会先将 GT 降到 1K 再开始监督。
+整数训练样本覆盖高分辨率 GT 的 texel 中心，亚像素和小数 LOD 也在原始 GT 链上采样。
+如果原生输出的 mip 链比 GT 更长，GT 监督钳制到最后可用层，网络输入仍保留原生输出 LOD。
+每张 latent 的采样 LOD 为
+`clamp(material_lod + log2(grid_resolution / native_material_max_edge), 0, grid_mip_count - 1)`；
+1K 输出搭配 1K/512 latent 时，两张 grid 的 LOD 偏移分别为 0/-1。
+导出的 `inference_spec.on_sample` 包含原生 `lod_reference_size`、`grid_lod_offsets` 和计算规则；
+引擎应使用这些值计算 UV footprint/LOD。小数 LOD 先混合 latent，再执行 decoder。
+
+- mip 抽样固定采用 80% 几何衰减（每层乘 0.5）与 20% 均匀覆盖的混合；
+  全部原生材质 mip 都会训练，1K 输出共 11 层。
+- 默认 25% 的可混合批次使用小数 LOD；高级实验可通过 `mip_fractional_sampling_ratio` 覆盖训练比例。
+  主样本与亚像素样本使用相同 LOD，GT 也进行双线性/三线性 repeat 采样。
+- 每次验证在所有整数 mip 和半整数 LOD 使用固定种子的 scrambled Sobol UV（`mip_validation_samples`，默认每层 16384 点），
+  覆盖不同 texel/ASTC 块内相位且不消耗训练随机数。汇总 PSNR 固定采用上述 mip 分配与 25% 半整数 LOD 权重，
+  不随训练小数 LOD 比例改变，以保持模型选择标准一致。
+  每次验证都更新最佳检查点；早停仍按 `early_stop_interval` 的窗口判断，恢复最佳权重后重新计算验证分数。
+  plateau 调度器与早停使用这个分数，随机单步 loss 不驱动学习率；decoder 降速时，
+  已激活的 codec 优化器同比降速。plateau patience 内部固定为 4，连续第 5 次未达到改善标准的验证会触发降速。
+- `material_compare_resolution` 同时控制 FNTC 材质对比图的原生输出尺寸与传统基线的压缩尺寸。
+  2K GT、1K 输出时，两者均从 1K 原生图双线性放大到 2K 后计算图像指标；训练仍监督原始
+  2K GT 及其同编号 mip。Baseline 的压缩输入仍为 1K 材质图，不改变 FNTC 的高分辨率监督。
+  PBR 独立使用像素内 latent 解码，不采样这张用于材质对比的 1K 图片。
+- PBR 的 FNTC 路径在 DX12 像素着色器中采样部署解码后的 latent mip 链，再执行网络，
+  不再过滤预先解码的材质图片。它是 on-sample 画质参考；PC 上使用浮点 latent 上传，
+  不代表移动端原生 ASTC 采样带宽或推理耗时。
+
+当前 DX12 on-sample 路径支持 Mobile 预设的零隐藏层、零 PE、零特征差分、无 SR/CNN、
+无材质二次压缩，最多六张四通道 latent、十二个材质输出；PBR 位移须关闭。
+on-sample 要求每张 grid 的 `quantize_bits: 8`（默认值），保证 ASTC/BC 解码后的 feature 映射
+能与原生纹理过滤保持一致；2/4-bit 的逐 texel 重量化仍可用于 PC on-load。
+codec 训练直接读取代理表示，更新后只标记源参数镜像过期，保存或 source forward 时才同步，
+避免每步结束时重复解码整条 ASTC mip 链。BC1 的 usage 日志按各 mip 分别记录。
+native ASTC6×6 按有梯度的块累计 Adam 更新；BC1/ASTC roundtrip 保留普通 Adam 的全参数步语义，
+其中零梯度层仍可能受历史动量影响，两种后端的优化轨迹不保证相同。
+Mobile 推理契约现为 schema 3，DX12 协议为 2。旧的原始 GT LOD 契约不再直接加载，
+新训练采用原生材质 LOD 和原始 GT 同编号 mip 监督；旧预滤波配方不能精确续训为新配方。
+本次改动不会自动重启已有训练任务。
+
+回归检查：`python tests/test_mobile_on_sample.py`。
+
 `model.py` 将特征和编码模块与 decoder 组合起来；`train.py` 组织训练流程：
 
 | 目录 | 职责 |
@@ -215,7 +263,16 @@ tensorboard --logdir ./outputs
 - **Loss/train**：训练损失
 - **PSNR / SSIM / LPIPS**：各材质组的 Mip0 图像质量指标；ROMSD LPIPS 分别评估有效标量通道后取平均。
 
-训练、latent 块压缩导出和材质指标对比使用 Mip0（`mip0_only: true`）。
+PC 预设的每张 grid 使用 `n_levels: 1`；Mobile 使用 `n_levels: full`。
+层数统一在 `feature_grid_configs` 中配置，移除全局 `mip0_only` 开关；运行时的同名标记由所有 grid 的层数推导。
+`on_load` 要求每张 grid 都为 `n_levels: 1`；可训练的多层 mip 链使用 `inference_mode: on_sample`。
+多 mip 训练会选择不同的材质 mip，并在所选层执行纹素中心与亚像素监督。材质图像指标仍展示 Mip0；
+PBR 对比使用完整 mip 链，不能用 Mip0 的图像指标代替各 LOD 的渲染质量。
+
+每张 latent grid 的 `n_levels` 默认为 `1`；设为 `full` 时建立独立学习的完整金字塔，一直到 1×1。
+每一层都有自己的参数和 codec 状态，粗层不由 latent Mip0 缩小生成；正整数可指定较短的链。
+LOD 用于选择 latent 层，小数 LOD 线性混合相邻层，超出范围时钳制到该 grid 的最小层。
+LOD 不作为 decoder 的输入通道，因此两张四通道 Mobile grid 使用八个特征输入和一个常数偏置输入。
 
 ## 主要特性
 
@@ -227,7 +284,7 @@ tensorboard --logdir ./outputs
 diffuse(3) | normal(3 或 2) | roughness(1) | occlusion(1) | metallic(1) | specular(1) | displacement(1)
 ```
 
-网络和 SR base 只按上述顺序保留实际使用的通道，不保留空材质槽位。mip0 only 模型及解码器输入不包含 miplevel。
+网络和 SR base 只按上述顺序保留实际使用的通道，不保留空材质槽位。多 mip 模型查询携带归一化的 mip 值用于选择 latent 层，但 decoder 输入不包含 mip 值；Mip0-only 查询也省略该值。
 
 法线输入统一使用 OpenGL 约定；DirectX 法线需在输入前翻转绿色通道。`xy` / `hemi_oct` 强制正 Z 半球，GT 和重建法线使用相同编码；`xyz` 保留 Z 的正负号，但 BC5 存储会强制使用 XY 编码。
 
@@ -306,9 +363,9 @@ material_recompression_enable: true
 
 `FNTC_Uncompressed` 指压缩 latent 解码后推理得到、尚未再次压缩的材质；`FNTC_Recompressed_DiffuseBC7_NormalBC5_RomsdBC1` 指同一材质按基线配方再次压缩；`Baseline_DiffuseBC7_NormalBC5_RomsdBC1` 指传统材质压缩基线。默认开启二次压缩，以 FNTC_Recompressed 为核心部署方法；关闭后使用 FNTC_Uncompressed。重建损失用于训练 decoder，真实二次压缩用于验证，不通过传统编码器反传。
 
-`[Material Test]` 按 `material_compare_interval` 触发，周期独立于保存、早停及阶段起点，阶段结束另输出最终结果。材质报告位于 `Compare_Material/iter_<iteration>/`，同目录保存 `metrics.json`、`metrics.csv`、带左上角指标的独立图、拼图以及二次压缩和基线的 DDS/ASTC 文件。PBR 在 `Compare_PBRScene/iter_<iteration>/` 比较各启用方法，Scene 使用 `pbr_render_resolution`，独立渲染的 Scene Detail 使用 `pbr_detail_resolution`。
+`[Material Test]` 按 `material_compare_interval` 触发，周期独立于保存、早停及阶段起点，阶段结束另输出最终结果。材质报告位于 `Compare_Material/iter_<iteration>/`，同目录保存 `metrics.json`、`metrics.csv`、带左上角指标的独立图、拼图以及二次压缩和基线的 DDS/KTX2 文件。PBR 在 `Compare_PBRScene/iter_<iteration>/` 比较各启用方法，Scene 使用 `pbr_render_resolution`，独立渲染的 Scene Detail 使用 `pbr_detail_resolution`。
 
-整张材质 DDS 包含逐级缩小至 1×1 的完整 mip 链，从拼接、解码后的 Mip0 连续过滤生成各级，法线采用向量过滤。ASTC 材质单独保存为 `Diffuse_Baseline_ASTC6x6.astc`、`Diffuse_Baseline_ASTC6x6_mip1.astc` 等文件。压缩块对齐时直接拼接 tile 码流；内部 tile 边界切开压缩块时，对拼接后的解码图重新编码，使导出纹理与评估像素一致。质量指标与存储对比仍按 Mip0 统计；导出文件另外包含低级 mip 和容器头。模型 latent surface 仍只导出 Mip0。
+每组材质纹理用一个文件保存逐级缩小至 1×1 的完整 mip 链：BC 使用 DDS，ASTC 使用 KTX2，例如 `Diffuse_Baseline_ASTC6x6.ktx2`。各级从拼接、解码后的 Mip0 连续过滤生成，法线采用向量过滤；KTX2 直接封装已有的线性 ASTC UNORM 码流，不转码、不进行 supercompression。压缩块对齐时直接拼接 tile 码流；内部 tile 边界切开压缩块时，对拼接后的解码图重新编码，使导出纹理与评估像素一致。材质图像指标衡量 Mip0，存储统计包含完整链与容器头。SR base 仍使用单级 DDS/KTX2 文件。
 
 例如 GT=2048、推理/基线=1024，以下文件都保存为2048×2048；低分辨率内容在压缩之后双线性拉伸再对高分辨率 GT 计算指标：`Diffuse_GT[1024x1024].png`、`Diffuse_GT[2048x2048].png`、`Diffuse_BC7.png`、`Diffuse_FNTC_Uncompressed.png`、`Diffuse_FNTC_Recompressed.png`。低分辨率 GT 图表示预滤波后的未压缩源，`Diffuse_BC7.png` 表示其传统压缩结果。
 
@@ -322,7 +379,7 @@ Scene 与 Detail 共用设备、几何、管线和阴影，每种材质只准备
 
 场景包含两个顶置平滑球体的方体。相机略微俯视，默认 Detail 视口（`center: [0.76, 0.59]`、`zoom: 3.5`）拉近到右侧球体与方体的局部，同时保留墙面、地面和投影。数据集加载时已将颜色转为线性，因此渲染器直接使用线性材质值及压缩 mip 纹素，避免重复 gamma 转换。OpenGL 源法线按对应的绿色通道约定解释。平行光、点光源均采用缓存的 1024 像素阴影贴图与 PCF 过滤。默认使用室内点光源；可选的室外平行光也会被天花板遮挡。着色采用 Cook-Torrance GGX、少量环境补光、Reinhard 色调映射及 sRGB 输出，不模拟全局光照。本次渲染修改后的 PBR 指标不能直接与旧报告比较。
 
-FNTC 存储统计计压缩 latent、decoder、CNN 和启用的 SR base；材质 tile cache 大小单列。基线统计压缩材质 payload，容器头均不计入。SR base 的实际 payload 与容器文件大小分别记录在导出的 `SR_Base/metadata.json`。
+FNTC 存储统计计全部压缩 latent 文件、decoder/CNN NPZ 元数据和启用的单级 SR base；材质 tile cache 大小单列。基线统计完整材质 mip 链文件及容器头。SR base 的实际 payload 与容器文件大小分别记录在导出的 `SR_Base/metadata.json`。
 
 ### ASTC 感知 Latent 训练
 
@@ -378,12 +435,23 @@ ASTC 阶段的 feature-gradient 采样使用同一份可微解码 feature；第�
 
 ### 异构多特征网格
 
+每张 latent surface 的全部可训练 mip 封装到同一个文件：ASTC 使用 `feature_grid_0.ktx2`，
+BC1 使用 `feature_grid_0_bc1_0.dds`；具体文件名以清单为准。`network_data.npz` 的
+`feature_grid_compression` 清单记录各级尺寸、surface 通道与文件名，`inference_spec`
+记录 LOD 选层和过滤规则。引擎应加载独立学习的 mip 数据，不能自动从 latent Mip0 生成替代链。
+多 mip 模型使用 inference schema 2。ASTC 或多 mip BC1 导出使用 compression schema 4：`surfaces[]` 列出容器文件，`mips[]` 列出各级尺寸；所有 grid 均为单层 BC1 时保留 compression schema 2。容器封装不改变 checkpoint 权重与推理契约。
+
+存储对比计入实际部署文件：全部 latent 层、包含 decoder/CNN 与元数据的 `network_data.npz`，以及纹理文件头。
+Baseline 和未压缩 GT 始终统计到 1×1 的完整材质 mip 链，与实际材质导出和 PBR 采样一致，不由 latent 层数决定。
+小 mip 按真实块数向上取整，不直接套用 4/3 系数。已启用的单级 SR base 文件单列并计入 FNTC 总量；训练 checkpoint、优化器和运行时材质输出缓存不计入部署存储。
+
 通过 `feature_grid_configs` 可以配置多个分辨率或不同精度的 feature grid：
 
 | 字段 | 说明 |
 |------|------|
 | `format` | 必填格式：`BC1` 或 `astc6x6`、`astc4x4` 等 ASTC 块尺寸 |
 | `max_resolution` | 最大分辨率 |
+| `n_levels` | 默认 `1`；`full` 为可训练的完整链到 1×1；正整数指定层数，各 grid 独立配置 |
 | `quantize_bits` | 量化精度（2/4/8 位） |
 | `n_features_per_level` | 每 grid 的特征数：ASTC 支持 1/2/4/8，BC1 支持 4/8；默认 4 |
 | `feature_gradient_count` | 邻域差分数：0/2/4/8/24；默认 0 |

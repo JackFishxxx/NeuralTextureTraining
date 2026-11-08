@@ -9,6 +9,7 @@ import math
 import numpy as np
 from PIL import Image
 import torchvision.transforms.functional as TF
+from Common.Material.color_space import srgb_to_linear
 from Core.Feature_Grid.sampling import bilinear_texel_corners, resize_bilinear_repeat, sample_image
 from Common.Material.normal_encoding import (
     decode_normal,
@@ -178,7 +179,7 @@ def get_texture_config(normal_encoding: str = "xyz") -> List[Dict]:
         # add other texture types and their possible keywords if needed
     }
 
-    # vis_mode: "srgb" = apply gamma for display, "normal" = re-normalize vectors, "linear" = save as-is
+    # vis_mode: "srgb" = encode linear RGB for display, "normal" = re-normalize vectors, "linear" = save as-is
     # loss_weight: per-channel loss weight used during training
     # display_name: subfolder name used when saving evaluation images
     texture_configs = {
@@ -241,13 +242,25 @@ class TextureDataset(torch.nn.Module):
         self.texture_height, self.texture_width, self.num_channels = self.textures.shape
         self.material_reconstruction_size = material_size(config, self.texture_height, self.texture_width)
         
-        self.num_mips = int(min(math.log2(self.texture_height), math.log2(self.texture_width))) + 1
-
         self.mip_cache = self.generate_mip()
+        self.num_mips = len(self.mip_cache)
         if config.super_resolution_enable:
             from Common.Material.reconstruction import sr_base_source_mip
             sr_base_source_mip(self, config.super_resolution_base_resolution)
     
+    @torch.no_grad()
+    def sample_lod(self, uv: torch.Tensor, lod: float) -> torch.Tensor:
+        """Sample the original GT pyramid at the requested mip, without a resolution offset."""
+        source = self.mip_cache
+        lod = min(max(float(lod), 0.), len(source) - 1)
+        lower, upper = math.floor(lod), min(math.floor(lod) + 1, len(source) - 1)
+        def lookup(mip):
+            size = uv.new_tensor(source[mip].shape[:2])
+            xy = (uv.flip(1) * size - .5) * (2 ** mip)
+            return self.sample_continuous(xy, mip)
+        target = lookup(lower)
+        return torch.lerp(target, lookup(upper), lod - lower) if lod != lower else target
+
     @torch.no_grad()
     def sample_continuous(self, sample_xy: torch.Tensor, mips: Union[torch.Tensor, int]) -> torch.Tensor:
         """Bilinear repeat sampling; an integer mip avoids dynamic GPU masking."""
@@ -343,7 +356,7 @@ class TextureDataset(torch.nn.Module):
             image = image.convert(color_mode)
             tensor = TF.to_tensor(image)
             if texture_type == "diffuse":
-                tensor = torch.pow(tensor, 2.2)
+                tensor = srgb_to_linear(tensor)
             elif texture_type == "normal":
                 tensor = prepare_normal_input(tensor, self.normal_encoding)
         return tensor
@@ -476,13 +489,14 @@ class TextureDataset(torch.nn.Module):
         # the bug was not fixed since 2023
         # work on cpu seems not to have this problem
         textures = self.textures.cpu()
+        height, width = textures.shape[:2]
 
         # Build a conventional mip chain: each level is filtered from the
         # immediately preceding level, rather than repeatedly from Mip0.
         previous_parts = {}
-        for mip in range(self.num_mips):
-            mip_height = self.texture_height // (2 ** mip)
-            mip_width = self.texture_width // (2 ** mip)
+        for mip in range(max(height, width).bit_length()):
+            mip_height = max(1, height // (2 ** mip))
+            mip_width = max(1, width // (2 ** mip))
             mip_parts = []
             for texture_type in self.available_textures:
                 ds_start, ds_end = self.channel_slices[texture_type]

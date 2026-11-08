@@ -69,6 +69,7 @@ PHASE_CONFIG_KEYS = (
     'n_hidden_layers', 'n_frequencies', 'feature_grid_configs', 'material_cnn_enable',
     'num_mips', 'num_channels', 'pos_encoding_reference_edge',
     'material_cnn_inference_size', 'material_reconstruction_size',
+    'material_lod_reference_size',
 )
 
 
@@ -85,14 +86,22 @@ def config_values(config):
 
 
 def training_recipe(config):
+    from Common.Material.color_space import SRGB_TRANSFER
     ignored = {'load_dir', 'load_iter', 'save_dir', 'data_dir', 'mode', 'device', 'warm_start',
                'num_channels', 'num_mips', 'texture_types', 'pos_encoding_reference_edge', 'material_reconstruction_size',
-               'material_cnn_inference_size', 'output_loss_weights', 'save_interval',
+               'material_cnn_inference_size', 'material_lod_reference_size', 'output_loss_weights', 'save_interval',
                'enable_material_compare', 'material_compare_interval', 'eval_inference_tile'}
     result = {k: v for k, v in config_values(config).items() if k not in ignored and not k.startswith('groups_')}
+    if getattr(config, 'inference_mode', 'on_load') == 'on_load':
+        for key in ('inference_mode', 'mip_fractional_sampling_ratio', 'mip_validation_samples'):
+            result.pop(key, None)
     result['grid_training'] = [asdict(p) for p in config.grid_training]
     result['normal_loss'] = 'encoded_mse'
     result['material_metric_space'] = 'encoded_channels'
+    result['diffuse_source_transfer'] = SRGB_TRANSFER
+    if getattr(config, 'inference_mode', 'on_load') == 'on_sample':
+        result['on_sample_validation'] = 'scrambled_sobol_fixed_lod_weights_v2'
+        result['on_sample_lod'] = 'native_material_lod_original_gt_same_mip_v1'
     if config.super_resolution_enable:
         result['sr_base'] = 'baseline_material_codec_all_stages_v1'
     return result

@@ -1,4 +1,5 @@
 import os
+import math
 import torch
 import copy
 import numpy as np
@@ -18,7 +19,7 @@ from Core.Feature_Grid.optimization import make_scheduler
 
 
 from Core.Feature_Grid.feature_grid import (
-    FeatureGridSpec, enforce_wrap_boundary_constraint_inplace,
+    FeatureGridSpec, LearnedMipPyramid, enforce_wrap_boundary_constraint_inplace,
     feature_to_unorm, qat_noise_multiplier, quantize_feature_ste, quantize_feature_tensor,
     unorm_to_feature,
 )
@@ -59,6 +60,13 @@ class TCNNModel(torch.nn.Module):
 
         self.num_mips = config.num_mips
         self.mip0_only = bool(getattr(config, 'mip0_only', False))
+        self.inference_mode = getattr(config, 'inference_mode', 'on_load')
+        self.material_lod_reference_size = tuple(getattr(config, 'material_lod_reference_size', ()))
+        if not self.material_lod_reference_size:
+            self.material_lod_reference_size = (
+                tuple(getattr(config, 'material_reconstruction_size', ())) or
+                (max(g['max_resolution'] for g in config.feature_grid_configs),) * 2
+                if self.inference_mode == 'on_sample' else (2 ** (config.num_mips - 1),) * 2)
         self.n_frequencies = config.n_frequencies
         self.n_neurons = config.n_neurons
         self.n_hidden_layers = config.n_hidden_layers
@@ -142,8 +150,6 @@ class TCNNModel(torch.nn.Module):
 
         for idx, grid_cfg in enumerate(config.feature_grid_configs):
             spec = FeatureGridSpec.from_config(grid_cfg, config.quantize_bits, config.learning_rate)
-            if self.mip0_only:
-                spec = FeatureGridSpec(**{**spec.__dict__, 'n_levels': 1, 'base_resolution': spec.max_resolution})
             self.feature_grid_specs.append(spec)
             self.register_buffer(f'_center_shifts_{idx}', torch.tensor(
                 ((0, 0), *gradient_directions(spec.feature_gradient_count)),
@@ -163,13 +169,17 @@ class TCNNModel(torch.nn.Module):
                 "per_level_scale": 2.0,
                 "interpolation": spec.interpolation,
             }
-            feature_grid = tcnn.Encoding(
+            feature_grid = LearnedMipPyramid(spec, self.device) if n_levels > 1 else tcnn.Encoding(
                 n_input_dims=2,
                 encoding_config=feature_grid_config
             )
             self.feature_grids.append(feature_grid)
 
             print(f"Initialized feature grid: max_res={max_res}, base_res={base_res}, n_levels={n_levels}, n_features_per_level={n_feature_per_level}, quantize_bits={qbits}, interpolation={spec.interpolation}")
+
+        self.feature_grid_lod_offsets = tuple(
+            math.log2(spec.max_resolution / max(self.material_lod_reference_size))
+            if self.inference_mode == 'on_sample' else 0. for spec in self.feature_grid_specs)
 
         self.material_cnn = None
         if getattr(config, 'material_cnn_enable', False):
@@ -198,12 +208,13 @@ class TCNNModel(torch.nn.Module):
             optimizer_params.append({'params': feature_grid.parameters(), 'lr': spec.learning_rate})
         self.optimizer = torch.optim.Adam(optimizer_params, betas=(config.momentum, .999),
                                           weight_decay=config.weight_decay)
-        self.scheduler = make_scheduler(self.optimizer, config.lr_scheduler, self.max_iter)
+        self.scheduler = make_scheduler(self.optimizer, config.lr_scheduler, self.max_iter,
+                                        on_sample=self.inference_mode == 'on_sample')
 
     def _create_decoder(self, config, positional_dims):
         features = sum(channels * (1 + grid['feature_gradient_count'])
                        for channels, grid in zip(_feature_input_channels(config), config.feature_grid_configs))
-        inputs = positional_dims + features * self.num_sampled_mips + 1 + (not config.mip0_only)
+        inputs = positional_dims + features * self.num_sampled_mips + 1
         if config.super_resolution_enable:
             inputs += self.num_channels
         return tcnn.Network(inputs, self.num_channels, {
@@ -211,21 +222,6 @@ class TCNNModel(torch.nn.Module):
             'output_activation': 'None', 'n_neurons': config.n_neurons,
             'n_hidden_layers': config.n_hidden_layers,
         })
-
-    def decoder_storage_bytes(self, deployment_config=None):
-        """Count exported weights without allocating another latent grid or optimizer."""
-        network, cnn = self.network, self.material_cnn
-        if deployment_config is not None:
-            devices = [torch.cuda.current_device()] if self.device == 'cuda' else []
-            with torch.random.fork_rng(devices=devices):
-                # Tiled sin/cos contributes four input channels per frequency.
-                network = self._create_decoder(deployment_config, 4 * deployment_config.n_frequencies)
-                with torch.device('meta'):
-                    cnn = MaterialCNN(self.num_channels) if deployment_config.material_cnn_enable else None
-        decoder = sum(p.numel() * p.element_size() for p in network.parameters())
-        decoder += self.decoder_output_bias.numel() * self.decoder_output_bias.element_size()
-        spatial = sum(p.numel() * p.element_size() for p in cnn.parameters()) if cnn is not None else 0
-        return decoder, spatial
 
     def _hard_swish(self, x: torch.Tensor) -> torch.Tensor:
         """Hard-Swish activation without trig/exp.
@@ -443,7 +439,8 @@ class TCNNModel(torch.nn.Module):
                     params, spec, uvs, shifts=getattr(self, f'_center_shifts_{idx}'))
             else:
                 grid_levels = spec.n_levels
-                clipped_mips = torch.clamp(mips, max=grid_levels - num_sampled_mips)
+                clipped_mips = torch.clamp(mips + self.feature_grid_lod_offsets[idx],
+                                          min=0, max=grid_levels - num_sampled_mips)
                 selected_level_f = grid_levels - num_sampled_mips - clipped_mips
                 sampled_features = sample_feature_inputs(params, spec, uvs, selected_level_f)
             sampled_features = sampled_features.to(feature_grid.dtype)
@@ -456,8 +453,6 @@ class TCNNModel(torch.nn.Module):
         features = torch.cat(features, dim=1)
 
         input_parts = [positional_encodings, features]
-        if not self.mip0_only:
-            input_parts.append(mip_encodings)
         if self.super_resolution_enable:
             input_parts.append(x[:, coordinate_dims:])
         input_parts.append(torch.ones((len(x), 1), device=x.device, dtype=features.dtype))
@@ -546,6 +541,8 @@ class TCNNModel(torch.nn.Module):
         from Core.Feature_Grid.serialization import validate_contract, restore_proxies
 
         validate_contract(self, state_dict)
+        # Normalize equivalent JSON metadata to the model's serialized layout.
+        state_dict['_inference_contract'] = self._inference_contract.detach().clone()
         restore_proxies(self, state_dict)
         result = super().load_state_dict(state_dict, strict=strict, assign=assign)
         self._pending_grid_sync.clear()
@@ -556,6 +553,38 @@ class TCNNModel(torch.nn.Module):
         super()._save_to_state_dict(destination, prefix, keep_vars)
         from Core.Feature_Grid.serialization import proxy_layout_tensor
         destination[prefix+'_grid_proxy_kinds'] = proxy_layout_tensor(self)
+
+    @torch.no_grad()
+    def network_data_arrays(self):
+        """The exact decoder/CNN arrays and metadata written to network_data.npz."""
+        save_kwargs = {
+            "info": self.get_model_info(),
+            "feature_sampling": np.array("bilinear_repeat_texel_center"),
+            "normal_encoding": np.array(self.normal_encoding),
+            "normal_output_convention": np.array("opengl"),
+            "normal_sampling": np.array("filter_encoded_then_decode"),
+            "normal_xy_min_z": np.array(NORMAL_XY_MIN_Z, dtype=np.float32),
+            "pos_encoding_type": np.array(self.pos_encoding_type),
+            "pos_encoding_tile_size": np.array(self.pos_encoding_tile_size, dtype=np.int32),
+            "pos_encoding_reference_size": np.array(
+                self.pos_encoding_reference_size, dtype=np.int32
+            ),
+            "network": self.network.params.detach().cpu().numpy(),
+            "decoder_output_bias": self.decoder_output_bias.detach().cpu().numpy(),
+        }
+
+        from Core.Feature_Grid.serialization import deployment_arrays
+
+        save_kwargs.update(deployment_arrays(self))
+        if self.material_cnn is not None:
+            save_kwargs.update(self.material_cnn.export_arrays())
+        return save_kwargs
+
+    def network_data_bytes(self):
+        import io
+        stream = io.BytesIO()
+        np.savez(stream, **self.network_data_arrays())
+        return stream.tell()
 
     @torch.no_grad()
     def save(self, curr_iter: int, model_path: str) -> None:
@@ -576,37 +605,7 @@ class TCNNModel(torch.nn.Module):
 
             save_model.simulate_quantize()
 
-            # ----------------------------------------------------------------------------------
-            # - process the range of network weights
-            # ----------------------------------------------------------------------------------
-
-            # generate model infos
-            info = save_model.get_model_info()
-
-            save_kwargs = {
-                "info": info,
-                "feature_sampling": np.array("bilinear_repeat_texel_center"),
-                "normal_encoding": np.array(self.normal_encoding),
-                "normal_output_convention": np.array("opengl"),
-                "normal_sampling": np.array("filter_encoded_then_decode"),
-                "normal_xy_min_z": np.array(NORMAL_XY_MIN_Z, dtype=np.float32),
-                "pos_encoding_type": np.array(self.pos_encoding_type),
-                "pos_encoding_tile_size": np.array(self.pos_encoding_tile_size, dtype=np.int32),
-                "pos_encoding_reference_size": np.array(
-                    self.pos_encoding_reference_size, dtype=np.int32
-                ),
-                "network": save_model.network.state_dict()["params"].numpy(),
-                "decoder_output_bias": save_model.decoder_output_bias.detach().numpy(),
-            }
-
-            from Core.Feature_Grid.serialization import deployment_arrays
-
-            save_kwargs.update(deployment_arrays(self))
-            network_data_path = os.path.join(save_path, f"network_data.npz")
-            if save_model.material_cnn is not None:
-                save_kwargs.update(save_model.material_cnn.export_arrays())
-            # Network data and compressed surfaces share the same deployment manifest.
-            np.savez(network_data_path, **save_kwargs)
+            np.savez(os.path.join(save_path, 'network_data.npz'), **self.network_data_arrays())
             from Core.Feature_Grid.compression import export_latents
 
             export_latents(save_model, save_path)

@@ -216,6 +216,10 @@ def run_pbr_comparison_pipeline(trainer, evaluation, output_root, *, curr_iter=N
         os.makedirs(out_dir,exist_ok=True)
     scores = {}
     sizes = {}
+    on_sample = None
+    if evaluation.sample_model is not None:
+        from .on_sample import prepare_on_sample
+        on_sample = prepare_on_sample(evaluation.sample_model)
     # Detail uses a fresh camera viewport, never a resized crop of the main view.
     views = [('Scene', _scene_view(config.pbr_render_resolution))]
     if save_outputs or include_detail_metrics:
@@ -248,7 +252,8 @@ def run_pbr_comparison_pipeline(trainer, evaluation, output_root, *, curr_iter=N
         if pending:
             images = scene.render_views(image, dataset.canonical_channel_slices, dataset.normal_encoding,
                                         dataset.available_textures, config.pbr_mip_lod_bias, trainer.pbr_lighting,
-                                        evaluation.compressed_maps.get(name), [viewport for _, viewport in pending])
+                                        evaluation.compressed_maps.get(name), [viewport for _, viewport in pending],
+                                        on_sample=on_sample if name == UNCOMPRESSED else None)
             for (view, _), rendered in zip(pending, images):
                 rendered_views[view][name] = rendered
                 if name in fixed_names:
@@ -295,9 +300,15 @@ def run_pbr_comparison_pipeline(trainer, evaluation, output_root, *, curr_iter=N
                                     inference_size=list(evaluation.size),
                                     material_sizes={name:list(image.shape[-2:]) for name,image in evaluation.native_images.items()},
                                     normal_encoding=dataset.normal_encoding,
-                                    mip_sources={name: ('compressed full-image mip chains' if name in evaluation.compressed_maps
+                                    mip_sources={name: ('filtered deployment latent mips then pixel decoder' if on_sample is not None and name == UNCOMPRESSED
+                                                       else 'compressed full-image mip chains' if name in evaluation.compressed_maps
                                                        else 'floating mip pyramid') for name in evaluation.native_images},
-                                    texture_addressing='repeat full material UVs; bilinear/trilinear sampling of assembled compressed mips',
+                                    texture_addressing=('FNTC: bilinear/trilinear latent filtering then pixel decoder; baseline: material mip sampling'
+                                                        if on_sample is not None else
+                                                        'repeat full material UVs; bilinear/trilinear sampling of assembled compressed mips'),
+                                    inference_mode='on_sample' if on_sample is not None else 'on_load',
+                                    lod_reference_size=(list(evaluation.sample_model.material_lod_reference_size)
+                                                        if on_sample is not None else None),
                                     mip_lod_bias=config.pbr_mip_lod_bias,lighting=trainer.pbr_lighting,
                                     detail_view=dict(center=config.pbr_detail_center,zoom=config.pbr_detail_zoom,
                                                      resolution=config.pbr_detail_resolution,rendered_separately=True)))

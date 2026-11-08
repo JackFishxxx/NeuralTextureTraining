@@ -120,7 +120,10 @@ class Trainer(FeatureGridTraining):
                                                            tile_size=configs.fntc_tile_size)
                 material_compression.validate_dataset(dataset)
                 print(f"[NormalEncoding] mode={dataset.normal_encoding}")
-                configs.num_mips = dataset.num_mips
+                configs.material_lod_reference_size = (list(dataset.material_reconstruction_size)
+                    if configs.inference_mode == 'on_sample' else [dataset.texture_height, dataset.texture_width])
+                configs.num_mips = (max(configs.material_lod_reference_size).bit_length()
+                    if configs.inference_mode == 'on_sample' else dataset.num_mips)
                 configs.normal_encoding = dataset.normal_encoding
                 configs.texture_types = dataset.available_textures
                 # Tile size is measured in decoder/material texels, independent of GT resolution.
@@ -137,8 +140,7 @@ class Trainer(FeatureGridTraining):
                 model.configure_direct_diffuse_from_dataset(dataset)
                 configs.material_reconstruction_size = list(material_size(model, dataset.texture_height, dataset.texture_width))
                 configs.num_channels = model.num_channels
-            log_comparison_storage(model, dataset, material_compression, configs,
-                                   deployment_config=deployment_config)
+            log_comparison_storage(model, dataset, material_compression, configs)
         finally:
             print(startup_log.getvalue(), end='')
 
@@ -172,16 +174,23 @@ class Trainer(FeatureGridTraining):
             os.makedirs(self.infer_path, exist_ok=True)
 
         # data config
-        self.num_mips = dataset.num_mips
+        self.num_mips = configs.num_mips
         self.texture_height = dataset.texture_height
         self.texture_width = dataset.texture_width
         self.mip0_only = bool(getattr(configs, "mip0_only", False))
         native_h, native_w = configs.material_reconstruction_size
         infer_h, infer_w = material_size(model,self.texture_height,self.texture_width,
             resolution=configs.material_compare_resolution)
-        print(f'[Material Reconstruction] training={native_w}x{native_h}, inference={infer_w}x{infer_h}, '
-              f'GT={self.texture_width}x{self.texture_height}, '
-              f'resize_to_gt={(infer_h, infer_w) != (self.texture_height, self.texture_width)}, texel_centers=True')
+        if self.mip0_only:
+            print(f'[Material Reconstruction] training={native_w}x{native_h}, inference={infer_w}x{infer_h}, '
+                  f'GT={self.texture_width}x{self.texture_height}, '
+                  f'resize_to_gt={(infer_h, infer_w) != (self.texture_height, self.texture_width)}, texel_centers=True')
+        else:
+            print(f'[Material Reconstruction] direct UV training across {self.num_mips} material mips; '
+                  f'GT={self.texture_width}x{self.texture_height}, '
+                  + (f'on_sample native LOD reference={native_w}x{native_h}; baseline={infer_w}x{infer_h}; '
+                     'supervision=original GT at the same mip index'
+                     if model.inference_mode == 'on_sample' else f'inference Mip0={infer_w}x{infer_h}'))
         self.subpixel_sampling_enable = bool(getattr(configs, "subpixel_sampling_enable", True))
         self.subpixel_sampling_ratio = float(getattr(configs, "subpixel_sampling_ratio", 0.25))
         self.subpixel_jitter = float(getattr(configs, "subpixel_jitter", 0.5))
@@ -313,6 +322,11 @@ class Trainer(FeatureGridTraining):
         self._early_stop_phase_start_iter = start
 
     def _validation_score(self, curr_iter, eval_psnr=None):
+        if self.model.inference_mode == 'on_sample':
+            cached = getattr(self, '_sampled_validation', None)
+            score = cached[1] if cached is not None and cached[0] == curr_iter else self._validate_sampled_mips(curr_iter)
+            self.writer.add_scalar('EarlyStop/on_sample_mip_PSNR', score, curr_iter)
+            return score
         score = float(eval_psnr if eval_psnr is not None else self.deployment_metrics(psnr_only=True)['average'][0])
         self.writer.add_scalar('EarlyStop/recompressed_PSNR' if self.configs.material_recompression_enable
                                else 'EarlyStop/uncompressed_PSNR', score, curr_iter)
@@ -371,6 +385,7 @@ class Trainer(FeatureGridTraining):
         final_lr = self.model.optimizer.param_groups[0]["lr"]
         restored_earlier = self._phase_control.best_iteration != last_iter
         self._phase_control.restore(self.model)
+        self._sampled_validation = None
         self._grid_compression_optimizer = None
         self.last_training_stats = dict(self._phase_control.summary(),
                                         completed_iteration=last_iter, final_decoder_lr=final_lr)
@@ -412,26 +427,14 @@ class Trainer(FeatureGridTraining):
                 self._reset_training_phase("codec", curr_iter)
                 # Reset plateau history when the input distribution changes.
                 if isinstance(self.model.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    self.model.scheduler = make_scheduler(
-                        self.model.optimizer, self.configs.lr_scheduler, self.max_iter - curr_iter)
+                    self.model.scheduler = make_scheduler(self.model.optimizer, self.configs.lr_scheduler,
+                        self.max_iter - curr_iter, on_sample=self.model.inference_mode == 'on_sample')
             self.model.optimizer.zero_grad()
 
             if self.quantize and curr_iter % self.eval_interval == 0:
                 self.writer.add_scalar("QAT/noise_mult", self.model._qat_noise_multiplier(), curr_iter)
 
-            # generate random sample indices
-            ys = torch.randint(0, self.texture_height, [self.batch_size, 1]).to(self.device)
-            xs = torch.randint(0, self.texture_width, [self.batch_size, 1]).to(self.device)
-            # Use the dataset's compact material layout.
-            gt_texture = self.dataset.mip_cache[0][ys[:, 0], xs[:, 0]]
-            gt_texture = self.dataset.expand_to_canonical(gt_texture).to(
-                torch.float32 if self.native_reconstruction else torch.float16)
-            us = (xs.float() + 0.5) / self.texture_width
-            vs = (ys.float() + 0.5) / self.texture_height
-            batch_input = torch.cat([us, vs] + ([] if self.mip0_only else [torch.zeros_like(us)]), dim=1)
-            superres_base = self._sr_base_at_uv(batch_input[:, :2]) if self.super_resolution_enable else None
-            if superres_base is not None:
-                batch_input = torch.cat([batch_input, superres_base], dim=1)
+            batch_input, gt_texture, superres_base = self._sample_training_batch()
             total_loss = self._training_batch_loss(
                 batch_input, gt_texture, superres_base, loss_weights, curr_iter, codec_due
             )
@@ -448,7 +451,8 @@ class Trainer(FeatureGridTraining):
             loss_value = self._flush_training_scalars(curr_iter)['Loss/train']
             if self.model.scheduler is not None:
                 if isinstance(self.model.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    self.model.scheduler.step(metrics=loss_value)
+                    if self.model.inference_mode != 'on_sample':
+                        self.model.scheduler.step(metrics=loss_value)
                 else:
                     self.model.scheduler.step()
 
@@ -463,17 +467,28 @@ class Trainer(FeatureGridTraining):
             if (curr_iter - self._early_stop_phase_start_iter) % self.eval_interval == 0:
                 evaluation = self.material_evaluation(baseline=False, primary_only=True)
                 eval_psnr = self.eval(curr_iter, evaluation=evaluation)
+                if self.model.inference_mode == 'on_sample':
+                    validation = self._validate_sampled_mips(curr_iter, evaluation)
+                    if isinstance(self.model.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        previous_lr = self.model.optimizer.param_groups[0]['lr']
+                        self.model.scheduler.step(validation)
+                        ratio = self.model.optimizer.param_groups[0]['lr'] / previous_lr
+                        if ratio != 1 and self._grid_compression_optimizer is not None:
+                            self._grid_compression_optimizer.scale_learning_rates(ratio)
 
-                if (curr_iter > self._early_stop_phase_start_iter
-                        and (curr_iter - self._early_stop_phase_start_iter) % self.early_stop_interval == 0):
+                check_window = (curr_iter > self._early_stop_phase_start_iter
+                    and (curr_iter - self._early_stop_phase_start_iter) % self.early_stop_interval == 0)
+                if self.model.inference_mode == 'on_sample' or check_window:
                     current_psnr = self._validation_score(curr_iter, eval_psnr)
-                    self.writer.add_scalar('LR/decoder', self.model.optimizer.param_groups[0]["lr"], curr_iter)
                     stop = self._observe_training_score(
                         current_psnr, curr_iter,
-                        allow_stop=self.early_stop and self._phase_control.phase != "warmup",
+                        allow_stop=check_window and self.early_stop and self._phase_control.phase != "warmup",
+                        adjust_lr=check_window,
                     )
-                    print(f"[EarlyStopCheck] {self._phase_control.phase} iter {curr_iter}: "
-                          f"PSNR={current_psnr:.4f}, stagnant_windows={self._phase_control.bad_windows}")
+                    if check_window:
+                        self.writer.add_scalar('LR/decoder', self.model.optimizer.param_groups[0]["lr"], curr_iter)
+                        print(f"[EarlyStopCheck] {self._phase_control.phase} iter {curr_iter}: "
+                              f"PSNR={current_psnr:.4f}, stagnant_windows={self._phase_control.bad_windows}")
                     if stop:
                         self._complete_training_phase(eval_psnr, current_psnr, final_report, evaluation=evaluation)
                         return

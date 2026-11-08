@@ -3,6 +3,7 @@
 ASTC native operations and BC1 endpoint updates remain format-specific.
 """
 
+from functools import cached_property
 import torch
 from Common.Material.reconstruction import cached_sr_base
 from Common.cuda_graph import make_graphed_callables
@@ -11,6 +12,17 @@ from dataset import material_size, sample_material, NativeQueryPlan
 
 
 from Core.ASTC_Aware.parameters import ASTCTrainingOperations
+
+
+def mip_probabilities(count):
+    """Fixed fine-mip priority with a uniform floor for full-chain coverage."""
+    weights = torch.pow(torch.tensor(.5, dtype=torch.float64), torch.arange(count))
+    return .8 * weights / weights.sum() + .2 / count
+
+
+def fixed_validation_uv(count, device):
+    """Cover UV and subtexel phases without consuming the training RNG."""
+    return torch.quasirandom.SobolEngine(2, scramble=True, seed=1729).draw(count).to(device)
 
 
 def prepare_decoder_inputs(trainer):
@@ -46,21 +58,21 @@ def release_decoder_inputs(trainer):
 
 
 class FeatureGridTraining(ASTCTrainingOperations):
+    @cached_property
+    def _mip_sampling_probabilities(self):
+        return mip_probabilities(1 if self.mip0_only else self.num_mips)
+
     def _initialize_grid_compression(self, dataset, configs):
         self.material_size = material_size(self.model, self.texture_height, self.texture_width)
         self.native_reconstruction = self.material_size != (self.texture_height, self.texture_width)
         self._native_query_plans = {}
-        if self.native_reconstruction and not self.mip0_only:
-            raise ValueError(
-                "Native material reconstruction below GT resolution currently requires mip0_only"
-            )
         self.astc_codec_backend = configs.astc_codec_backend
         self._codec_phase_logged = False
         self._grid_compression_optimizer = None
         if (self.progress.stage in ('single', 'representation') and configs.codec_training_enable
                 and configs.astc_aware_enable and configs.native_astc_grids):
-            if not self.mip0_only or not self.model.quantize:
-                raise ValueError("Native ASTC optimization requires quantized Mip0")
+            if not self.model.quantize:
+                raise ValueError("Native ASTC optimization requires quantized feature grids")
             if configs.astc_decoder_projection_interval > 0 and not self._supports_astc_projection():
                 print('[ASTC Projection] inactive: requires an affine SR decoder without PE/feature gradients')
             from Core.ASTC_Aware.differentiable_proxy import native_extension
@@ -85,7 +97,8 @@ class FeatureGridTraining(ASTCTrainingOperations):
     def _predict_material(self, inputs):
         """Keep the residual API while supervising the deployed native-raster upsampler."""
         size = material_size(self.model, self.texture_height, self.texture_width)
-        if size == (self.texture_height, self.texture_width):
+        if (getattr(self.model, 'inference_mode', 'on_load') == 'on_sample'
+                or size == (self.texture_height, self.texture_width)):
             return self.model(inputs)
         base_sampler = self._sr_base_sampler if self.super_resolution_enable else None
         uv = inputs[:, :2]
@@ -180,28 +193,84 @@ class FeatureGridTraining(ASTCTrainingOperations):
             return self._pbr_loss_graph(target, prediction)
         return self._compute_pbr_render_loss(target, prediction)
 
+    @torch.no_grad()
+    def _validate_sampled_mips(self, iteration, evaluation=None):
+        from Common.Material.reconstruction import make_deployment_model
+        model = getattr(evaluation, 'sample_model', None) or make_deployment_model(self.model)
+        cases = getattr(self, '_sampled_validation_cases', None)
+        if cases is None:
+            uv = fixed_validation_uv(self.configs.mip_validation_samples, self.device)
+            probabilities = self._mip_sampling_probabilities
+            count = len(probabilities)
+            cases = []
+            for mip, probability in enumerate(probabilities.tolist()):
+                # Keep model selection comparable when training LOD sampling changes.
+                blend = .25 if mip + 1 < count else 0.
+                for lod, weight in ((float(mip), probability * (1 - blend)), (mip + .5, probability * blend)):
+                    if weight:
+                        inputs, target, _ = self._batch_with_mip(uv, lod, self.dataset.sample_lod(uv, lod))
+                        cases.append((lod, weight, inputs, target))
+            self._sampled_validation_cases = cases
+        weights = torch.tensor(self.eval_weights, device=self.device, dtype=torch.float32)
+        score = 0.
+        for lod, probability, inputs, target in cases:
+            prediction = model(inputs).float().clamp(0, 1)
+            mse = ((prediction - target.float()).square() * weights).sum(1).mean() / weights.sum().clamp_min(1e-8)
+            psnr = float((-10 * mse.clamp_min(1e-12).log10()).item())
+            self.writer.add_scalar(f'Validation/Mip{lod:g}/PSNR', psnr, iteration)
+            score += probability * psnr
+        self._sampled_validation = (iteration, score)
+        self.writer.add_scalar('Validation/on_sample_mip_PSNR', score, iteration)
+        return score
+
+    def _sample_training_batch(self):
+        on_sample = getattr(getattr(self, 'model', None), 'inference_mode', 'on_load') == 'on_sample'
+        mip = (int(torch.multinomial(self._mip_sampling_probabilities, 1).item())
+               if on_sample and not self.mip0_only else 0)
+        lod = float(mip)
+        if (on_sample and not self.mip0_only and mip < self.num_mips - 1
+                and torch.rand(()).item() < self.configs.mip_fractional_sampling_ratio):
+            lod += torch.rand(()).item()
+        self._training_mip, self._training_lod = mip, lod
+        # Output LOD may extend past the original GT's last available mip.
+        level = self.dataset.mip_cache[min(mip, len(self.dataset.mip_cache) - 1)]
+        height, width = level.shape[:2]
+        ys = torch.randint(height, (self.batch_size,), device=self.device)
+        xs = torch.randint(width, (self.batch_size,), device=self.device)
+        uv = torch.stack(((xs.float() + .5) / width, (ys.float() + .5) / height), 1)
+        target = (self.dataset.sample_lod(uv, lod) if on_sample else
+                  self.dataset.expand_to_canonical(level[ys, xs]).to(
+                      torch.float32 if self.native_reconstruction else torch.float16))
+        return self._batch_with_mip(uv, lod, target)
+
+    def _batch_with_mip(self, uv, mip, target):
+        inputs = uv if self.mip0_only else torch.cat(
+            (uv, uv.new_full((len(uv), 1), mip / max(1, self.num_mips - 1))), 1)
+        base = self._sr_base_at_uv(uv) if self.super_resolution_enable else None
+        if base is not None:
+            inputs = torch.cat((inputs, base), 1)
+        return inputs, target, base
+
     def _sample_subpixel_batch(self):
         count = max(1, int(round(self.batch_size * self.subpixel_sampling_ratio)))
+        mip = min(getattr(self, '_training_mip', 0), len(self.dataset.mip_cache) - 1)
+        height, width = self.dataset.mip_cache[mip].shape[:2]
         xy = torch.stack(
             (
-                torch.randint(0, self.texture_height, (count,), device=self.device),
-                torch.randint(0, self.texture_width, (count,), device=self.device),
+                torch.randint(0, height, (count,), device=self.device),
+                torch.randint(0, width, (count,), device=self.device),
             ),
             1,
         ).float()
         xy += (torch.rand_like(xy) * 2 - 1) * self.subpixel_jitter
+        uv = torch.stack(((xy[:, 1] + .5) / width, (xy[:, 0] + .5) / height), 1)
+        if getattr(getattr(self, 'model', None), 'inference_mode', 'on_load') == 'on_sample':
+            lod = self._training_lod
+            return self._batch_with_mip(uv, lod, self.dataset.sample_lod(uv, lod))
         target = self.dataset.expand_to_canonical(
-            self.dataset.sample_continuous(xy, 0)
+            self.dataset.sample_continuous(xy * (2 ** mip), mip)
         ).to(torch.float32 if getattr(self, "native_reconstruction", False) else torch.float16)
-        uv = torch.stack(
-            ((xy[:, 1] + 0.5) / self.texture_width, (xy[:, 0] + 0.5) / self.texture_height), 1
-        )
-        inputs = uv if self.mip0_only else torch.cat((uv, uv.new_zeros((count, 1))), 1)
-        base = None
-        if self.super_resolution_enable:
-            base = self._sr_base_at_uv(uv)
-            inputs = torch.cat((inputs, base), 1)
-        return inputs, target, base
+        return self._batch_with_mip(uv, mip, target)
 
     def _codec_batch_loss(self, inputs, target, weights, curr_iter):
         self._ensure_grid_proxies()
@@ -259,13 +328,9 @@ class FeatureGridTraining(ASTCTrainingOperations):
 
     def _finish_codec_step(self, codec_due):
         if codec_due:
-            # BC1 training reads proxies directly; refresh its source mirrors
-            # only when a source forward or state export actually needs them.
-            active = self.model._codec_active_grids
-            self.model._pending_grid_sync.update(
-                i for i in active if self.model.grid_compressions[i].format == 'bc1')
-            self._sync_grid_sources(
-                i for i in active if self.model.grid_compressions[i].format != 'bc1')
+            # Codec proxies are authoritative. Refresh source mirrors only when
+            # a source forward or checkpoint actually needs their current values.
+            self.model._pending_grid_sync.update(self._codec_due_grids)
 
     def _compute_material_reconstruction_loss(self, gt, prediction, base, loss_weights, curr_iter=None):
         material = prediction.float() if base is None else prediction.float() + base.float()

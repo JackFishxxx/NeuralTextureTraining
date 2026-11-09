@@ -107,19 +107,21 @@ def cached_sr_base(dataset, compression, base_resolution, output_size):
 
 
 def export_sr_base(dataset, compression, base_resolution, directory):
-    """Export the low-resolution SR base as a single-level texture."""
+    """Export the SR base and its complete material-aware mip chain."""
     _, image, textures, _ = _sr_base(dataset, compression, base_resolution)
+    compression.prepare_textures(textures,dataset,image.shape[-2:])
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     for name, data in textures.items():
         (directory / name).write_bytes(data)
     metadata = dict(formats=compression.recipe(dataset), size=list(image.shape[-2:]),
                     source_gt_mip=sr_base_source_mip(dataset,base_resolution),
-                    payload_bytes=compression.payload_bytes(dataset,image.shape[-2:]),
+                    payload_bytes=compression.payload_bytes(dataset,image.shape[-2:],full_chain=True),
                     file_bytes=sum(map(len,textures.values())),
                     normal_encoding=compression.normal_encoding(dataset),
                     decoded_normal_encoding=dataset.normal_encoding,
-                    sampling='bilinear_repeat_to_native_material_size', mip_count=1)
+                    sampling='bilinear_repeat_to_native_material_size',
+                    mip_count=sum(1 for _ in compression.mip_sizes(image.shape[-2:],full_chain=True)))
     (directory / 'metadata.json').write_text(json.dumps(metadata,indent=2),encoding='utf-8')
     return metadata
 

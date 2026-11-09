@@ -144,14 +144,15 @@ def write_metrics(directory, records, *, evaluation, iteration=None, metadata=No
     report = dict(schema_version=3, evaluation=evaluation, iteration=iteration,
                   storage_scope=dict(unit='bytes', material_mips='full_chain',
                                      latent_mips='all_exported_levels', decoder_metadata_included=True,
-                                     sr_base_included=True, container_overhead_included=True),
+                                     sr_base_included=True, sr_base_mips='full_chain',
+                                     container_overhead_included=True),
                   metric_definitions={
                       'psnr': 'dB; image MSE or weighted group mean; exact image matches report 120 dB',
                       'normal': 'PSNR/SSIM on encoded channels; LPIPS averages scalar channels replicated to RGB',
                       'average': 'weighted mean of group scores, using the sum of effective channel weights',
                       'romsd_lpips': 'mean of per-scalar LPIPS, each scalar replicated to RGB',
                       'lpips_status': 'not_computed is null in JSON and empty in CSV; never a perfect score',
-                      'storage': 'deployment file bytes: all exported latent levels, decoder/CNN NPZ including metadata and containers, enabled single-level SR base; baseline/GT use full material mip chains regardless of latent level counts; training state and runtime output cache excluded',
+                      'storage': 'deployment file bytes: all exported latent levels, decoder/CNN NPZ including metadata and containers, enabled full-mip-chain SR base; baseline/GT use full material mip chains regardless of latent level counts; training state and runtime output cache excluded',
                   }, metadata=metadata or {}, records=records)
     text = json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2) + '\n'
     (directory/'metrics.json').write_text(text, encoding='utf-8')
@@ -392,7 +393,7 @@ def log_comparison_storage(model, dataset, compression, config, *, verbose=True)
     base = 0
     if model.super_resolution_enable:
         level = dataset.mip_cache[sr_base_source_mip(dataset,config.super_resolution_base_resolution)]
-        base = compression.file_bytes(dataset,level.shape[:2])
+        base = compression.file_bytes(dataset,level.shape[:2],full_chain=True)
     channels = sum(b-a for name in dataset.available_textures
                    for a,b in [dataset.canonical_channel_slices[name]])
     storage = {UNCOMPRESSED: latent+network+base,
@@ -402,13 +403,21 @@ def log_comparison_storage(model, dataset, compression, config, *, verbose=True)
     if config.material_recompression_enable:
         storage[recompressed_method(compression,dataset)] = latent+network+base
     if verbose:
-        for name, count in storage.items():
-            detail = (f'latent files={latent:,} B + decoder/CNN NPZ={network:,} B + SR base={base:,} B'
-                      + (f'; output tile cache={tile:,} B separately' if name.startswith('FNTC_Recompressed') else '')
-                      if name.startswith('FNTC_') else
-                      'material tiles' if name != 'GT' else 'UNORM8 effective channels')
-            print(f'[Storage] {name} total={count:,} B ({count/1024:.2f} KiB) | {detail}; '
-                  f'tile={compression.tile_size}; all latent levels + full baseline/GT mip chains; file headers included')
+        rows = [('Method', 'Total (KiB)', 'Compression ratio', 'Latent (KiB)', 'Decoder/CNN (KiB)',
+                 'SR base (Full Mips Chain) (KiB)')]
+        for name in ('GT', baseline_method(compression,dataset),
+                     primary_method(compression,dataset,config.material_recompression_enable)):
+            count = storage[name]
+            fntc = name.startswith('FNTC_')
+            rows.append((name, f'{count/1024:,.2f}', f'{storage["GT"]/count:.2f}x' if count else '-',
+                         f'{latent/1024:,.2f}' if fntc else '-', f'{network/1024:,.2f}' if fntc else '-',
+                         f'{base/1024:,.2f}' if fntc else '-'))
+        widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+        print(f'[Storage] All latent levels; full mip chains: Baseline / SR base / GT (UNORM8 effective channels); '
+              f'file headers included; compression ratio=GT/total; tile={compression.tile_size}')
+        for row in rows:
+            print('[Storage] ' + ' | '.join(value.ljust(width) if i == 0 else value.rjust(width)
+                                           for i, (value, width) in enumerate(zip(row, widths))))
     return storage
 
 
@@ -502,7 +511,7 @@ def run_material_comparison_pipeline(trainer, *, evaluation=None, curr_iter=None
                                 latent_formats=[r.as_config() for r in trainer.model.grid_compressions],
                                 gt_size=list(gt.shape[-2:]),inference_size=list(evaluation.size),
                                 screenshot_size=list(gt.shape[-2:]),storage_bytes=storage,
-                                storage_meaning={'FNTC':'all latent files + decoder/CNN NPZ metadata + enabled single-level SR base; file headers included; output cache excluded',
+                                storage_meaning={'FNTC':'all latent files + decoder/CNN NPZ metadata + enabled full-mip-chain SR base; file headers included; output cache excluded',
                                                  'Baseline':'complete material mip-chain files regardless of latent level counts'},
                                 output_tile_cache_bytes=(compression.file_bytes(dataset,evaluation.size, full_chain=True)
                                                         if trainer.configs.material_recompression_enable else 0),

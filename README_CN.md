@@ -365,7 +365,7 @@ material_recompression_enable: true
 
 `[Material Test]` 按 `material_compare_interval` 触发，周期独立于保存、早停及阶段起点，阶段结束另输出最终结果。材质报告位于 `Compare_Material/iter_<iteration>/`，同目录保存 `metrics.json`、`metrics.csv`、带左上角指标的独立图、拼图以及二次压缩和基线的 DDS/KTX2 文件。PBR 在 `Compare_PBRScene/iter_<iteration>/` 比较各启用方法，Scene 使用 `pbr_render_resolution`，独立渲染的 Scene Detail 使用 `pbr_detail_resolution`。
 
-每组材质纹理用一个文件保存逐级缩小至 1×1 的完整 mip 链：BC 使用 DDS，ASTC 使用 KTX2，例如 `Diffuse_Baseline_ASTC6x6.ktx2`。各级从拼接、解码后的 Mip0 连续过滤生成，法线采用向量过滤；KTX2 直接封装已有的线性 ASTC UNORM 码流，不转码、不进行 supercompression。压缩块对齐时直接拼接 tile 码流；内部 tile 边界切开压缩块时，对拼接后的解码图重新编码，使导出纹理与评估像素一致。材质图像指标衡量 Mip0，存储统计包含完整链与容器头。SR base 仍使用单级 DDS/KTX2 文件。
+每组材质纹理用一个文件保存逐级缩小至 1×1 的完整 mip 链：BC 使用 DDS，ASTC 使用 KTX2，例如 `Diffuse_Baseline_ASTC6x6.ktx2`。各级从拼接、解码后的 Mip0 连续过滤生成，法线采用向量过滤；KTX2 直接封装已有的线性 ASTC UNORM 码流，不转码、不进行 supercompression。压缩块对齐时直接拼接 tile 码流；内部 tile 边界切开压缩块时，对拼接后的解码图重新编码，使导出纹理与评估像素一致。材质图像指标衡量 Mip0，存储统计包含完整链与容器头。SR base 同样从其原生尺寸导出至 1×1 的完整 mip 链，BC 使用 DDS，ASTC 使用 KTX2。
 
 例如 GT=2048、推理/基线=1024，以下文件都保存为2048×2048；低分辨率内容在压缩之后双线性拉伸再对高分辨率 GT 计算指标：`Diffuse_GT[1024x1024].png`、`Diffuse_GT[2048x2048].png`、`Diffuse_BC7.png`、`Diffuse_FNTC_Uncompressed.png`、`Diffuse_FNTC_Recompressed.png`。低分辨率 GT 图表示预滤波后的未压缩源，`Diffuse_BC7.png` 表示其传统压缩结果。
 
@@ -379,7 +379,7 @@ Scene 与 Detail 共用设备、几何、管线和阴影，每种材质只准备
 
 场景包含两个顶置平滑球体的方体。相机略微俯视，默认 Detail 视口（`center: [0.76, 0.59]`、`zoom: 3.5`）拉近到右侧球体与方体的局部，同时保留墙面、地面和投影。数据集加载时已将颜色转为线性，因此渲染器直接使用线性材质值及压缩 mip 纹素，避免重复 gamma 转换。OpenGL 源法线按对应的绿色通道约定解释。平行光、点光源均采用缓存的 1024 像素阴影贴图与 PCF 过滤。默认使用室内点光源；可选的室外平行光也会被天花板遮挡。着色采用 Cook-Torrance GGX、少量环境补光、Reinhard 色调映射及 sRGB 输出，不模拟全局光照。本次渲染修改后的 PBR 指标不能直接与旧报告比较。
 
-FNTC 存储统计计全部压缩 latent 文件、decoder/CNN NPZ 元数据和启用的单级 SR base；材质 tile cache 大小单列。基线统计完整材质 mip 链文件及容器头。SR base 的实际 payload 与容器文件大小分别记录在导出的 `SR_Base/metadata.json`。
+FNTC 存储统计计全部压缩 latent 文件、decoder/CNN NPZ 元数据和启用的完整 mip 链 SR base；材质 tile cache 大小单列。基线统计完整材质 mip 链文件及容器头。SR base 的实际 payload 与容器文件大小分别记录在导出的 `SR_Base/metadata.json`。
 
 ### ASTC 感知 Latent 训练
 
@@ -443,7 +443,7 @@ BC1 使用 `feature_grid_0_bc1_0.dds`；具体文件名以清单为准。`networ
 
 存储对比计入实际部署文件：全部 latent 层、包含 decoder/CNN 与元数据的 `network_data.npz`，以及纹理文件头。
 Baseline 和未压缩 GT 始终统计到 1×1 的完整材质 mip 链，与实际材质导出和 PBR 采样一致，不由 latent 层数决定。
-小 mip 按真实块数向上取整，不直接套用 4/3 系数。已启用的单级 SR base 文件单列并计入 FNTC 总量；训练 checkpoint、优化器和运行时材质输出缓存不计入部署存储。
+小 mip 按真实块数向上取整，不直接套用 4/3 系数。已启用的完整 mip 链 SR base 文件单列并计入 FNTC 总量；训练 checkpoint、优化器和运行时材质输出缓存不计入部署存储。
 
 通过 `feature_grid_configs` 可以配置多个分辨率或不同精度的 feature grid：
 
@@ -479,7 +479,7 @@ bias，并增加 `decoder_output_bias` 作为输出层 bias。残差超分模式
 
 设置 `super_resolution_enable: true` 和 `super_resolution_base_resolution`，可将使用 Baseline 相同编码器、格式、打包及 tile 规则压缩的源 mip 与 latent 特征一起输入 decoder。默认 PC 的 base 为 BC7 diffuse / BC5 normal / BC1 ROMSD。表征、codec 优化、decoder、CNN、评估及推理共用该压缩 base。decoder 预测有符号残差，在原生材质纹素中心计算 `clamp(bilinear_base + predicted_residual, 0, 1)`。此模式关闭 direct diffuse 推理。
 
-`super_resolution_base_resolution` 必须匹配源 GT 某一级 mip 的实际最长边。材质报告和推理在 `Compare_Material/SR_Base/` 将该低分辨率 base 导出为单级纹理及元数据。元数据记录源 GT mip，模型 inference contract 记录格式与法线编码。
+`super_resolution_base_resolution` 必须匹配源 GT 某一级 mip 的实际最长边。材质报告和推理在 `Compare_Material/SR_Base/` 将该低分辨率 base 导出为含完整 mip 链的纹理及元数据。元数据记录源 GT mip，模型 inference contract 记录格式与法线编码。
 
 材质栅格默认采用最大 latent 分辨率，不超过 GT 并保持宽高比。`material_compare_resolution` 可独立于 latent 分辨率覆盖 FNTC 推理及基线尺寸。材质 CNN 在推理栅格上运行，之后执行材质二次压缩。
 

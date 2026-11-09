@@ -282,7 +282,7 @@ Storage comparisons count actual deployment file sizes: every exported latent
 level, decoder/CNN `network_data.npz` (including metadata), and texture/container
 headers. Baseline and raw GT always count their full material mip chains down to
 1x1, matching material export and PBR sampling, independently of latent level counts.
-Enabled single-level SR base files are counted separately within the FNTC total;
+Enabled full-mip-chain SR base files are counted separately within the FNTC total;
 training checkpoints and runtime material output caches are excluded. Small mip
 costs use exact codec block rounding rather than a blanket 4/3 multiplier.
 
@@ -371,7 +371,7 @@ Tile size is measured in inference material texels. CNN training/inference, FNTC
 
 Reports record `fntc_tile_size` and `tile_layout`. Full material textures are written directly under `Compare_Material/iter_<iteration>/`, for example `DDS_Diffuse_Baseline_BC7.dds` and `DDS_Diffuse_FNTC_Recompressed_BC7.dds`, with corresponding Normal and Romsd files in their configured formats. CNN checkpoints and NPZ exports preserve tile size and validate it during restoration.
 
-Material textures contain a full mip chain down to 1×1 in one file per group: BC uses DDS, ASTC uses KTX2, e.g. `Diffuse_Baseline_ASTC6x6.ktx2`. Mips are filtered successively from the assembled, decoded Mip0, with vector filtering for normals. KTX2 stores the existing linear ASTC UNORM blocks without transcoding or supercompression. Material image metrics measure Mip0; storage includes the complete chain and container headers. Latent export packs every configured independently learned level into the same surface file; it never generates substitute mips by resizing latent Mip0. SR base exports remain single-level DDS/KTX2 textures.
+Material textures contain a full mip chain down to 1×1 in one file per group: BC uses DDS, ASTC uses KTX2, e.g. `Diffuse_Baseline_ASTC6x6.ktx2`. Mips are filtered successively from the assembled, decoded Mip0, with vector filtering for normals. KTX2 stores the existing linear ASTC UNORM blocks without transcoding or supercompression. Material image metrics measure Mip0; storage includes the complete chain and container headers. Latent export packs every configured independently learned level into the same surface file; it never generates substitute mips by resizing latent Mip0. SR base exports also contain a full mip chain from their native dimensions down to 1×1 in DDS/KTX2 textures.
 
 ### FNTC tile recompression
 
@@ -397,7 +397,7 @@ Scene and Detail share the device, geometry, pipelines and shadows. Each materia
 
 The room contains two boxes topped by smooth spheres. The elevated camera and default Detail viewport (`center: [0.76, 0.59]`, `zoom: 3.5`) show a close-up of part of the right sphere and its supporting box, together with the wall, floor and cast shadows. Dataset loading already linearizes albedo, so the renderer consumes linear material values and compressed mip texels directly. OpenGL source normals use the appropriate green-channel convention. Directional and point lights use cached 1024-pixel shadow maps with PCF. Interior point lights are enabled by default; optional directional sunlight is also occluded by the room ceiling. Shading uses Cook-Torrance GGX, a small ambient fill, Reinhard tone mapping and sRGB output; it does not simulate global illumination. These rendering changes invalidate comparisons with earlier PBR metric reports.
 
-FNTC storage counts all compressed latent files, decoder/CNN NPZ metadata and the enabled single-level SR base; material tile cache bytes are reported separately. Baseline storage includes full material mip-chain files and their container headers. Exported `SR_Base/metadata.json` records payload and file sizes separately.
+FNTC storage counts all compressed latent files, decoder/CNN NPZ metadata and the enabled full-mip-chain SR base; material tile cache bytes are reported separately. Baseline storage includes full material mip-chain files and their container headers. Exported `SR_Base/metadata.json` records payload and file sizes separately.
 
 ### ASTC-Aware Latent Training
 
@@ -492,7 +492,7 @@ for the output layer. In residual SR mode, the decoder output is signed and skip
 
 Set `super_resolution_enable: true` and `super_resolution_base_resolution` to provide a source mip compressed with the Baseline's exact codecs, formats, packing and tile rules alongside the latent features. The PC preset uses BC7 diffuse / BC5 normal / BC1 ROMSD. Representation learning, codec optimization, decoder fitting, CNN, evaluation and inference share this compressed base. The decoder predicts a signed residual, combined as `clamp(bilinear_base + predicted_residual, 0, 1)` at native material texel centers. This mode disables direct-diffuse inference.
 
-`super_resolution_base_resolution` must match the actual maximum edge of a source GT mip. Material reports and inference export this low-resolution base as single-level textures with metadata under `Compare_Material/SR_Base/`. Metadata records the source GT mip; the model inference contract records the formats and normal encoding.
+`super_resolution_base_resolution` must match the actual maximum edge of a source GT mip. Material reports and inference export this low-resolution base as full-mip-chain textures with metadata under `Compare_Material/SR_Base/`. Metadata records the source GT mip; the model inference contract records the formats and normal encoding.
 
 The material raster follows the largest latent resolution, capped by GT and preserving aspect ratio. `material_compare_resolution` overrides FNTC inference and baseline dimensions independently of latent resolution. Material CNN filtering runs on the inference raster before material recompression.
 
